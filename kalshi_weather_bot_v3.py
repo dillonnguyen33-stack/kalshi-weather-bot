@@ -1234,6 +1234,10 @@ def main():
     # Start signal rescan thread
     threading.Thread(target=signal_rescan_loop, daemon=True).start()
 
+    # Wait for price watcher to populate cache before first scan
+    print("[main] Waiting 100s for price watcher to populate market cache...")
+    time.sleep(100)
+
     # Main ensemble scan loop
     while True:
         try:
