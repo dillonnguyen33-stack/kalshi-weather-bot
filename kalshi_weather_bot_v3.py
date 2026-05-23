@@ -53,6 +53,7 @@ AWC_METAR_BASE      = "https://aviationweather.gov/api/data/metar"
 
 X_BEARER_TOKEN      = os.environ.get("X_BEARER_TOKEN", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
+TOMORROW_IO_KEY     = os.environ.get("TOMORROW_IO_KEY", "")  # free tier, 500 calls/day
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
 
@@ -512,6 +513,72 @@ async def fetch_gfs_ensemble(session, lat, lon, ds) -> list[float]:
         return highs
     except: return []
 
+
+async def fetch_nbm(session, lat, lon, ds) -> float | None:
+    """NBM — NWS National Blend of Models, same source Kalshi settles on."""
+    try:
+        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
+            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,
+            "models":"nbm",
+        })
+        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
+        return max(temps) if temps else None
+    except: return None
+
+async def fetch_icon(session, lat, lon, ds) -> float | None:
+    """ICON — German weather service, second only to ECMWF globally."""
+    try:
+        data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
+            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,
+            "models":"icon_seamless",
+        })
+        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
+        return max(temps) if temps else None
+    except: return None
+
+async def fetch_ecmwf_ensemble(session, lat, lon, ds) -> list[float]:
+    """ECMWF 51-member ensemble — highest quality ensemble globally."""
+    try:
+        members = ",".join([f"temperature_2m_member{i:02d}" for i in range(0,51)])
+        data = await _get_json(session, f"{OPEN_METEO_ENS_BASE}/ensemble", {
+            "latitude":lat,"longitude":lon,"hourly":members,
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,
+            "models":"ecmwf_ifs025",
+        })
+        hourly = data.get("hourly",{})
+        highs = []
+        for i in range(0,51):
+            temps = [t for t in (hourly.get(f"temperature_2m_member{i:02d}") or []) if t is not None]
+            if temps: highs.append(max(temps))
+        return highs
+    except: return []
+
+async def fetch_tomorrow_io(session, lat, lon, ds) -> float | None:
+    """Tomorrow.io — proprietary ML model, sharp on short-range. Free tier 500/day."""
+    if not TOMORROW_IO_KEY:
+        return None
+    try:
+        async with session.get(
+            "https://api.tomorrow.io/v4/weather/forecast",
+            params={
+                "location": f"{lat},{lon}",
+                "apikey": TOMORROW_IO_KEY,
+                "units": "imperial",
+                "timesteps": "1d",
+                "fields": "temperatureMax",
+                "startTime": f"{ds}T00:00:00Z",
+                "endTime": f"{ds}T23:59:59Z",
+            }
+        ) as r:
+            data = await r.json()
+            days = data.get("timelines",{}).get("daily",[])
+            if days:
+                return days[0].get("values",{}).get("temperatureMax")
+            return None
+    except: return None
+
 async def get_forecast(session, semaphore, city_code, target_date) -> dict | None:
     info = CITY_COORDS.get(city_code)
     if not info: return None
@@ -519,45 +586,79 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     ds = target_date.isoformat()
 
     async with semaphore:
-        ecmwf, hrrr, gfs = await asyncio.gather(
+        # All 7 model sources fire concurrently — same time cost as 1 sequential call
+        ecmwf, hrrr, gfs, nbm, icon, ecmwf_ens, tomorrow = await asyncio.gather(
             fetch_ecmwf(session, lat, lon, ds),
             fetch_hrrr(session, lat, lon, ds),
             fetch_gfs_ensemble(session, lat, lon, ds),
+            fetch_nbm(session, lat, lon, ds),
+            fetch_icon(session, lat, lon, ds),
+            fetch_ecmwf_ensemble(session, lat, lon, ds),
+            fetch_tomorrow_io(session, lat, lon, ds),
             return_exceptions=True,
         )
 
-    if isinstance(ecmwf, Exception): ecmwf = None
-    if isinstance(hrrr, Exception):  hrrr  = None
-    if isinstance(gfs, Exception):   gfs   = []
+    if isinstance(ecmwf, Exception):    ecmwf    = None
+    if isinstance(hrrr, Exception):     hrrr     = None
+    if isinstance(gfs, Exception):      gfs      = []
+    if isinstance(nbm, Exception):      nbm      = None
+    if isinstance(icon, Exception):     icon     = None
+    if isinstance(ecmwf_ens, Exception):ecmwf_ens= []
+    if isinstance(tomorrow, Exception): tomorrow = None
 
-    if not gfs and ecmwf is None and hrrr is None:
+    # Combine all ensemble members for spread calculation
+    all_members = list(gfs) + list(ecmwf_ens)
+
+    if not all_members and ecmwf is None and hrrr is None and nbm is None:
         return None
 
-    blend = list(gfs)
-    if ecmwf: blend += [ecmwf, ecmwf]
-    if hrrr:  blend += [hrrr, hrrr]
+    # Weighted blend:
+    # NBM (3x) — NWS consensus, closest to settlement source
+    # ECMWF (2x) — best single-model globally
+    # HRRR (2x) — fastest refresh, US only
+    # ICON (1x) — strong independent signal
+    # Tomorrow.io (1x) — ML model, optional
+    # GFS + ECMWF ensemble members (1x each) — spread/uncertainty
+    blend = list(all_members)
+    if nbm:      blend += [nbm, nbm, nbm]
+    if ecmwf:    blend += [ecmwf, ecmwf]
+    if hrrr:     blend += [hrrr, hrrr]
+    if icon:     blend.append(icon)
+    if tomorrow: blend.append(tomorrow)
+
+    if not blend:
+        return None
+
     mean = sum(blend) / len(blend)
 
-    if len(gfs) >= 2:
-        gm = sum(gfs) / len(gfs)
-        spread = math.sqrt(sum((x-gm)**2 for x in gfs) / len(gfs))
+    # Spread from all ensemble members (best uncertainty estimate)
+    if len(all_members) >= 2:
+        am = sum(all_members) / len(all_members)
+        spread = math.sqrt(sum((x-am)**2 for x in all_members) / len(all_members))
+    elif len(blend) >= 2:
+        bm = mean
+        spread = math.sqrt(sum((x-bm)**2 for x in blend) / len(blend))
     else:
         spread = 2.5
 
-    # Apply bias correction
     bias = get_bias(city_code)
     corrected_mean = mean + bias
-
     conf = "high" if spread < 2.0 else ("medium" if spread < 4.0 else "low")
+
     return {
-        "ensemble_mean":   round(mean, 1),
-        "corrected_mean":  round(corrected_mean, 1),
-        "bias_applied":    round(bias, 2),
-        "spread":          round(spread, 2),
-        "ecmwf_high":      round(ecmwf, 1) if ecmwf else None,
-        "hrrr_high":       round(hrrr, 1)  if hrrr  else None,
-        "gfs_members":     len(gfs),
-        "confidence":      conf,
+        "ensemble_mean":    round(mean, 1),
+        "corrected_mean":   round(corrected_mean, 1),
+        "bias_applied":     round(bias, 2),
+        "spread":           round(spread, 2),
+        "ecmwf_high":       round(ecmwf, 1)    if ecmwf    else None,
+        "hrrr_high":        round(hrrr, 1)     if hrrr     else None,
+        "nbm_high":         round(nbm, 1)      if nbm      else None,
+        "icon_high":        round(icon, 1)     if icon     else None,
+        "tomorrow_high":    round(tomorrow, 1) if tomorrow else None,
+        "gfs_members":      len(gfs),
+        "ecmwf_members":    len(ecmwf_ens),
+        "total_members":    len(all_members),
+        "confidence":       conf,
     }
 
 # ── PROBABILITY MODEL ─────────────────────────────────────────────────────────
@@ -706,9 +807,18 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units: 
     if obs_high is not None:
         fields.append({"name":"🔴 ASOS observed high","value":f"{obs_high}°F today","inline":True})
     if forecast.get("ecmwf_high"):
-        fields.append({"name":"🌍 ECMWF","value":f"{forecast['ecmwf_high']}°F","inline":True})
+        fields.append({"name":"🌍 ECMWF",    "value":f"{forecast['ecmwf_high']}°F",    "inline":True})
     if forecast.get("hrrr_high"):
-        fields.append({"name":"⚡ HRRR", "value":f"{forecast['hrrr_high']}°F", "inline":True})
+        fields.append({"name":"⚡ HRRR",     "value":f"{forecast['hrrr_high']}°F",     "inline":True})
+    if forecast.get("nbm_high"):
+        fields.append({"name":"🎯 NBM",      "value":f"{forecast['nbm_high']}°F",      "inline":True})
+    if forecast.get("icon_high"):
+        fields.append({"name":"🇩🇪 ICON",   "value":f"{forecast['icon_high']}°F",     "inline":True})
+    if forecast.get("tomorrow_high"):
+        fields.append({"name":"🤖 Tomorrow", "value":f"{forecast['tomorrow_high']}°F", "inline":True})
+    total = forecast.get("total_members", 0)
+    if total > 0:
+        fields.append({"name":"📊 Ensemble members","value":f"{total} total ({forecast.get('gfs_members',0)} GFS + {forecast.get('ecmwf_members',0)} ECMWF)","inline":False})
     if tweet_hit:
         fields.append({"name":"🐦 Signal","value":"Met/NWS tweet","inline":True})
     if afd_hit:
@@ -722,6 +832,32 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units: 
 # ── KALSHI MARKET DISCOVERY ───────────────────────────────────────────────────
 
 def get_active_kalshi_markets() -> list[dict]:
+    global _market_cache, _market_cache_ts
+    # Use cached market list if fresh (updated by price watcher)
+    with _lock:
+        cache_age = time.time() - _market_cache_ts
+        if _market_cache and cache_age < MARKET_CACHE_TTL:
+            raw = list(_market_cache)
+            print(f"[kalshi] Using cached market list ({len(raw)} markets, {cache_age:.0f}s old)")
+            markets = []
+            for m in raw:
+                series = m.get("series_ticker","")
+                if not series.startswith("KXHIGH") or m.get("status") != "open": continue
+                city_code = series.replace("KXHIGH","")
+                subtitle  = m.get("subtitle","")
+                nums = [float(n) for n in re.findall(r"(\d+\.?\d*)", subtitle)]
+                if not nums: continue
+                threshold = nums[0] if len(nums)==1 else sum(nums[:2])/2
+                ticker = m.get("ticker","")
+                if ticker:
+                    markets.append({
+                        "ticker":ticker,"series":series,"city_code":city_code,
+                        "threshold_f":threshold,"yes_price":m.get("yes_ask",50),
+                        "no_price":m.get("no_ask",50),"subtitle":subtitle,
+                    })
+            print(f"[kalshi] {len(markets)} active temperature markets (from cache)")
+            return markets
+
     markets, cursor = [], None
     now_ts = int(datetime.now(timezone.utc).timestamp())
     end_ts = now_ts + 86400 * 2
@@ -950,14 +1086,20 @@ PRICE_MOVE_TRIGGER  = 3      # cents — trigger rescan if price moves this much
 
 # Stores last known prices: ticker → (yes_price, no_price)
 price_snapshot: dict[str, tuple[int, int]] = {}
+# Shared market cache — price watcher populates, main scan reuses
+_market_cache: list[dict] = []
+_market_cache_ts: float = 0.0
+MARKET_CACHE_TTL = 120  # seconds before forcing a fresh fetch
 
 def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
     """
     Fetches live yes/no prices for all open KXHIGH markets.
+    Also updates the shared _market_cache so the main scan can reuse it.
     Returns dict: ticker → (yes_ask, no_ask, city_code)
-    Lightweight — no model data, just Kalshi prices.
     """
+    global _market_cache, _market_cache_ts
     prices = {}
+    markets_raw = []
     cursor = None
     now_ts = int(datetime.now(timezone.utc).timestamp())
     end_ts = now_ts + 86400 * 2
@@ -982,8 +1124,13 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             yes_price = m.get("yes_ask", 50)
             no_price  = m.get("no_ask",  50)
             prices[ticker] = (yes_price, no_price, city_code)
+            markets_raw.append(m)
         cursor = data.get("cursor")
         if not cursor: break
+    # Update shared cache so main scan doesn't need to fetch again
+    with _lock:
+        _market_cache = markets_raw
+        _market_cache_ts = time.time()
     return prices
 
 def price_watcher_loop():
