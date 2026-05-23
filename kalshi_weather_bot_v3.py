@@ -993,6 +993,7 @@ def get_active_kalshi_markets() -> list[dict]:
             markets_raw.extend(r.json().get("markets", []))
         except Exception as e:
             print(f"[kalshi] {series}: {e}")
+        time.sleep(0.5)
 
     markets = [m for m in (parse_market(r) for r in markets_raw) if m]
     print(f"[kalshi] {len(markets)} active temperature markets")
@@ -1244,6 +1245,7 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             if ticker:
                 prices[ticker] = (yes_price, no_price, city_code)
                 markets_raw.append(m)
+        time.sleep(0.5)
 
     # Update shared cache so main scan doesn't need to fetch again
     with _lock:
