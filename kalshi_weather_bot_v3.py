@@ -497,6 +497,19 @@ async def fetch_hrrr(session, lat, lon, ds) -> float | None:
         return max(temps) if temps else None
     except: return None
 
+
+async def fetch_rap(session, lat, lon, ds) -> float | None:
+    """RAP (Rapid Refresh) — NOAA hourly model, independent signal alongside HRRR."""
+    try:
+        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
+            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,
+            "models":"rap",
+        })
+        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
+        return max(temps) if temps else None
+    except: return None
+
 async def fetch_gfs_ensemble(session, lat, lon, ds) -> list[float]:
     try:
         members = ",".join([f"temperature_2m_member{i:02d}" for i in range(1,32)])
@@ -587,9 +600,10 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
 
     async with semaphore:
         # All 7 model sources fire concurrently — same time cost as 1 sequential call
-        ecmwf, hrrr, gfs, nbm, icon, ecmwf_ens, tomorrow = await asyncio.gather(
+        ecmwf, hrrr, rap, gfs, nbm, icon, ecmwf_ens, tomorrow = await asyncio.gather(
             fetch_ecmwf(session, lat, lon, ds),
             fetch_hrrr(session, lat, lon, ds),
+            fetch_rap(session, lat, lon, ds),
             fetch_gfs_ensemble(session, lat, lon, ds),
             fetch_nbm(session, lat, lon, ds),
             fetch_icon(session, lat, lon, ds),
@@ -600,6 +614,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
 
     if isinstance(ecmwf, Exception):    ecmwf    = None
     if isinstance(hrrr, Exception):     hrrr     = None
+    if isinstance(rap, Exception):      rap      = None
     if isinstance(gfs, Exception):      gfs      = []
     if isinstance(nbm, Exception):      nbm      = None
     if isinstance(icon, Exception):     icon     = None
@@ -623,6 +638,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     if nbm:      blend += [nbm, nbm, nbm]
     if ecmwf:    blend += [ecmwf, ecmwf]
     if hrrr:     blend += [hrrr, hrrr]
+    if rap:      blend += [rap, rap]
     if icon:     blend.append(icon)
     if tomorrow: blend.append(tomorrow)
 
@@ -653,6 +669,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         "ecmwf_high":       round(ecmwf, 1)    if ecmwf    else None,
         "hrrr_high":        round(hrrr, 1)     if hrrr     else None,
         "nbm_high":         round(nbm, 1)      if nbm      else None,
+        "rap_high":         round(rap, 1)      if rap      else None,
         "icon_high":        round(icon, 1)     if icon     else None,
         "tomorrow_high":    round(tomorrow, 1) if tomorrow else None,
         "gfs_members":      len(gfs),
@@ -812,6 +829,8 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units: 
         fields.append({"name":"⚡ HRRR",     "value":f"{forecast['hrrr_high']}°F",     "inline":True})
     if forecast.get("nbm_high"):
         fields.append({"name":"🎯 NBM",      "value":f"{forecast['nbm_high']}°F",      "inline":True})
+    if forecast.get("rap_high"):
+        fields.append({"name":"🔄 RAP",      "value":f"{forecast['rap_high']}°F",      "inline":True})
     if forecast.get("icon_high"):
         fields.append({"name":"🇩🇪 ICON",   "value":f"{forecast['icon_high']}°F",     "inline":True})
     if forecast.get("tomorrow_high"):
@@ -1081,7 +1100,7 @@ def tweet_scanner_loop(user_ids):
 
 # ── KALSHI PRICE WATCHER ──────────────────────────────────────────────────────
 
-PRICE_POLL_SECS     = 90     # poll Kalshi prices every 90 seconds
+PRICE_POLL_SECS     = 120    # poll Kalshi prices every 2 min
 PRICE_MOVE_TRIGGER  = 3      # cents — trigger rescan if price moves this much
 
 # Stores last known prices: ticker → (yes_price, no_price)
@@ -1089,7 +1108,7 @@ price_snapshot: dict[str, tuple[int, int]] = {}
 # Shared market cache — price watcher populates, main scan reuses
 _market_cache: list[dict] = []
 _market_cache_ts: float = 0.0
-MARKET_CACHE_TTL = 120  # seconds before forcing a fresh fetch
+MARKET_CACHE_TTL = 280  # seconds before forcing a fresh fetch
 
 def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
     """
@@ -1238,9 +1257,16 @@ def main():
     print("[main] Waiting 100s for price watcher to populate market cache...")
     time.sleep(100)
 
-    # Main ensemble scan loop
+    # Main ensemble scan loop — every 5 min 24/7
+    # Kalshi public endpoint is free, cache prevents duplicate fetches
+    # Only skip Thursday 3-5am ET maintenance window
     while True:
         try:
+            now_et = datetime.now(ET_TZ)
+            if now_et.weekday() == 3 and 3 <= now_et.hour < 5:
+                print(f"[main] Kalshi maintenance window (Thu 3-5am ET) — sleeping 30 min")
+                time.sleep(1800)
+                continue
             run_scan()
         except Exception as e:
             print(f"[error] {e}")
