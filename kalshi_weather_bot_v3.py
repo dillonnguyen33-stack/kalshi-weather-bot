@@ -923,7 +923,7 @@ def tweet_scanner_loop(user_ids):
 
 # ── KALSHI PRICE WATCHER ──────────────────────────────────────────────────────
 
-PRICE_POLL_SECS     = 60     # poll Kalshi prices every 60 seconds
+PRICE_POLL_SECS     = 90     # poll Kalshi prices every 90 seconds
 PRICE_MOVE_TRIGGER  = 3      # cents — trigger rescan if price moves this much
 
 # Stores last known prices: ticker → (yes_price, no_price)
