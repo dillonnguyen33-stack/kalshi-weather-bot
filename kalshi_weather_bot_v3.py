@@ -919,8 +919,8 @@ def parse_market(m: dict) -> dict | None:
         return None
 
     # Prices: API returns dollars (0.01–1.00) → convert to cents (1–100)
-    yes_price = round((m.get("yes_ask_dollars") or 0.5) * 100)
-    no_price  = round((m.get("no_ask_dollars")  or 0.5) * 100)
+    yes_price = round(float(m.get("yes_ask_dollars") or 0.5) * 100)
+    no_price  = round(float(m.get("no_ask_dollars")  or 0.5) * 100)
     yes_price = max(1, min(99, yes_price))
     no_price  = max(1, min(99, no_price))
 
@@ -1239,8 +1239,8 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             event_ticker = m.get("event_ticker", "") or ""
             city_code = series.replace("KXHIGH", "")
             # Prices in dollars → convert to cents
-            yes_price = max(1, min(99, round((m.get("yes_ask_dollars") or 0.5) * 100)))
-            no_price  = max(1, min(99, round((m.get("no_ask_dollars")  or 0.5) * 100)))
+            yes_price = max(1, min(99, round(float(m.get("yes_ask_dollars") or 0.5) * 100)))
+            no_price  = max(1, min(99, round(float(m.get("no_ask_dollars")  or 0.5) * 100)))
             if ticker:
                 prices[ticker] = (yes_price, no_price, city_code)
                 markets_raw.append(m)
