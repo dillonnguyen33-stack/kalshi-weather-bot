@@ -1,5 +1,10 @@
 """
-Kalshi Weather Temperature Bot — v3.0
+Kalshi Weather Temperature Bot — v3.1
+
+Upgrades over v3.0:
+  7. SCAN LOG FIX     — scan summary now always posts to DISCORD_LOG_WEBHOOK,
+                        even when 0 temperature markets are found. Previously
+                        the function returned early and never logged anything.
 
 Upgrades over v2.1:
   1. FEE-ADJUSTED EV  — exact Kalshi formula fee = 0.07×P×(1-P) baked into
@@ -975,8 +980,18 @@ def longshot_probability_adjustment(implied_p: float) -> float:
     return 0.0
 
 async def run_scan_async(force_codes=None):
+    ts = datetime.now(ET_TZ).strftime("%H:%M ET")
     markets = get_active_kalshi_markets()
-    if not markets: return
+
+    # ── FIX v3.1: always log to Discord, even when no markets found ──
+    if not markets:
+        msg = f"📊 **Scan done** {ts} | 0 temperature markets found"
+        if force_codes:
+            msg += f" | triggered: {', '.join(force_codes)}"
+        post_discord(DISCORD_LOG_WEBHOOK, msg)
+        print(f"[scan] Done — 0 markets found")
+        return
+
     if force_codes:
         markets = [m for m in markets if m["city_code"] in force_codes]
 
@@ -1014,7 +1029,6 @@ async def run_scan_async(force_codes=None):
         post_discord(DISCORD_WEBHOOK_URL, f"{emoji} **{city} — {market['subtitle']}**", [embed])
         alerts += 1
 
-    ts  = datetime.now(ET_TZ).strftime("%H:%M ET")
     msg = f"📊 **Scan done** {ts} | {len(markets)} markets | {alerts} alert(s)"
     if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
     post_discord(DISCORD_LOG_WEBHOOK, msg)
@@ -1219,8 +1233,8 @@ def signal_rescan_loop():
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
 def main():
-    print("🌡️  Kalshi Weather Bot v3.0")
-    print(f"   Upgrades: fee-adjusted EV | ASOS real-time | bias correction | longshot | maker mode | AFD parser")
+    print("🌡️  Kalshi Weather Bot v3.1")
+    print(f"   Upgrades: fee-adjusted EV | ASOS real-time | bias correction | longshot | maker mode | AFD parser | scan log fix")
     print(f"   Concurrency:   {MAX_CONCURRENT} simultaneous model requests")
     print(f"   Price watcher: every {PRICE_POLL_SECS}s, trigger on {PRICE_MOVE_TRIGGER}¢ move")
     print(f"   Accounts:      {len(ALL_ACCOUNTS)} X accounts monitored")
