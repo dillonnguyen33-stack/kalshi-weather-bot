@@ -67,9 +67,6 @@ MAX_SPREAD_FIRE     = 3.0    # ensemble spread <= 3°F for fire
 MAX_SPREAD_WATCH    = 5.0
 MAX_CONCURRENT      = 8
 
-# ── QK UNIT SIZING ────────────────────────────────────────────────────────────
-QK_BANKROLL         = float(os.environ.get("QK_BANKROLL", "2500"))  # total bankroll $
-QK_UNIT_SIZE        = float(os.environ.get("QK_UNIT_SIZE", "200"))  # $ per 1 unit
 
 ET_TZ = ZoneInfo("America/New_York")
 NWS_UA = "KalshiWeatherBot/3.0 dillonnguyen33@gmail.com"  # required by NWS API
@@ -693,7 +690,6 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units: 
         {"name":"📈 EV% (maker)",     "value": f"+{m_ev}% ← post limit order",         "inline":True},
         {"name":"💰 Half Kelly",      "value": f"{side_data['taker_hk']}% (taker) / {side_data['maker_hk']}% (maker)", "inline":False},
         {"name":"💎 QK suggest",      "value": format_units(units),                             "inline":True},
-        {"name":"💵 Stake",           "value": f"${units * QK_UNIT_SIZE:.0f}" if units > 0 else "—", "inline":True},
         {"name":"🌡️ Ensemble mean",   "value": f"{forecast['corrected_mean']}°F (raw {forecast['ensemble_mean']}°F)", "inline":True},
         {"name":"📐 Spread",          "value": f"±{forecast['spread']}°F",              "inline":True},
         {"name":"🎯 Confidence",      "value": f"{bar} {conf.capitalize()}",            "inline":True},
