@@ -855,63 +855,118 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units: 
 
 # ── KALSHI MARKET DISCOVERY ───────────────────────────────────────────────────
 
+def parse_threshold_from_ticker(ticker: str) -> tuple[float | None, str]:
+    """
+    Parses threshold and market type from ticker suffix.
+    KXHIGHNY-26MAY24-T67   → (67.0, ">")   above 67°
+    KXHIGHNY-26MAY24-T60   → (60.0, "<")   below 60° (title says <)
+    KXHIGHNY-26MAY24-B60.5 → (60.5, "B")   between 60-61°
+    Returns (threshold, kind) or (None, "")
+    """
+    # Suffix is after the last '-'
+    parts = ticker.rsplit("-", 1)
+    if len(parts) < 2:
+        return None, ""
+    suffix = parts[1]
+    if suffix.startswith("T"):
+        try:
+            return float(suffix[1:]), "T"
+        except ValueError:
+            return None, ""
+    if suffix.startswith("B"):
+        try:
+            base = float(suffix[1:])
+            # Bxx.5 means between xx and xx+1 — use midpoint
+            return base + 0.5, "B"
+        except ValueError:
+            return None, ""
+    return None, ""
+
+def parse_market(m: dict) -> dict | None:
+    """
+    Converts a raw Kalshi API market dict into the internal format.
+    Handles new API field names (yes_ask_dollars, event_ticker, title).
+    """
+    ticker = m.get("ticker", "")
+    if not ticker:
+        return None
+
+    # Derive series from event_ticker (e.g. KXHIGHNY-26MAY24 → KXHIGHNY)
+    event_ticker = m.get("event_ticker", "") or ""
+    series = event_ticker.split("-")[0] if event_ticker else ""
+    if not series.startswith("KXHIGH"):
+        return None
+
+    city_code = series.replace("KXHIGH", "")
+    if not city_code:
+        return None
+
+    threshold, kind = parse_threshold_from_ticker(ticker)
+    if threshold is None:
+        return None
+
+    # Prices: API returns dollars (0.01–1.00) → convert to cents (1–100)
+    yes_price = round((m.get("yes_ask_dollars") or 0.5) * 100)
+    no_price  = round((m.get("no_ask_dollars")  or 0.5) * 100)
+    yes_price = max(1, min(99, yes_price))
+    no_price  = max(1, min(99, no_price))
+
+    subtitle = m.get("title", "") or m.get("yes_sub_title", "") or ticker
+
+    return {
+        "ticker":      ticker,
+        "series":      series,
+        "city_code":   city_code,
+        "threshold_f": threshold,
+        "threshold_kind": kind,   # "T" (above/below) or "B" (between)
+        "yes_price":   yes_price,
+        "no_price":    no_price,
+        "subtitle":    subtitle,
+    }
+
+# All known KXHIGH series codes — used for direct per-series fetching
+KXHIGH_SERIES = [
+    "KXHIGHNY","KXHIGHAUS","KXHIGHLA","KXHIGHCH","KXHIGHMI","KXHIGHBO",
+    "KXHIGHHO","KXHIGHSE","KXHIGHDV","KXHIGHLV","KXHIGHSD","KXHIGHKC",
+    "KXHIGHSL","KXHIGHNO","KXHIGHCL","KXHIGHPI","KXHIGHBA","KXHIGHDC",
+    "KXHIGHSA","KXHIGHPO","KXHIGHAL","KXHIGHIN","KXHIGHOK","KXHIGHEL",
+    "KXHIGHMIL","KXHIGHRAL","KXHIGHTAM","KXHIGHMN","KXHIGHSF","KXHIGHAT",
+    "KXHIGHPHI","KXHIGHPHX","KXHIGHDA","KXHIGHDE","KXHIGHAU","KXHIGHCOL",
+    "KXHIGHTUC","KXHIGHSLC","KXHIGHMEM","KXHIGHOL",
+]
+
 def get_active_kalshi_markets() -> list[dict]:
     global _market_cache, _market_cache_ts
+
     # Use cached market list if fresh (updated by price watcher)
     with _lock:
         cache_age = time.time() - _market_cache_ts
         if _market_cache and cache_age < MARKET_CACHE_TTL:
             raw = list(_market_cache)
             print(f"[kalshi] Using cached market list ({len(raw)} markets, {cache_age:.0f}s old)")
-            markets = []
-            for m in raw:
-                series = m.get("series_ticker","")
-                if not series.startswith("KXHIGH") or m.get("status") != "open": continue
-                city_code = series.replace("KXHIGH","")
-                subtitle  = m.get("subtitle","")
-                nums = [float(n) for n in re.findall(r"(\d+\.?\d*)", subtitle)]
-                if not nums: continue
-                threshold = nums[0] if len(nums)==1 else sum(nums[:2])/2
-                ticker = m.get("ticker","")
-                if ticker:
-                    markets.append({
-                        "ticker":ticker,"series":series,"city_code":city_code,
-                        "threshold_f":threshold,"yes_price":m.get("yes_ask",50),
-                        "no_price":m.get("no_ask",50),"subtitle":subtitle,
-                    })
+            markets = [m for m in (parse_market(r) for r in raw) if m]
             print(f"[kalshi] {len(markets)} active temperature markets (from cache)")
             return markets
 
-    markets, cursor = [], None
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    end_ts = now_ts + 86400 * 2
-    while True:
-        params = {"status":"open","min_close_ts":now_ts,"max_close_ts":end_ts,"limit":100}
-        if cursor: params["cursor"] = cursor
+    # Fetch directly per series — avoids paginating 26k+ markets
+    markets_raw = []
+    for series in KXHIGH_SERIES:
         try:
-            r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=10)
+            r = requests.get(f"{KALSHI_BASE}/markets",
+                params={"status": "open", "series_ticker": series, "limit": 25},
+                timeout=10)
             if r.status_code == 429:
                 print(f"[kalshi] Rate limited, waiting 30s...")
                 time.sleep(30)
-                r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=10)
-            r.raise_for_status(); data = r.json()
+                r = requests.get(f"{KALSHI_BASE}/markets",
+                    params={"status": "open", "series_ticker": series, "limit": 25},
+                    timeout=10)
+            r.raise_for_status()
+            markets_raw.extend(r.json().get("markets", []))
         except Exception as e:
-            print(f"[kalshi] {e}"); break
-        for m in data.get("markets",[]):
-            series = m.get("series_ticker","")
-            if not series.startswith("KXHIGH") or m.get("status") != "open": continue
-            city_code = series.replace("KXHIGH","")
-            subtitle  = m.get("subtitle","")
-            nums = [float(n) for n in re.findall(r"(\d+\.?\d*)", subtitle)]
-            if not nums: continue
-            threshold = nums[0] if len(nums)==1 else sum(nums[:2])/2
-            markets.append({
-                "ticker":market_ticker, "series":series, "city_code":city_code,
-                "threshold_f":threshold, "yes_price":m.get("yes_ask",50),
-                "no_price":m.get("no_ask",50), "subtitle":subtitle,
-            }) if (market_ticker := m.get("ticker","")) else None
-        cursor = data.get("cursor")
-        if not cursor: break
+            print(f"[kalshi] {series}: {e}")
+
+    markets = [m for m in (parse_market(r) for r in markets_raw) if m]
     print(f"[kalshi] {len(markets)} active temperature markets")
     return markets
 
@@ -1127,39 +1182,41 @@ MARKET_CACHE_TTL = 280  # seconds before forcing a fresh fetch
 def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
     """
     Fetches live yes/no prices for all open KXHIGH markets.
+    Uses per-series fetching to avoid paginating 26k+ markets.
     Also updates the shared _market_cache so the main scan can reuse it.
-    Returns dict: ticker → (yes_ask, no_ask, city_code)
+    Returns dict: ticker → (yes_ask_cents, no_ask_cents, city_code)
     """
     global _market_cache, _market_cache_ts
     prices = {}
     markets_raw = []
-    cursor = None
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    end_ts = now_ts + 86400 * 2
-    while True:
-        params = {"status":"open","min_close_ts":now_ts,"max_close_ts":end_ts,"limit":200}
-        if cursor: params["cursor"] = cursor
+
+    for series in KXHIGH_SERIES:
         try:
-            r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=8)
+            r = requests.get(f"{KALSHI_BASE}/markets",
+                params={"status": "open", "series_ticker": series, "limit": 25},
+                timeout=8)
             if r.status_code == 429:
                 time.sleep(30)
-                r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=8)
+                r = requests.get(f"{KALSHI_BASE}/markets",
+                    params={"status": "open", "series_ticker": series, "limit": 25},
+                    timeout=8)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"[price_watcher] fetch error: {e}")
-            break
+            print(f"[price_watcher] fetch error {series}: {e}")
+            continue
+
         for m in data.get("markets", []):
-            series = m.get("series_ticker", "")
-            if not series.startswith("KXHIGH"): continue
             ticker    = m.get("ticker", "")
+            event_ticker = m.get("event_ticker", "") or ""
             city_code = series.replace("KXHIGH", "")
-            yes_price = m.get("yes_ask", 50)
-            no_price  = m.get("no_ask",  50)
-            prices[ticker] = (yes_price, no_price, city_code)
-            markets_raw.append(m)
-        cursor = data.get("cursor")
-        if not cursor: break
+            # Prices in dollars → convert to cents
+            yes_price = max(1, min(99, round((m.get("yes_ask_dollars") or 0.5) * 100)))
+            no_price  = max(1, min(99, round((m.get("no_ask_dollars")  or 0.5) * 100)))
+            if ticker:
+                prices[ticker] = (yes_price, no_price, city_code)
+                markets_raw.append(m)
+
     # Update shared cache so main scan doesn't need to fetch again
     with _lock:
         _market_cache = markets_raw
