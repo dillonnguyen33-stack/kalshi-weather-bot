@@ -730,6 +730,10 @@ def get_active_kalshi_markets() -> list[dict]:
         if cursor: params["cursor"] = cursor
         try:
             r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=10)
+            if r.status_code == 429:
+                print(f"[kalshi] Rate limited, waiting 30s...")
+                time.sleep(30)
+                r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=10)
             r.raise_for_status(); data = r.json()
         except Exception as e:
             print(f"[kalshi] {e}"); break
@@ -962,6 +966,9 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
         if cursor: params["cursor"] = cursor
         try:
             r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=8)
+            if r.status_code == 429:
+                time.sleep(30)
+                r = requests.get(f"{KALSHI_BASE}/markets", params=params, timeout=8)
             r.raise_for_status()
             data = r.json()
         except Exception as e:
