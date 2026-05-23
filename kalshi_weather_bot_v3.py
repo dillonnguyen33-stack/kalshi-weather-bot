@@ -44,7 +44,7 @@ from datetime import datetime, date, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-KALSHI_BASE         = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_BASE         = "https://external-api.kalshi.com/trade-api/v2"
 OPEN_METEO_BASE     = "https://api.open-meteo.com/v1"
 OPEN_METEO_ENS_BASE = "https://ensemble-api.open-meteo.com/v1"
 NWS_API_BASE        = "https://api.weather.gov"
