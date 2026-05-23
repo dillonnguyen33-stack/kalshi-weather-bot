@@ -59,7 +59,7 @@ DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
 SCAN_INTERVAL_SECS  = 300    # ensemble scan every 5 min
 TWEET_POLL_SECS     = 600    # twitter poll every 10 min
 ASOS_POLL_SECS      = 600    # ASOS observation poll every 10 min
-AFD_POLL_SECS       = 1200   # NWS AFD poll every 20 min
+AFD_POLL_SECS       = 3600   # NWS AFD poll every 60 min
 
 FIRE_EV_THRESHOLD   = 0.25   # fee-adjusted EV >= 25% → 🔥
 WATCH_EV_THRESHOLD  = 0.15   # fee-adjusted EV >= 15% → ⚠️
@@ -406,7 +406,15 @@ def classify_afd(text: str, wfo: str) -> dict:
             timeout=15,
         )
         r.raise_for_status()
-        return json.loads(r.json()["content"][0]["text"].strip())
+        raw = r.text.strip()
+        if not raw:
+            return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
+        data = r.json()
+        if "content" not in data or not data["content"]:
+            return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
+        return json.loads(data["content"][0]["text"].strip())
+    except json.JSONDecodeError:
+        return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
     except Exception as e:
         print(f"[claude/afd] {e}")
         return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
@@ -449,6 +457,7 @@ def afd_scanner_loop():
             if not text:
                 continue
             clf = classify_afd(text, wfo)
+            time.sleep(2)  # rate limit buffer between Claude calls
             if clf.get("is_signal"):
                 # Try to get cities from Claude's output first, else from WFO map
                 codes = names_to_codes(clf.get("cities", []))
@@ -885,7 +894,15 @@ def classify_tweet(text) -> dict:
             json={"model":"claude-sonnet-4-6","max_tokens":200,"system":sys,
                   "messages":[{"role":"user","content":f"Tweet: {text}"}]},timeout=15)
         r.raise_for_status()
-        return json.loads(r.json()["content"][0]["text"].strip())
+        raw = r.text.strip()
+        if not raw:
+            return {"is_signal":False,"cities":[],"direction":"","summary":""}
+        data = r.json()
+        if "content" not in data or not data["content"]:
+            return {"is_signal":False,"cities":[],"direction":"","summary":""}
+        return json.loads(data["content"][0]["text"].strip())
+    except json.JSONDecodeError:
+        return {"is_signal":False,"cities":[],"direction":"","summary":""}
     except Exception as e:
         print(f"[claude] {e}")
         return {"is_signal":False,"cities":[],"direction":"","summary":""}
@@ -913,6 +930,7 @@ def tweet_scanner_loop(user_ids):
                 seen_tweet_ids.add(tid)
                 user_since[uid] = tid
                 clf = classify_tweet(tweet["text"])
+                time.sleep(1)  # rate limit buffer
                 if clf.get("is_signal"):
                     codes = names_to_codes(clf.get("cities",[]))
                     if codes:
