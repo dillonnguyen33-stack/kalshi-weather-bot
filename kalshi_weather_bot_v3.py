@@ -80,45 +80,49 @@ NWS_UA = "KalshiWeatherBot/3.0 dillonnguyen33@gmail.com"  # required by NWS API
 # ── CITY CONFIG ───────────────────────────────────────────────────────────────
 # (lat, lon, display_name, ASOS_station_ICAO, NWS_WFO_office_id)
 CITY_COORDS = {
+    # Confirmed KXHIGH series codes
     "NY":  (40.7128,  -74.0060, "New York City",    "KNYC", "OKX"),
-    "CH":  (41.8781,  -87.6298, "Chicago",           "KMDW", "LOT"),
-    "LA":  (34.0522, -118.2437, "Los Angeles",       "KLAX", "LOX"),
-    "MI":  (25.7617,  -80.1918, "Miami",             "KMIA", "MFL"),
-    "PH":  (39.9526,  -75.1652, "Philadelphia",      "KPHL", "PHI"),
-    "AT":  (33.7490,  -84.3880, "Atlanta",           "KATL", "FFC"),
-    "MN":  (44.9778,  -93.2650, "Minneapolis",       "KMSP", "MPX"),
-    "SF":  (37.7749, -122.4194, "San Francisco",     "KSFO", "MTR"),
-    "DA":  (32.7767,  -96.7970, "Dallas",            "KDFW", "FWD"),
-    "BO":  (42.3601,  -71.0589, "Boston",            "KBOS", "BOX"),
-    "HO":  (29.7604,  -95.3698, "Houston",           "KIAH", "HGX"),
-    "DE":  (42.3314,  -83.0458, "Detroit",           "KDTW", "DTX"),
-    "SE":  (47.6062, -122.3321, "Seattle",           "KSEA", "SEW"),
-    "PHX": (33.4484, -112.0740, "Phoenix",           "KPHX", "PSR"),
-    "DV":  (39.7392, -104.9903, "Denver",            "KDEN", "BOU"),
-    "LV":  (36.1699, -115.1398, "Las Vegas",         "KLAS", "VEF"),
-    "SD":  (32.7157, -117.1611, "San Diego",         "KSAN", "SGX"),
-    "KC":  (39.0997,  -94.5786, "Kansas City",       "KMCI", "EAX"),
-    "SL":  (38.6270,  -90.1994, "St. Louis",         "KSTL", "LSX"),
-    "NO":  (29.9511,  -90.0715, "New Orleans",       "KMSY", "LIX"),
-    "CL":  (41.4993,  -81.6944, "Cleveland",         "KCLE", "CLE"),
-    "PI":  (40.4406,  -79.9959, "Pittsburgh",        "KPIT", "PBZ"),
-    "BA":  (39.2904,  -76.6122, "Baltimore",         "KBWI", "LWX"),
-    "DC":  (38.9072,  -77.0369, "Washington DC",     "KDCA", "LWX"),
-    "OL":  (36.1627,  -86.7816, "Nashville",         "KBNA", "OHX"),
-    "MEM": (35.1495,  -90.0490, "Memphis",           "KMEM", "MEG"),
-    "SA":  (29.4241,  -98.4936, "San Antonio",       "KSAT", "EWX"),
-    "AU":  (30.2672,  -97.7431, "Austin",            "KAUS", "EWX"),
-    "PO":  (45.5051, -122.6750, "Portland",          "KPDX", "PQR"),
-    "SLC": (40.7608, -111.8910, "Salt Lake City",    "KSLC", "SLC"),
-    "AL":  (35.2220,  -80.8431, "Charlotte",         "KCLT", "GSP"),
-    "IN":  (39.7684,  -86.1581, "Indianapolis",      "KIND", "IND"),
-    "COL": (39.9612,  -82.9988, "Columbus",          "KCMH", "ILN"),
-    "OK":  (35.4676,  -97.5164, "Oklahoma City",     "KOKC", "OUN"),
-    "TUC": (32.2226, -110.9747, "Tucson",            "KTUS", "TWC"),
-    "EL":  (31.7619, -106.4850, "El Paso",           "KELP", "EPZ"),
-    "MIL": (43.0389,  -87.9065, "Milwaukee",         "KMKE", "MKX"),
-    "RAL": (35.7796,  -78.6382, "Raleigh",           "KRDU", "RAH"),
-    "TAM": (27.9506,  -82.4572, "Tampa",             "KTPA", "TBW"),
+    "NYC": (40.7128,  -74.0060, "New York City",    "KNYC", "OKX"),  # KXLOWTNYC
+    "AUS": (30.2672,  -97.7431, "Austin",           "KAUS", "EWX"),
+    "LAX": (34.0522, -118.2437, "Los Angeles",      "KLAX", "LOX"),
+    "CHI": (41.8781,  -87.6298, "Chicago",          "KMDW", "LOT"),
+    "MIA": (25.7617,  -80.1918, "Miami",            "KMIA", "MFL"),
+    # Confirmed KXHIGHT series codes
+    "DAL": (32.7767,  -96.7970, "Dallas",           "KDFW", "FWD"),
+    "DC":  (38.9072,  -77.0369, "Washington DC",    "KDCA", "LWX"),
+    "SEA": (47.6062, -122.3321, "Seattle",          "KSEA", "SEW"),
+    "PHX": (33.4484, -112.0740, "Phoenix",          "KPHX", "PSR"),
+    "BOS": (42.3601,  -71.0589, "Boston",           "KBOS", "BOX"),
+    "HOU": (29.7604,  -95.3698, "Houston",          "KIAH", "HGX"),
+    "ATL": (33.7490,  -84.3880, "Atlanta",          "KATL", "FFC"),
+    "OKC": (35.4676,  -97.5164, "Oklahoma City",    "KOKC", "OUN"),
+    "LV":  (36.1699, -115.1398, "Las Vegas",        "KLAS", "VEF"),
+    "SFO": (37.7749, -122.4194, "San Francisco",    "KSFO", "MTR"),
+    "DEN": (39.7392, -104.9903, "Denver",           "KDEN", "BOU"),
+    # Unconfirmed — best guesses for remaining cities
+    "SA":  (29.4241,  -98.4936, "San Antonio",      "KSAT", "EWX"),
+    "NO":  (29.9511,  -90.0715, "New Orleans",      "KMSY", "LIX"),
+    "MN":  (44.9778,  -93.2650, "Minneapolis",      "KMSP", "MPX"),
+    "PHI": (39.9526,  -75.1652, "Philadelphia",     "KPHL", "PHI"),
+    "MEM": (35.1495,  -90.0490, "Memphis",          "KMEM", "MEG"),
+    "PI":  (40.4406,  -79.9959, "Pittsburgh",       "KPIT", "PBZ"),
+    "BA":  (39.2904,  -76.6122, "Baltimore",        "KBWI", "LWX"),
+    "CL":  (41.4993,  -81.6944, "Cleveland",        "KCLE", "CLE"),
+    "SD":  (32.7157, -117.1611, "San Diego",        "KSAN", "SGX"),
+    "KC":  (39.0997,  -94.5786, "Kansas City",      "KMCI", "EAX"),
+    "SL":  (38.6270,  -90.1994, "St. Louis",        "KSTL", "LSX"),
+    "PO":  (45.5051, -122.6750, "Portland",         "KPDX", "PQR"),
+    "AL":  (35.2220,  -80.8431, "Charlotte",        "KCLT", "GSP"),
+    "IN":  (39.7684,  -86.1581, "Indianapolis",     "KIND", "IND"),
+    "COL": (39.9612,  -82.9988, "Columbus",         "KCMH", "ILN"),
+    "TUC": (32.2226, -110.9747, "Tucson",           "KTUS", "TWC"),
+    "EL":  (31.7619, -106.4850, "El Paso",          "KELP", "EPZ"),
+    "MIL": (43.0389,  -87.9065, "Milwaukee",        "KMKE", "MKX"),
+    "RAL": (35.7796,  -78.6382, "Raleigh",          "KRDU", "RAH"),
+    "TAM": (27.9506,  -82.4572, "Tampa",            "KTPA", "TBW"),
+    "SLC": (40.7608, -111.8910, "Salt Lake City",   "KSLC", "SLC"),
+    "OL":  (36.1627,  -86.7816, "Nashville",        "KBNA", "OHX"),
+    "DE":  (42.3314,  -83.0458, "Detroit",          "KDTW", "DTX"),
 }
 
 # ── PER-CITY SEASONAL BIAS CORRECTIONS (°F) ──────────────────────────────────
@@ -128,9 +132,9 @@ CITY_COORDS = {
 # HRRR daytime warm bias at rural sites; ECMWF urban cold bias documented in lit.
 CITY_BIAS_F = {
     "NY":  [ 0.8,  0.7,  0.5,  0.3,  0.2,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.7],
-    "CH":  [ 1.2,  1.0,  0.8,  0.4,  0.2,  0.0, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
-    "LA":  [-0.5, -0.4, -0.3, -0.2, -0.2, -0.3, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
-    "MI":  [ 0.3,  0.3,  0.2,  0.1,  0.0,  0.0, -0.2, -0.2,  0.0,  0.1,  0.2,  0.3],
+    "CHI": [ 1.2,  1.0,  0.8,  0.4,  0.2,  0.0, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
+    "LAX": [-0.5, -0.4, -0.3, -0.2, -0.2, -0.3, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
+    "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  0.0, -0.2, -0.2,  0.0,  0.1,  0.2,  0.3],
     "PH":  [ 0.7,  0.6,  0.5,  0.3,  0.1,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.6],
     "AT":  [ 0.5,  0.4,  0.3,  0.2,  0.1,  0.0, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
     "MN":  [ 1.5,  1.3,  1.0,  0.5,  0.2,  0.0, -0.5, -0.4,  0.0,  0.6,  1.0,  1.4],
@@ -138,7 +142,7 @@ CITY_BIAS_F = {
     "DA":  [ 0.3,  0.2,  0.1,  0.0, -0.1, -0.3, -0.6, -0.5, -0.2,  0.0,  0.2,  0.3],
     "BO":  [ 0.9,  0.8,  0.6,  0.4,  0.2,  0.0, -0.3, -0.2,  0.0,  0.4,  0.6,  0.8],
     "PHX": [-0.4, -0.3, -0.2, -0.1,  0.0, -0.3, -0.8, -0.7, -0.3, -0.1, -0.2, -0.3],
-    "DV":  [ 0.6,  0.5,  0.4,  0.2,  0.1,  0.0, -0.4, -0.3,  0.0,  0.3,  0.5,  0.6],
+    "DEN": [ 0.6,  0.5,  0.4,  0.2,  0.1,  0.0, -0.4, -0.3,  0.0,  0.3,  0.5,  0.6],
     "SE":  [-0.3, -0.3, -0.2, -0.1,  0.0,  0.0, -0.2, -0.2, -0.1,  0.0, -0.2, -0.3],
     "HO":  [ 0.2,  0.1,  0.0, -0.1, -0.2, -0.4, -0.6, -0.6, -0.3, -0.1,  0.1,  0.2],
     "LV":  [-0.5, -0.4, -0.2,  0.0,  0.1, -0.2, -0.8, -0.7, -0.2,  0.0, -0.2, -0.4],
@@ -187,9 +191,9 @@ ALL_ACCOUNTS = NWS_CITY_OFFICES + NWS_NATIONAL + MET_ACCOUNTS
 
 CITY_KEYWORD_MAP = {
     "new york":"NY","nyc":"NY","central park":"NY","manhattan":"NY",
-    "chicago":"CH","windy city":"CH",
-    "los angeles":"LA","socal":"LA","l.a.":"LA",
-    "miami":"MI","south florida":"MI",
+    "chicago":"CHI","windy city":"CHI",
+    "los angeles":"LAX","socal":"LAX","l.a.":"LAX",
+    "miami":"MIA","south florida":"MIA",
     "philadelphia":"PH","philly":"PH",
     "atlanta":"AT","atl":"AT",
     "minneapolis":"MN","twin cities":"MN",
@@ -200,7 +204,7 @@ CITY_KEYWORD_MAP = {
     "detroit":"DE",
     "seattle":"SE",
     "phoenix":"PHX",
-    "denver":"DV",
+    "denver":"DEN",
     "las vegas":"LV",
     "san diego":"SD",
     "kansas city":"KC",
@@ -213,7 +217,7 @@ CITY_KEYWORD_MAP = {
     "nashville":"OL",
     "memphis":"MEM",
     "san antonio":"SA",
-    "austin":"AU",
+    "austin":"AUS",
     "portland":"PO",
     "salt lake":"SLC",
     "charlotte":"AL",
@@ -437,15 +441,15 @@ def names_to_codes(cities: list[str]) -> list[str]:
 def wfo_to_city_codes(wfo: str) -> list[str]:
     """Maps a WFO office ID to the city codes it covers."""
     mapping = {
-        "OKX": ["NY"], "LOT": ["CH","MIL"], "LOX": ["LA","SD"],
-        "MFL": ["MI","TAM"], "PHI": ["PH","BA","DC"], "LWX": ["BA","DC"],
+        "OKX": ["NY"], "LOT": ["CHI","MIL"], "LOX": ["LAX","SD"],
+        "MFL": ["MIA","TAM"], "PHI": ["PH","BA","DC"], "LWX": ["BA","DC"],
         "FFC": ["AT"], "MPX": ["MN"], "MTR": ["SF"],
         "FWD": ["DA"], "BOX": ["BO"], "HGX": ["HO"],
         "DTX": ["DE","CL"], "SEW": ["SE"], "PSR": ["PHX","TUC"],
-        "BOU": ["DV"], "VEF": ["LV"], "SGX": ["SD"],
+        "BOU": ["DEN"], "VEF": ["LV"], "SGX": ["SD"],
         "EAX": ["KC"], "LSX": ["SL"], "LIX": ["NO"],
         "CLE": ["CL","PI"], "PBZ": ["PI"], "OHX": ["OL"],
-        "MEG": ["MEM"], "EWX": ["SA","AU"], "PQR": ["PO"],
+        "MEG": ["MEM"], "EWX": ["SA","AUS"], "PQR": ["PO"],
         "SLC": ["SLC"], "GSP": ["AL","RAL"], "IND": ["IN"],
         "ILN": ["COL"], "OUN": ["OK"], "TWC": ["TUC"],
         "EPZ": ["EL"], "MKX": ["MIL"], "RAH": ["RAL"],
@@ -894,10 +898,19 @@ def parse_market(m: dict) -> dict | None:
     # Derive series from event_ticker (e.g. KXHIGHNY-26MAY24 → KXHIGHNY)
     event_ticker = m.get("event_ticker", "") or ""
     series = event_ticker.split("-")[0] if event_ticker else ""
-    if not series.startswith("KXHIGH"):
+    if not any(series.startswith(p) for p in ("KXHIGH","KXHIGHT","KXLOWT")):
         return None
 
-    city_code = series.replace("KXHIGH", "")
+    # Extract city code by stripping the known prefix
+    if series.startswith("KXLOWT"):
+        city_code = series[len("KXLOWT"):]
+        market_kind = "low"
+    elif series.startswith("KXHIGHT"):
+        city_code = series[len("KXHIGHT"):]
+        market_kind = "high"
+    else:
+        city_code = series[len("KXHIGH"):]
+        market_kind = "high"
     if not city_code:
         return None
 
@@ -925,15 +938,30 @@ def parse_market(m: dict) -> dict | None:
     }
 
 # All known KXHIGH series codes — used for direct per-series fetching
-KXHIGH_SERIES = [
-    "KXHIGHNY","KXHIGHAUS","KXHIGHLA","KXHIGHCH","KXHIGHMI","KXHIGHBO",
-    "KXHIGHHO","KXHIGHSE","KXHIGHDV","KXHIGHLV","KXHIGHSD","KXHIGHKC",
-    "KXHIGHSL","KXHIGHNO","KXHIGHCL","KXHIGHPI","KXHIGHBA","KXHIGHDC",
-    "KXHIGHSA","KXHIGHPO","KXHIGHAL","KXHIGHIN","KXHIGHOK","KXHIGHEL",
-    "KXHIGHMIL","KXHIGHRAL","KXHIGHTAM","KXHIGHMN","KXHIGHSF","KXHIGHAT",
-    "KXHIGHPHI","KXHIGHPHX","KXHIGHDA","KXHIGHDE","KXHIGHAU","KXHIGHCOL",
-    "KXHIGHTUC","KXHIGHSLC","KXHIGHMEM","KXHIGHOL",
+# Confirmed working series codes (verified against live Kalshi API)
+# Three prefixes: KXHIGH, KXHIGHT (high temp), KXLOWT (low temp)
+ALL_TEMP_SERIES = [
+    # High temp KXHIGH prefix (confirmed)
+    "KXHIGHNY","KXHIGHAUS","KXHIGHLAX","KXHIGHCHI","KXHIGHMIA",
+    # High temp KXHIGHT prefix (confirmed)
+    "KXHIGHTDAL","KXHIGHTDC","KXHIGHTSEA","KXHIGHTPHX","KXHIGHTBOS",
+    "KXHIGHTHOU","KXHIGHTATL","KXHIGHTOKC","KXHIGHTLV","KXHIGHTSFO",
+    "KXHIGHTDEN","KXHIGHTSA","KXHIGHTNO","KXHIGHTMN","KXHIGHTPHI",
+    "KXHIGHTMEM","KXHIGHTPI","KXHIGHTBA","KXHIGHTCL","KXHIGHTSD",
+    "KXHIGHTKC","KXHIGHTSL","KXHIGHTPO","KXHIGHTAL","KXHIGHTIN",
+    "KXHIGHTEL","KXHIGHTMIL","KXHIGHTRAL","KXHIGHTTAM","KXHIGHTSLC",
+    "KXHIGHTCOL","KXHIGHTTUC","KXHIGHTDE","KXHIGHTOL",
+    # Low temp KXLOWT prefix (confirmed)
+    "KXLOWTNYC","KXLOWTDAL","KXLOWTDC","KXLOWTSEA","KXLOWTPHX",
+    "KXLOWTBOS","KXLOWTHOU","KXLOWTATL","KXLOWTOKC","KXLOWTLV",
+    "KXLOWTSFO","KXLOWTAUS","KXLOWTLAX","KXLOWTCHI","KXLOWTMIA",
+    "KXLOWTDEN","KXLOWTSA","KXLOWTNO","KXLOWTMN","KXLOWTPHI",
+    "KXLOWTMEM","KXLOWTPI","KXLOWTBA","KXLOWTCL","KXLOWTSD",
+    "KXLOWTKC","KXLOWTSL","KXLOWTPO","KXLOWTAL","KXLOWTIN",
+    "KXLOWTEL","KXLOWTMIL","KXLOWTRAL","KXLOWTTAM","KXLOWTSLC",
+    "KXLOWTCOL","KXLOWTTUC","KXLOWTDE","KXLOWTOL",
 ]
+KXHIGH_SERIES = ALL_TEMP_SERIES  # alias for backward compat
 
 def get_active_kalshi_markets() -> list[dict]:
     global _market_cache, _market_cache_ts
