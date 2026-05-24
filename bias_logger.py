@@ -1,15 +1,18 @@
 """
-Kalshi Weather Temperature Bot — v3.7
+Kalshi Weather Temperature Bot — v3.8
 
-Changes from v3.6:
-  v3.7 — Three improvements:
-          1. Tweet pre-filter: cheap keyword check before Sonnet call,
-             cuts tweet API cost 60-70% (same pattern as AFD pre-filter)
-          2. Cross-scan alert deduplication: posted_alert_keys set keyed on
-             ticker+date prevents double-posting when price watcher triggers
-             a rescan minutes after a regular scan already fired on that market
-          3. NBM weight bump: NBM is US-tuned for high temps, weight increased
-             from 3x to 5x in the blend — will be validated by calibration report
+Changes from v3.7:
+  v3.8 — Two bug fixes:
+          1. ASOS timezone fix: ASOS time-weight now uses each city's LOCAL
+             timezone instead of ET. LA at 12:38 PT was getting 60% ASOS weight
+             (mid-afternoon ET) instead of the correct 15% (morning PT), causing
+             the observed 64°F reading to wrongly rule out high temps above 64°F
+             early in the day. City timezone added to CITY_COORDS as 6th field.
+          2. T/B type separated dedup: T-type (above/below threshold) and B-type
+             (bucket) markets are now deduplicated independently per city.
+             Previously a T63 and B63.5 were 0.5°F apart and should have been
+             caught by BUCKET_GAP_F=3, but mixed-type sorting caused them to
+             both slip through. Now each type runs its own gap-check pass.
 
 Install: pip install aiohttp requests
 """
@@ -50,9 +53,12 @@ MAX_CONCURRENT      = 8
 BUCKET_GAP_F        = 3.0
 
 ET_TZ  = ZoneInfo("America/New_York")
-NWS_UA = "KalshiWeatherBot/3.7 dillonnguyen33@gmail.com"
+PT_TZ  = ZoneInfo("America/Los_Angeles")
+CT_TZ  = ZoneInfo("America/Chicago")
+MT_TZ  = ZoneInfo("America/Denver")
+NWS_UA = "KalshiWeatherBot/3.8 dillonnguyen33@gmail.com"
 
-# ── AFD PRE-FILTER KEYWORDS (v3.6) ───────────────────────────────────────────
+# ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
     "no significant", "no significant changes",
     "near normal", "close to normal", "around normal",
@@ -87,38 +93,26 @@ def afd_should_classify(text: str) -> tuple[bool, str]:
             return True, f"signal keyword: '{kw}'"
     return False, "no signal keywords found"
 
-# ── v3.7: TWEET PRE-FILTER ────────────────────────────────────────────────────
-# Must contain at least one of these before we bother sending to Sonnet.
-# Catches weather-relevant language without missing the indirect phrasing
-# that a strict filter would drop (e.g. "running a few degrees warmer").
+# ── TWEET PRE-FILTER KEYWORDS ─────────────────────────────────────────────────
 TWEET_SIGNAL_KEYWORDS = [
-    # Direct temperature language
     "temperature", "temp", "degrees", "°f", "°c",
     "high of", "low of", "high temp", "low temp",
     "warmer", "cooler", "hotter", "colder",
     "above normal", "below normal", "above average", "below average",
     "well above", "well below",
-    # Forecast change language
     "forecast", "outlook", "update", "revised", "upgrade", "downgrade",
     "trend", "trending", "shift", "shifting", "changing",
     "uncertainty", "uncertain", "confidence",
     "model", "ensemble", "gfs", "ecmwf", "nam", "hrrr", "nbm",
-    # Pattern / event language
     "heat", "cold snap", "warm spell", "cold spell",
     "record", "anomaly", "anomalous", "exceptional",
     "pattern change", "ridge", "trough", "front", "frontal",
-    # NWS-style language
     "afd", "area forecast", "special weather",
     "degrees above", "degrees below", "degrees warmer", "degrees cooler",
     "running warm", "running cool", "running hot", "running cold",
 ]
 
 def tweet_should_classify(text: str) -> tuple[bool, str]:
-    """
-    Cheap pre-filter for tweets — identical pattern to afd_should_classify.
-    Returns (should_classify, reason).
-    Skips Sonnet if no weather-relevant language found.
-    """
     tl = text.lower()
     for kw in TWEET_SIGNAL_KEYWORDS:
         if kw in tl:
@@ -126,47 +120,48 @@ def tweet_should_classify(text: str) -> tuple[bool, str]:
     return False, "no weather keywords"
 
 # ── CITY CONFIG ───────────────────────────────────────────────────────────────
+# v3.8: 6th field = local ZoneInfo for correct ASOS time-weighting
 CITY_COORDS = {
-    "NY":  (40.7128,  -74.0060, "New York City",    "KNYC", "OKX"),
-    "NYC": (40.7128,  -74.0060, "New York City",    "KNYC", "OKX"),
-    "AUS": (30.2672,  -97.7431, "Austin",           "KAUS", "EWX"),
-    "LAX": (34.0522, -118.2437, "Los Angeles",      "KLAX", "LOX"),
-    "CHI": (41.8781,  -87.6298, "Chicago",          "KMDW", "LOT"),
-    "MIA": (25.7617,  -80.1918, "Miami",            "KMIA", "MFL"),
-    "DAL": (32.7767,  -96.7970, "Dallas",           "KDFW", "FWD"),
-    "DC":  (38.9072,  -77.0369, "Washington DC",    "KDCA", "LWX"),
-    "SEA": (47.6062, -122.3321, "Seattle",          "KSEA", "SEW"),
-    "PHX": (33.4484, -112.0740, "Phoenix",          "KPHX", "PSR"),
-    "BOS": (42.3601,  -71.0589, "Boston",           "KBOS", "BOX"),
-    "HOU": (29.7604,  -95.3698, "Houston",          "KIAH", "HGX"),
-    "ATL": (33.7490,  -84.3880, "Atlanta",          "KATL", "FFC"),
-    "OKC": (35.4676,  -97.5164, "Oklahoma City",    "KOKC", "OUN"),
-    "LV":  (36.1699, -115.1398, "Las Vegas",        "KLAS", "VEF"),
-    "SFO": (37.7749, -122.4194, "San Francisco",    "KSFO", "MTR"),
-    "DEN": (39.7392, -104.9903, "Denver",           "KDEN", "BOU"),
-    "SA":  (29.4241,  -98.4936, "San Antonio",      "KSAT", "EWX"),
-    "NO":  (29.9511,  -90.0715, "New Orleans",      "KMSY", "LIX"),
-    "MN":  (44.9778,  -93.2650, "Minneapolis",      "KMSP", "MPX"),
-    "PHI": (39.9526,  -75.1652, "Philadelphia",     "KPHL", "PHI"),
-    "MEM": (35.1495,  -90.0490, "Memphis",          "KMEM", "MEG"),
-    "PI":  (40.4406,  -79.9959, "Pittsburgh",       "KPIT", "PBZ"),
-    "BA":  (39.2904,  -76.6122, "Baltimore",        "KBWI", "LWX"),
-    "CL":  (41.4993,  -81.6944, "Cleveland",        "KCLE", "CLE"),
-    "SD":  (32.7157, -117.1611, "San Diego",        "KSAN", "SGX"),
-    "KC":  (39.0997,  -94.5786, "Kansas City",      "KMCI", "EAX"),
-    "SL":  (38.6270,  -90.1994, "St. Louis",        "KSTL", "LSX"),
-    "PO":  (45.5051, -122.6750, "Portland",         "KPDX", "PQR"),
-    "AL":  (35.2220,  -80.8431, "Charlotte",        "KCLT", "GSP"),
-    "IN":  (39.7684,  -86.1581, "Indianapolis",     "KIND", "IND"),
-    "COL": (39.9612,  -82.9988, "Columbus",         "KCMH", "ILN"),
-    "TUC": (32.2226, -110.9747, "Tucson",           "KTUS", "TWC"),
-    "EL":  (31.7619, -106.4850, "El Paso",          "KELP", "EPZ"),
-    "MIL": (43.0389,  -87.9065, "Milwaukee",        "KMKE", "MKX"),
-    "RAL": (35.7796,  -78.6382, "Raleigh",          "KRDU", "RAH"),
-    "TAM": (27.9506,  -82.4572, "Tampa",            "KTPA", "TBW"),
-    "SLC": (40.7608, -111.8910, "Salt Lake City",   "KSLC", "SLC"),
-    "OL":  (36.1627,  -86.7816, "Nashville",        "KBNA", "OHX"),
-    "DE":  (42.3314,  -83.0458, "Detroit",          "KDTW", "DTX"),
+    "NY":  (40.7128,  -74.0060, "New York City",    "KNYC", "OKX", ET_TZ),
+    "NYC": (40.7128,  -74.0060, "New York City",    "KNYC", "OKX", ET_TZ),
+    "AUS": (30.2672,  -97.7431, "Austin",           "KAUS", "EWX", CT_TZ),
+    "LAX": (34.0522, -118.2437, "Los Angeles",      "KLAX", "LOX", PT_TZ),
+    "CHI": (41.8781,  -87.6298, "Chicago",          "KMDW", "LOT", CT_TZ),
+    "MIA": (25.7617,  -80.1918, "Miami",            "KMIA", "MFL", ET_TZ),
+    "DAL": (32.7767,  -96.7970, "Dallas",           "KDFW", "FWD", CT_TZ),
+    "DC":  (38.9072,  -77.0369, "Washington DC",    "KDCA", "LWX", ET_TZ),
+    "SEA": (47.6062, -122.3321, "Seattle",          "KSEA", "SEW", PT_TZ),
+    "PHX": (33.4484, -112.0740, "Phoenix",          "KPHX", "PSR", MT_TZ),
+    "BOS": (42.3601,  -71.0589, "Boston",           "KBOS", "BOX", ET_TZ),
+    "HOU": (29.7604,  -95.3698, "Houston",          "KIAH", "HGX", CT_TZ),
+    "ATL": (33.7490,  -84.3880, "Atlanta",          "KATL", "FFC", ET_TZ),
+    "OKC": (35.4676,  -97.5164, "Oklahoma City",    "KOKC", "OUN", CT_TZ),
+    "LV":  (36.1699, -115.1398, "Las Vegas",        "KLAS", "VEF", PT_TZ),
+    "SFO": (37.7749, -122.4194, "San Francisco",    "KSFO", "MTR", PT_TZ),
+    "DEN": (39.7392, -104.9903, "Denver",           "KDEN", "BOU", MT_TZ),
+    "SA":  (29.4241,  -98.4936, "San Antonio",      "KSAT", "EWX", CT_TZ),
+    "NO":  (29.9511,  -90.0715, "New Orleans",      "KMSY", "LIX", CT_TZ),
+    "MN":  (44.9778,  -93.2650, "Minneapolis",      "KMSP", "MPX", CT_TZ),
+    "PHI": (39.9526,  -75.1652, "Philadelphia",     "KPHL", "PHI", ET_TZ),
+    "MEM": (35.1495,  -90.0490, "Memphis",          "KMEM", "MEG", CT_TZ),
+    "PI":  (40.4406,  -79.9959, "Pittsburgh",       "KPIT", "PBZ", ET_TZ),
+    "BA":  (39.2904,  -76.6122, "Baltimore",        "KBWI", "LWX", ET_TZ),
+    "CL":  (41.4993,  -81.6944, "Cleveland",        "KCLE", "CLE", ET_TZ),
+    "SD":  (32.7157, -117.1611, "San Diego",        "KSAN", "SGX", PT_TZ),
+    "KC":  (39.0997,  -94.5786, "Kansas City",      "KMCI", "EAX", CT_TZ),
+    "SL":  (38.6270,  -90.1994, "St. Louis",        "KSTL", "LSX", CT_TZ),
+    "PO":  (45.5051, -122.6750, "Portland",         "KPDX", "PQR", PT_TZ),
+    "AL":  (35.2220,  -80.8431, "Charlotte",        "KCLT", "GSP", ET_TZ),
+    "IN":  (39.7684,  -86.1581, "Indianapolis",     "KIND", "IND", ET_TZ),
+    "COL": (39.9612,  -82.9988, "Columbus",         "KCMH", "ILN", ET_TZ),
+    "TUC": (32.2226, -110.9747, "Tucson",           "KTUS", "TWC", MT_TZ),
+    "EL":  (31.7619, -106.4850, "El Paso",          "KELP", "EPZ", MT_TZ),
+    "MIL": (43.0389,  -87.9065, "Milwaukee",        "KMKE", "MKX", CT_TZ),
+    "RAL": (35.7796,  -78.6382, "Raleigh",          "KRDU", "RAH", ET_TZ),
+    "TAM": (27.9506,  -82.4572, "Tampa",            "KTPA", "TBW", ET_TZ),
+    "SLC": (40.7608, -111.8910, "Salt Lake City",   "KSLC", "SLC", MT_TZ),
+    "OL":  (36.1627,  -86.7816, "Nashville",        "KBNA", "OHX", CT_TZ),
+    "DE":  (42.3314,  -83.0458, "Detroit",          "KDTW", "DTX", ET_TZ),
 }
 
 # ── BIAS CORRECTIONS ──────────────────────────────────────────────────────────
@@ -193,6 +188,13 @@ def get_bias(city_code: str) -> float:
     month = datetime.now().month - 1
     return CITY_BIAS_F.get(city_code, DEFAULT_BIAS)[month]
 
+def get_city_tz(city_code: str) -> ZoneInfo:
+    """v3.8: return city's local timezone for correct ASOS time-weighting."""
+    info = CITY_COORDS.get(city_code)
+    if info and len(info) >= 6:
+        return info[5]
+    return ET_TZ
+
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
 asos_observed: dict[str, float]  = {}
 afd_last_hash: dict[str, str]    = {}
@@ -200,11 +202,8 @@ seen_tweet_ids: set              = set()
 seen_afd_ids: set                = set()
 tweet_flagged_cities: set        = set()
 afd_flagged_cities: set          = set()
-
-# v3.7: cross-scan dedup — ticker+date → already posted today
 posted_alert_keys: set           = set()
 last_reset_date                  = None
-
 _lock = threading.Lock()
 
 # ── DAILY RESET ───────────────────────────────────────────────────────────────
@@ -275,12 +274,12 @@ def compute_ev_kelly(model_prob: float, yes_price: int, no_price: int) -> dict:
     results = {}
     for side, price, prob in [("YES", yes_price, model_prob),
                                ("NO",  no_price,  1 - model_prob)]:
-        p     = price / 100
-        t_fee = kalshi_taker_fee(price)
-        m_fee = kalshi_maker_fee(price)
-        win   = 1 - p
-        t_ev  = prob * (win - t_fee) - (1 - prob) * p
-        m_ev  = prob * (win - m_fee) - (1 - prob) * p
+        p       = price / 100
+        t_fee   = kalshi_taker_fee(price)
+        m_fee   = kalshi_maker_fee(price)
+        win     = 1 - p
+        t_ev    = prob * (win - t_fee) - (1 - prob) * p
+        m_ev    = prob * (win - m_fee) - (1 - prob) * p
         t_kelly = max(0, (prob * win - (1 - prob) * p) / win) if win > 0 else 0
         m_kelly = max(0, t_kelly * (1 + (t_fee - m_fee) / win)) if win > 0 else 0
         results[side] = {
@@ -346,7 +345,6 @@ def fetch_afd_text(wfo: str) -> str | None:
         return None
 
 def classify_afd(text: str, wfo: str) -> dict:
-    """Haiku for AFD — v3.6. Only called after pre-filter passes."""
     if not ANTHROPIC_API_KEY or not text:
         return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
     excerpt = text[:1500]
@@ -548,7 +546,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         return None
 
     blend = list(all_members)
-    if nbm:      blend += [nbm] * 5   # v3.7: NBM weight 3x→5x (US-tuned for high temps)
+    if nbm:      blend += [nbm] * 5
     if ecmwf:    blend += [ecmwf, ecmwf]
     if hrrr:     blend += [hrrr, hrrr]
     if rap:      blend += [rap, rap]
@@ -558,14 +556,14 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
 
     mean = sum(blend) / len(blend)
     if len(all_members) >= 2:
-        am = sum(all_members) / len(all_members)
+        am     = sum(all_members) / len(all_members)
         spread = math.sqrt(sum((x-am)**2 for x in all_members) / len(all_members))
     elif len(blend) >= 2:
         spread = math.sqrt(sum((x-mean)**2 for x in blend) / len(blend))
     else:
         spread = 2.5
 
-    bias = get_bias(city_code)
+    bias           = get_bias(city_code)
     corrected_mean = mean + bias
     if len(all_members) < 10:
         spread = max(spread, 1.5)
@@ -585,7 +583,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         "ecmwf_members":  len(ecmwf_ens),
         "total_members":  len(all_members),
         "confidence":     conf,
-        "nbm_weight":     5,  # logged so calibration report can track NBM influence
+        "nbm_weight":     5,
     }
 
 # ── PROBABILITY MODEL ─────────────────────────────────────────────────────────
@@ -609,8 +607,10 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
     asos_weight = 0.0
     asos_prob   = 0.5
     if obs_high is not None:
-        now_et = datetime.now(ET_TZ)
-        hour   = now_et.hour
+        # v3.8: use city's LOCAL timezone, not ET
+        city_tz   = get_city_tz(city_code)
+        now_local = datetime.now(city_tz)
+        hour      = now_local.hour
         if hour >= 18:   asos_weight = 0.95
         elif hour >= 16: asos_weight = 0.85
         elif hour >= 14: asos_weight = 0.60
@@ -664,7 +664,6 @@ def format_units(units: float) -> str:
 
 def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0) -> dict:
     city_code = market["city_code"]
-    city_name = CITY_COORDS.get(city_code, (None,None,city_code))[2]
     best      = ev_data["best_side"]
     side_data = ev_data[best]
     conf      = forecast["confidence"]
@@ -687,7 +686,10 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
     if obs_high is not None:
-        fields.append({"name":"ASOS high","value":f"{obs_high}°F","inline":True})
+        # v3.8: show city local time alongside ASOS reading
+        city_tz   = get_city_tz(city_code)
+        local_hr  = datetime.now(city_tz).strftime("%H:%M")
+        fields.append({"name":"ASOS high","value":f"{obs_high}°F @ {local_hr} local","inline":True})
 
     sources = []
     for key, label in [("ecmwf_high","ECMWF"),("hrrr_high","HRRR"),("nbm_high","NBM"),
@@ -755,8 +757,8 @@ ALL_TEMP_SERIES = [
 KXHIGH_SERIES = ALL_TEMP_SERIES
 
 _market_cache: list[dict] = []
-_market_cache_ts: float = 0.0
-MARKET_CACHE_TTL = 280
+_market_cache_ts: float   = 0.0
+MARKET_CACHE_TTL          = 280
 
 def get_active_kalshi_markets() -> list[dict]:
     global _market_cache, _market_cache_ts
@@ -764,9 +766,8 @@ def get_active_kalshi_markets() -> list[dict]:
         cache_age = time.time() - _market_cache_ts
         if _market_cache and cache_age < MARKET_CACHE_TTL:
             raw = list(_market_cache)
-            print(f"[kalshi] Using cached market list ({len(raw)} markets, {cache_age:.0f}s old)")
             markets = [m for m in (parse_market(r) for r in raw) if m]
-            print(f"[kalshi] {len(markets)} active temperature markets (from cache)")
+            print(f"[kalshi] {len(markets)} markets (cache {cache_age:.0f}s old)")
             return markets
     markets_raw = []
     for series in KXHIGH_SERIES:
@@ -792,7 +793,6 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     cc = market["city_code"]
     if cc not in CITY_COORDS: return None
 
-    # v3.7: cross-scan dedup check before doing any work
     alert_key = f"{market['ticker']}_{today}"
     with _lock:
         if alert_key in posted_alert_keys:
@@ -844,33 +844,42 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     watch = t_ev >= WATCH_EV_THRESHOLD*100 and spread <= MAX_SPREAD_WATCH
     city  = CITY_COORDS[cc][2]
     tag   = "🔥" if fire else ("⚠️" if watch else ("🐦" if tweet_hit or afd_hit else "—"))
-    print(f"[scan] {city}: model={side_data['prob']}% implied={side_data['implied']}% "
-          f"EV={t_ev}% (maker {side_data['maker_ev']}%) spread=±{spread}°F {tag}")
+    print(f"[scan] {city} [{kind}]: model={side_data['prob']}% "
+          f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
 
     if fire or watch or ((tweet_hit or afd_hit) and t_ev > 0):
         return {
-            "market":     market,
-            "forecast":   forecast,
-            "ev_data":    ev_data,
-            "obs_high":   obs_high,
-            "tweet":      tweet_hit,
-            "afd":        afd_hit,
-            "fire":       fire,
-            "taker_ev":   t_ev,
-            "threshold":  threshold,
-            "alert_key":  alert_key,
+            "market":    market,
+            "forecast":  forecast,
+            "ev_data":   ev_data,
+            "obs_high":  obs_high,
+            "tweet":     tweet_hit,
+            "afd":       afd_hit,
+            "fire":      fire,
+            "taker_ev":  t_ev,
+            "threshold": threshold,
+            "kind":      kind,       # v3.8: pass kind for separated dedup
+            "alert_key": alert_key,
         }
     return None
 
-# ── BUCKET DEDUPLICATION ──────────────────────────────────────────────────────
+# ── v3.8: T/B SEPARATED BUCKET DEDUPLICATION ─────────────────────────────────
 def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
-    city_groups = defaultdict(list)
+    """
+    Per city, run gap-check separately for T-type and B-type markets.
+    This prevents a T63 and B63.5 from slipping through together because
+    they're only 0.5°F apart but were previously sorted in the same pass.
+    Within each type, sort by EV descending and greedily select alerts
+    that are at least BUCKET_GAP_F away from already-selected thresholds.
+    """
+    # Group by city AND kind
+    groups: dict[tuple, list] = defaultdict(list)
     for res in raw_results:
-        cc = res["market"]["city_code"]
-        city_groups[cc].append(res)
+        key = (res["market"]["city_code"], res["kind"])
+        groups[key].append(res)
 
     kept = []
-    for cc, alerts in city_groups.items():
+    for (cc, kind), alerts in groups.items():
         alerts.sort(key=lambda x: -x["taker_ev"])
         selected_thresholds = []
         for alert in alerts:
@@ -879,10 +888,10 @@ def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
             if not too_close:
                 selected_thresholds.append(thresh)
                 kept.append(alert)
-                print(f"[dedup] {cc} keeping threshold={thresh}°F EV={alert['taker_ev']}%")
+                print(f"[dedup] {cc}/{kind} keeping thresh={thresh}°F EV={alert['taker_ev']}%")
             else:
                 nearest = min(selected_thresholds, key=lambda s: abs(thresh - s))
-                print(f"[dedup] {cc} dropping threshold={thresh}°F (too close to {nearest}°F)")
+                print(f"[dedup] {cc}/{kind} dropping thresh={thresh}°F (near {nearest}°F)")
     return kept
 
 async def run_scan_async(force_codes=None):
@@ -926,7 +935,7 @@ async def run_scan_async(force_codes=None):
 
     valid_results = [r for r in raw_results if r is not None and not isinstance(r, Exception)]
     filtered      = deduplicate_buckets(valid_results)
-    print(f"[dedup] {len(valid_results)} raw alerts → {len(filtered)} after bucket dedup")
+    print(f"[dedup] {len(valid_results)} raw → {len(filtered)} after T/B separated dedup")
 
     alerts = 0
     for res in filtered:
@@ -941,18 +950,15 @@ async def run_scan_async(force_codes=None):
         units    = recommend_units(t_ev_res, forecast["confidence"], res["tweet"], res["afd"], fire)
         embed    = build_embed(market,forecast,ev_data,res["obs_high"],res["tweet"],res["afd"],units)
         post_discord(DISCORD_WEBHOOK_URL, f"{emoji} **{city} — {market['subtitle']}**", [embed])
-
-        # v3.7: mark as posted so rescan doesn't double-fire
         with _lock:
             posted_alert_keys.add(res["alert_key"])
-
         alerts += 1
 
     msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
-           f"{len(valid_results)} raw | {alerts} posted (after dedup)")
+           f"{len(valid_results)} raw | {alerts} posted")
     if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
     post_discord(DISCORD_LOG_WEBHOOK, msg)
-    print(f"[scan] Done — {alerts} alert(s) posted ({len(valid_results)} raw before dedup)")
+    print(f"[scan] Done — {alerts} posted ({len(valid_results)} raw)")
 
 def run_scan(force_codes=None):
     asyncio.run(run_scan_async(force_codes))
@@ -973,7 +979,6 @@ def get_user_ids(usernames):
     return ids
 
 def classify_tweet(text) -> dict:
-    """Sonnet for tweets — nuance matters. Only called after pre-filter passes."""
     if not ANTHROPIC_API_KEY:
         return {"is_signal":False,"cities":[],"direction":"","summary":""}
     sys_prompt = (
@@ -1014,11 +1019,10 @@ def fetch_timeline(uid, since_id):
 
 def tweet_scanner_loop(user_ids):
     print(f"[twitter] Monitoring {len(user_ids)} accounts")
-    user_since  = {uid: None for uid in user_ids.values()}
-    tw_total    = 0
-    tw_skipped  = 0
+    user_since    = {uid: None for uid in user_ids.values()}
+    tw_total      = 0
+    tw_skipped    = 0
     tw_classified = 0
-
     while True:
         for username, uid in user_ids.items():
             for tweet in fetch_timeline(uid, user_since.get(uid)):
@@ -1027,26 +1031,20 @@ def tweet_scanner_loop(user_ids):
                 seen_tweet_ids.add(tid)
                 user_since[uid] = tid
                 tw_total += 1
-
-                # v3.7: cheap pre-filter before Sonnet
                 should_classify, reason = tweet_should_classify(tweet["text"])
                 if not should_classify:
                     tw_skipped += 1
-                    print(f"[twitter] @{username} skipped ({reason}) — "
-                          f"{tw_skipped}/{tw_total} filtered")
+                    print(f"[twitter] @{username} skipped ({reason}) — {tw_skipped}/{tw_total}")
                     continue
-
                 tw_classified += 1
                 clf = classify_tweet(tweet["text"])
                 time.sleep(1)
-
                 if clf.get("is_signal"):
                     codes = names_to_codes(clf.get("cities",[]))
                     if codes:
                         with _lock: tweet_flagged_cities.update(codes)
                         print(f"[twitter] Signal @{username}: {codes} | "
                               f"{clf.get('direction')} | {clf.get('summary')}")
-
         time.sleep(TWEET_POLL_SECS)
 
 # ── PRICE WATCHER ─────────────────────────────────────────────────────────────
@@ -1056,7 +1054,7 @@ price_snapshot: dict[str, tuple[int, int]] = {}
 
 def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
     global _market_cache, _market_cache_ts
-    prices = {}
+    prices      = {}
     markets_raw = []
     for series in KXHIGH_SERIES:
         try:
@@ -1069,7 +1067,7 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             r.raise_for_status()
             data = r.json()
         except Exception as e:
-            print(f"[price_watcher] fetch error {series}: {e}")
+            print(f"[price_watcher] {series}: {e}")
             continue
         for m in data.get("markets", []):
             ticker    = m.get("ticker", "")
@@ -1087,12 +1085,11 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
 
 def price_watcher_loop():
     global price_snapshot
-    print(f"[price_watcher] Starting — polling every {PRICE_POLL_SECS}s, "
-          f"trigger on {PRICE_MOVE_TRIGGER}¢ move")
+    print(f"[price_watcher] Starting — {PRICE_POLL_SECS}s poll, {PRICE_MOVE_TRIGGER}¢ trigger")
     price_snapshot = {t: (y, n) for t, (y, n, _) in fetch_current_prices().items()}
     time.sleep(PRICE_POLL_SECS)
     while True:
-        current = fetch_current_prices()
+        current      = fetch_current_prices()
         moved_cities = set()
         for ticker, (yes_new, no_new, city_code) in current.items():
             prev = price_snapshot.get(ticker)
@@ -1102,14 +1099,13 @@ def price_watcher_loop():
             yes_old, no_old = prev
             if abs(yes_new-yes_old) >= PRICE_MOVE_TRIGGER or abs(no_new-no_old) >= PRICE_MOVE_TRIGGER:
                 moved_cities.add(city_code)
-                direction = "↑ YES" if yes_new > yes_old else ("↓ YES" if yes_new < yes_old else "")
-                print(f"[price_watcher] {city_code} {ticker}: "
-                      f"yes {yes_old}¢→{yes_new}¢ no {no_old}¢→{no_new}¢ {direction}")
+                direction = "↑" if yes_new > yes_old else "↓"
+                print(f"[price_watcher] {city_code} {ticker}: {yes_old}¢→{yes_new}¢ {direction}")
             price_snapshot[ticker] = (yes_new, no_new)
         if moved_cities:
             known = {c for c in moved_cities if c in CITY_COORDS}
             if known:
-                print(f"[price_watcher] Price move → rescan: {known}")
+                print(f"[price_watcher] Move detected → rescan: {known}")
                 run_scan(force_codes=known)
         time.sleep(PRICE_POLL_SECS)
 
@@ -1127,14 +1123,13 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.7")
-    print(f"   v3.7: Tweet pre-filter (Sonnet only when weather keywords found)")
-    print(f"         Cross-scan dedup (posted_alert_keys — no double posting on rescan)")
-    print(f"         NBM weight 3x→5x in ensemble blend")
-    print(f"   v3.6: AFD → Haiku + AFD pre-filter (~90% cost reduction)")
-    print(f"   v3.5: Bucket dedup — BUCKET_GAP_F={BUCKET_GAP_F}°F")
-    print(f"   v3.4: Price watcher triggers rescan on {PRICE_MOVE_TRIGGER}¢ moves")
-    print(f"   Concurrency: {MAX_CONCURRENT} | Accounts: {len(ALL_ACCOUNTS)} | "
+    print("🌡️  Kalshi Weather Bot v3.8")
+    print(f"   v3.8: ASOS uses city local timezone (not ET) for time-weighting")
+    print(f"         T-type and B-type markets deduplicated independently")
+    print(f"   v3.7: Tweet pre-filter | Cross-scan dedup | NBM weight 5x")
+    print(f"   v3.6: AFD → Haiku + AFD pre-filter")
+    print(f"   v3.5: Bucket dedup BUCKET_GAP_F={BUCKET_GAP_F}°F")
+    print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
     if not DISCORD_WEBHOOK_URL: print("[warn] DISCORD_WEBHOOK_URL not set")
@@ -1162,7 +1157,7 @@ def main():
         try:
             now_et = datetime.now(ET_TZ)
             if now_et.weekday() == 3 and 3 <= now_et.hour < 5:
-                print(f"[main] Kalshi maintenance window (Thu 3-5am ET) — sleeping 30 min")
+                print(f"[main] Kalshi maintenance window — sleeping 30 min")
                 time.sleep(1800)
                 continue
             run_scan()
