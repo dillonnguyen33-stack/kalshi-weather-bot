@@ -1,5 +1,5 @@
 """
-Kalshi Weather Temperature Bot — v3.3
+Kalshi Weather Temperature Bot — v3.4
 
 Changes from v3.1:
   v3.2 — CDF bucket probability fix: B-type (bucket) markets now use
@@ -268,7 +268,7 @@ def classify_afd(text: str, wfo: str) -> dict:
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":system,
+            json={"model":"claude-sonnet-4-20250514","max_tokens":200,"system":system,
                   "messages":[{"role":"user","content":f"WFO: {wfo}\n\nAFD excerpt:\n{excerpt}"}]},
             timeout=15)
         r.raise_for_status()
@@ -462,6 +462,9 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
 
     bias = get_bias(city_code)
     corrected_mean = mean + bias
+    # Floor spread at 1.5°F when fewer than 10 ensemble members
+    if len(all_members) < 10:
+        spread = max(spread, 1.5)
     conf = "high" if spread < 2.0 else ("medium" if spread < 4.0 else "low")
     return {
         "ensemble_mean":  round(mean, 1),
@@ -621,7 +624,7 @@ def parse_market(m: dict) -> dict | None:
     event_ticker = m.get("event_ticker", "") or ""
     series = event_ticker.split("-")[0] if event_ticker else ""
     if not any(series.startswith(p) for p in ("KXHIGH","KXHIGHT","KXLOWT")): return None
-    if series.startswith("KXLOWT"):   city_code = series[len("KXLOWT"):]
+    if series.startswith("KXLOWT"):   return None  # low temp needs separate min-temp forecast
     elif series.startswith("KXHIGHT"): city_code = series[len("KXHIGHT"):]
     else:                              city_code = series[len("KXHIGH"):]
     if not city_code: return None
@@ -763,7 +766,21 @@ async def run_scan_async(force_codes=None):
     if force_codes:
         markets = [m for m in markets if m["city_code"] in force_codes]
 
-    today     = date.today()
+    today = date.today()
+
+    # Filter out stale markets (settlement date = today or earlier)
+    def ticker_date(ticker):
+        try:
+            part = ticker.split("-")[1]  # e.g. 26MAY24
+            months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                      "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+            yr  = 2000 + int(part[0:2])
+            mon = months[part[2:5]]
+            day = int(part[5:7])
+            return date(yr, mon, day)
+        except:
+            return today
+    markets = [m for m in markets if ticker_date(m["ticker"]) > today]
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT+4)
     timeout   = aiohttp.ClientTimeout(total=30)
@@ -827,7 +844,7 @@ def classify_tweet(text) -> dict:
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":sys_prompt,
+            json={"model":"claude-sonnet-4-20250514","max_tokens":200,"system":sys_prompt,
                   "messages":[{"role":"user","content":f"Tweet: {text}"}]},timeout=15)
         r.raise_for_status()
         data = r.json()
@@ -947,7 +964,7 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.3")
+    print("🌡️  Kalshi Weather Bot v3.4")
     print(f"   v3.2: CDF bucket probabilities — buckets sum to 100%")
     print(f"   v3.3: bias_logger logs best_side + taker_ev correctly")
     print(f"   Concurrency:   {MAX_CONCURRENT} simultaneous model requests")
