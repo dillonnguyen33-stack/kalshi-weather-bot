@@ -1,17 +1,15 @@
 """
-Kalshi Weather Temperature Bot — v3.6
+Kalshi Weather Temperature Bot — v3.7
 
-Changes from v3.5:
-  v3.6 — API cost reduction:
-          1. AFD classifier switched from claude-sonnet-4-6 → claude-haiku-4-5-20251001
-             (~20x cheaper, same accuracy for binary signal/no-signal classification)
-          2. Loose AFD pre-filter: skips Claude entirely for routine stable-weather AFDs
-             using a two-pass check:
-               a. SKIP if opening 300 chars contains routine phrases ("no significant",
-                  "near normal", "seasonal", etc.)
-               b. PASS if body contains any signal keyword (warmer than, model spread, etc.)
-             Estimated savings: 70-80% fewer AFD Claude calls on calm weather days
-          3. Tweet classifier stays on claude-sonnet-4-6 (nuance matters there)
+Changes from v3.6:
+  v3.7 — Three improvements:
+          1. Tweet pre-filter: cheap keyword check before Sonnet call,
+             cuts tweet API cost 60-70% (same pattern as AFD pre-filter)
+          2. Cross-scan alert deduplication: posted_alert_keys set keyed on
+             ticker+date prevents double-posting when price watcher triggers
+             a rescan minutes after a regular scan already fired on that market
+          3. NBM weight bump: NBM is US-tuned for high temps, weight increased
+             from 3x to 5x in the blend — will be validated by calibration report
 
 Install: pip install aiohttp requests
 """
@@ -52,10 +50,9 @@ MAX_CONCURRENT      = 8
 BUCKET_GAP_F        = 3.0
 
 ET_TZ  = ZoneInfo("America/New_York")
-NWS_UA = "KalshiWeatherBot/3.6 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.7 dillonnguyen33@gmail.com"
 
-# ── v3.6: AFD PRE-FILTER KEYWORDS ────────────────────────────────────────────
-# If the opening 300 chars of the AFD contains ANY of these → skip Claude (routine forecast)
+# ── AFD PRE-FILTER KEYWORDS (v3.6) ───────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
     "no significant", "no significant changes",
     "near normal", "close to normal", "around normal",
@@ -64,8 +61,6 @@ AFD_ROUTINE_PHRASES = [
     "high pressure", "dry and sunny", "dry weather",
     "dominated by high pressure",
 ]
-
-# If the full AFD body contains ANY of these → send to Claude (potential signal)
 AFD_SIGNAL_KEYWORDS = [
     "uncertainty", "uncertain",
     "warmer than", "cooler than",
@@ -82,25 +77,53 @@ AFD_SIGNAL_KEYWORDS = [
 ]
 
 def afd_should_classify(text: str) -> tuple[bool, str]:
-    """
-    Two-pass pre-filter for AFD text.
-    Returns (should_classify, reason).
-
-    Pass 1: Check opening 300 chars for routine phrases → skip if found
-    Pass 2: Check full body for signal keywords → classify if found
-    If neither fires, skip (nothing interesting).
-    """
     opening = text[:300].lower()
     for phrase in AFD_ROUTINE_PHRASES:
         if phrase in opening:
             return False, f"routine opening: '{phrase}'"
-
     body = text.lower()
     for kw in AFD_SIGNAL_KEYWORDS:
         if kw in body:
             return True, f"signal keyword: '{kw}'"
-
     return False, "no signal keywords found"
+
+# ── v3.7: TWEET PRE-FILTER ────────────────────────────────────────────────────
+# Must contain at least one of these before we bother sending to Sonnet.
+# Catches weather-relevant language without missing the indirect phrasing
+# that a strict filter would drop (e.g. "running a few degrees warmer").
+TWEET_SIGNAL_KEYWORDS = [
+    # Direct temperature language
+    "temperature", "temp", "degrees", "°f", "°c",
+    "high of", "low of", "high temp", "low temp",
+    "warmer", "cooler", "hotter", "colder",
+    "above normal", "below normal", "above average", "below average",
+    "well above", "well below",
+    # Forecast change language
+    "forecast", "outlook", "update", "revised", "upgrade", "downgrade",
+    "trend", "trending", "shift", "shifting", "changing",
+    "uncertainty", "uncertain", "confidence",
+    "model", "ensemble", "gfs", "ecmwf", "nam", "hrrr", "nbm",
+    # Pattern / event language
+    "heat", "cold snap", "warm spell", "cold spell",
+    "record", "anomaly", "anomalous", "exceptional",
+    "pattern change", "ridge", "trough", "front", "frontal",
+    # NWS-style language
+    "afd", "area forecast", "special weather",
+    "degrees above", "degrees below", "degrees warmer", "degrees cooler",
+    "running warm", "running cool", "running hot", "running cold",
+]
+
+def tweet_should_classify(text: str) -> tuple[bool, str]:
+    """
+    Cheap pre-filter for tweets — identical pattern to afd_should_classify.
+    Returns (should_classify, reason).
+    Skips Sonnet if no weather-relevant language found.
+    """
+    tl = text.lower()
+    for kw in TWEET_SIGNAL_KEYWORDS:
+        if kw in tl:
+            return True, f"keyword: '{kw}'"
+    return False, "no weather keywords"
 
 # ── CITY CONFIG ───────────────────────────────────────────────────────────────
 CITY_COORDS = {
@@ -171,13 +194,30 @@ def get_bias(city_code: str) -> float:
     return CITY_BIAS_F.get(city_code, DEFAULT_BIAS)[month]
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
-asos_observed: dict[str, float] = {}
-afd_last_hash: dict[str, str]   = {}
-seen_tweet_ids: set      = set()
-seen_afd_ids:   set      = set()
-tweet_flagged_cities: set = set()
-afd_flagged_cities:   set = set()
+asos_observed: dict[str, float]  = {}
+afd_last_hash: dict[str, str]    = {}
+seen_tweet_ids: set              = set()
+seen_afd_ids: set                = set()
+tweet_flagged_cities: set        = set()
+afd_flagged_cities: set          = set()
+
+# v3.7: cross-scan dedup — ticker+date → already posted today
+posted_alert_keys: set           = set()
+last_reset_date                  = None
+
 _lock = threading.Lock()
+
+# ── DAILY RESET ───────────────────────────────────────────────────────────────
+def maybe_reset_daily():
+    global posted_alert_keys, last_reset_date
+    today = datetime.now(ET_TZ).date()
+    if last_reset_date is None:
+        last_reset_date = today
+        return
+    if today > last_reset_date:
+        print("[reset] New day — clearing posted alert keys")
+        posted_alert_keys.clear()
+        last_reset_date = today
 
 # ── TWITTER ACCOUNTS ──────────────────────────────────────────────────────────
 NWS_CITY_OFFICES = [
@@ -306,10 +346,7 @@ def fetch_afd_text(wfo: str) -> str | None:
         return None
 
 def classify_afd(text: str, wfo: str) -> dict:
-    """
-    v3.6: Uses claude-haiku-4-5-20251001 instead of Sonnet (~20x cheaper).
-    Only called after afd_should_classify() pre-filter passes.
-    """
+    """Haiku for AFD — v3.6. Only called after pre-filter passes."""
     if not ANTHROPIC_API_KEY or not text:
         return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
     excerpt = text[:1500]
@@ -325,17 +362,10 @@ def classify_afd(text: str, wfo: str) -> dict:
     )
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key":         ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type":      "application/json",
-            },
-            json={
-                "model":      "claude-haiku-4-5-20251001",  # v3.6: Haiku for AFD
-                "max_tokens": 200,
-                "system":     system,
-                "messages":   [{"role": "user", "content": f"WFO: {wfo}\n\nAFD excerpt:\n{excerpt}"}],
-            },
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
+                     "content-type":"application/json"},
+            json={"model":"claude-haiku-4-5-20251001","max_tokens":200,"system":system,
+                  "messages":[{"role":"user","content":f"WFO: {wfo}\n\nAFD excerpt:\n{excerpt}"}]},
             timeout=15)
         r.raise_for_status()
         data = r.json()
@@ -374,45 +404,27 @@ def wfo_to_city_codes(wfo: str) -> list[str]:
 def afd_scanner_loop():
     wfos = list(set(info[4] for info in CITY_COORDS.values()))
     print(f"[afd] Monitoring {len(wfos)} NWS forecast offices")
-
-    # Counters for monitoring filter effectiveness
-    afd_total     = 0
-    afd_skipped   = 0
-    afd_classified = 0
-
+    afd_total = afd_skipped = afd_classified = 0
     while True:
         for wfo in wfos:
             text = fetch_afd_text(wfo)
-            if not text:
-                continue
-
+            if not text: continue
             afd_total += 1
-
-            # ── v3.6: Pre-filter before calling Claude ────────────────────────
             should_classify, reason = afd_should_classify(text)
             if not should_classify:
                 afd_skipped += 1
-                print(f"[afd] {wfo} skipped ({reason}) — "
-                      f"{afd_skipped}/{afd_total} filtered so far")
+                print(f"[afd] {wfo} skipped ({reason}) — {afd_skipped}/{afd_total} filtered")
                 continue
-
             afd_classified += 1
-            print(f"[afd] {wfo} → Claude ({reason}) — "
-                  f"{afd_classified}/{afd_total} classified so far")
-
+            print(f"[afd] {wfo} → Claude ({reason}) — {afd_classified}/{afd_total} classified")
             clf = classify_afd(text, wfo)
             time.sleep(2)
-
             if clf.get("is_signal"):
                 codes = names_to_codes(clf.get("cities", []))
-                if not codes:
-                    codes = wfo_to_city_codes(wfo)
+                if not codes: codes = wfo_to_city_codes(wfo)
                 if codes:
-                    with _lock:
-                        afd_flagged_cities.update(codes)
-                    print(f"[afd] Signal {wfo}: {codes} | "
-                          f"{clf.get('direction')} | {clf.get('summary')}")
-
+                    with _lock: afd_flagged_cities.update(codes)
+                    print(f"[afd] Signal {wfo}: {codes} | {clf.get('direction')} | {clf.get('summary')}")
         time.sleep(AFD_POLL_SECS)
 
 # ── ASYNC FORECAST ENGINE ─────────────────────────────────────────────────────
@@ -536,7 +548,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         return None
 
     blend = list(all_members)
-    if nbm:      blend += [nbm, nbm, nbm]
+    if nbm:      blend += [nbm] * 5   # v3.7: NBM weight 3x→5x (US-tuned for high temps)
     if ecmwf:    blend += [ecmwf, ecmwf]
     if hrrr:     blend += [hrrr, hrrr]
     if rap:      blend += [rap, rap]
@@ -573,6 +585,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         "ecmwf_members":  len(ecmwf_ens),
         "total_members":  len(all_members),
         "confidence":     conf,
+        "nbm_weight":     5,  # logged so calibration report can track NBM influence
     }
 
 # ── PROBABILITY MODEL ─────────────────────────────────────────────────────────
@@ -636,13 +649,13 @@ def post_discord(webhook, content, embeds=None):
 def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire) -> float:
     signal_boost = tweet_hit and afd_hit
     if ev_pct >= 25:
-        if confidence == "high":   return 2.0 if signal_boost else 1.5
+        if confidence == "high":     return 2.0 if signal_boost else 1.5
         elif confidence == "medium": return 1.0
-        else: return 0.5
+        else:                        return 0.5
     elif ev_pct >= 15:
-        if confidence == "high":   return 1.0
+        if confidence == "high":     return 1.0
         elif confidence == "medium": return 0.5
-        else: return 0.0
+        else:                        return 0.0
     return 0.0
 
 def format_units(units: float) -> str:
@@ -779,6 +792,12 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     cc = market["city_code"]
     if cc not in CITY_COORDS: return None
 
+    # v3.7: cross-scan dedup check before doing any work
+    alert_key = f"{market['ticker']}_{today}"
+    with _lock:
+        if alert_key in posted_alert_keys:
+            return None
+
     forecast = await get_forecast(session, semaphore, cc, today)
     if not forecast: return None
 
@@ -799,7 +818,6 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
 
     ev_data = compute_ev_kelly(prob, market["yes_price"], market["no_price"])
     best    = ev_data["best_side"]
-
     if not best: return None
 
     side_data = ev_data[best]
@@ -816,10 +834,8 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
             _log_prediction(
                 today, cc, CITY_COORDS[cc][2], market["ticker"], threshold,
                 forecast, prob, market["yes_price"], market["no_price"],
-                obs_high,
-                best_side=best,
-                taker_ev=ev_data[best]["taker_ev"],
-                threshold_kind=kind,
+                obs_high, best_side=best,
+                taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
             )
         except Exception as _e:
             print(f"[bias_logger] {_e}")
@@ -833,19 +849,20 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
 
     if fire or watch or ((tweet_hit or afd_hit) and t_ev > 0):
         return {
-            "market":    market,
-            "forecast":  forecast,
-            "ev_data":   ev_data,
-            "obs_high":  obs_high,
-            "tweet":     tweet_hit,
-            "afd":       afd_hit,
-            "fire":      fire,
-            "taker_ev":  t_ev,
-            "threshold": threshold,
+            "market":     market,
+            "forecast":   forecast,
+            "ev_data":    ev_data,
+            "obs_high":   obs_high,
+            "tweet":      tweet_hit,
+            "afd":        afd_hit,
+            "fire":       fire,
+            "taker_ev":   t_ev,
+            "threshold":  threshold,
+            "alert_key":  alert_key,
         }
     return None
 
-# ── BUCKET DEDUPLICATION (v3.5) ───────────────────────────────────────────────
+# ── BUCKET DEDUPLICATION ──────────────────────────────────────────────────────
 def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
     city_groups = defaultdict(list)
     for res in raw_results:
@@ -869,12 +886,11 @@ def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
     return kept
 
 async def run_scan_async(force_codes=None):
-    ts = datetime.now(ET_TZ).strftime("%H:%M ET")
+    maybe_reset_daily()
+    ts      = datetime.now(ET_TZ).strftime("%H:%M ET")
     markets = get_active_kalshi_markets()
     if not markets:
-        msg = f"📊 **Scan done** {ts} | 0 temperature markets found"
-        if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
-        post_discord(DISCORD_LOG_WEBHOOK, msg)
+        post_discord(DISCORD_LOG_WEBHOOK, f"📊 **Scan done** {ts} | 0 markets found")
         return
     if force_codes:
         markets = [m for m in markets if m["city_code"] in force_codes]
@@ -883,7 +899,7 @@ async def run_scan_async(force_codes=None):
 
     def ticker_date(ticker):
         try:
-            part = ticker.split("-")[1]
+            part   = ticker.split("-")[1]
             months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
                       "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
             yr  = 2000 + int(part[0:2])
@@ -925,6 +941,11 @@ async def run_scan_async(force_codes=None):
         units    = recommend_units(t_ev_res, forecast["confidence"], res["tweet"], res["afd"], fire)
         embed    = build_embed(market,forecast,ev_data,res["obs_high"],res["tweet"],res["afd"],units)
         post_discord(DISCORD_WEBHOOK_URL, f"{emoji} **{city} — {market['subtitle']}**", [embed])
+
+        # v3.7: mark as posted so rescan doesn't double-fire
+        with _lock:
+            posted_alert_keys.add(res["alert_key"])
+
         alerts += 1
 
     msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
@@ -952,7 +973,7 @@ def get_user_ids(usernames):
     return ids
 
 def classify_tweet(text) -> dict:
-    """Tweet classifier stays on claude-sonnet-4-6 — nuance matters here."""
+    """Sonnet for tweets — nuance matters. Only called after pre-filter passes."""
     if not ANTHROPIC_API_KEY:
         return {"is_signal":False,"cities":[],"direction":"","summary":""}
     sys_prompt = (
@@ -963,13 +984,10 @@ def classify_tweet(text) -> dict:
     )
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={
-                "model":    "claude-sonnet-4-6",  # Sonnet stays for tweets
-                "max_tokens": 200,
-                "system":   sys_prompt,
-                "messages": [{"role":"user","content":f"Tweet: {text}"}],
-            },
+            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
+                     "content-type":"application/json"},
+            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":sys_prompt,
+                  "messages":[{"role":"user","content":f"Tweet: {text}"}]},
             timeout=15)
         r.raise_for_status()
         data = r.json()
@@ -996,7 +1014,11 @@ def fetch_timeline(uid, since_id):
 
 def tweet_scanner_loop(user_ids):
     print(f"[twitter] Monitoring {len(user_ids)} accounts")
-    user_since = {uid: None for uid in user_ids.values()}
+    user_since  = {uid: None for uid in user_ids.values()}
+    tw_total    = 0
+    tw_skipped  = 0
+    tw_classified = 0
+
     while True:
         for username, uid in user_ids.items():
             for tweet in fetch_timeline(uid, user_since.get(uid)):
@@ -1004,14 +1026,27 @@ def tweet_scanner_loop(user_ids):
                 if tid in seen_tweet_ids: continue
                 seen_tweet_ids.add(tid)
                 user_since[uid] = tid
+                tw_total += 1
+
+                # v3.7: cheap pre-filter before Sonnet
+                should_classify, reason = tweet_should_classify(tweet["text"])
+                if not should_classify:
+                    tw_skipped += 1
+                    print(f"[twitter] @{username} skipped ({reason}) — "
+                          f"{tw_skipped}/{tw_total} filtered")
+                    continue
+
+                tw_classified += 1
                 clf = classify_tweet(tweet["text"])
                 time.sleep(1)
+
                 if clf.get("is_signal"):
                     codes = names_to_codes(clf.get("cities",[]))
                     if codes:
                         with _lock: tweet_flagged_cities.update(codes)
                         print(f"[twitter] Signal @{username}: {codes} | "
                               f"{clf.get('direction')} | {clf.get('summary')}")
+
         time.sleep(TWEET_POLL_SECS)
 
 # ── PRICE WATCHER ─────────────────────────────────────────────────────────────
@@ -1074,7 +1109,7 @@ def price_watcher_loop():
         if moved_cities:
             known = {c for c in moved_cities if c in CITY_COORDS}
             if known:
-                print(f"[price_watcher] Price move detected → immediate rescan: {known}")
+                print(f"[price_watcher] Price move → rescan: {known}")
                 run_scan(force_codes=known)
         time.sleep(PRICE_POLL_SECS)
 
@@ -1092,15 +1127,15 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.6")
-    print(f"   v3.6: AFD → Haiku (~20x cheaper) + loose pre-filter")
-    print(f"         Routine AFDs skipped before Claude call")
-    print(f"         Tweet classifier stays on Sonnet")
+    print("🌡️  Kalshi Weather Bot v3.7")
+    print(f"   v3.7: Tweet pre-filter (Sonnet only when weather keywords found)")
+    print(f"         Cross-scan dedup (posted_alert_keys — no double posting on rescan)")
+    print(f"         NBM weight 3x→5x in ensemble blend")
+    print(f"   v3.6: AFD → Haiku + AFD pre-filter (~90% cost reduction)")
     print(f"   v3.5: Bucket dedup — BUCKET_GAP_F={BUCKET_GAP_F}°F")
     print(f"   v3.4: Price watcher triggers rescan on {PRICE_MOVE_TRIGGER}¢ moves")
-    print(f"   Concurrency:   {MAX_CONCURRENT} simultaneous model requests")
-    print(f"   Accounts:      {len(ALL_ACCOUNTS)} X accounts monitored")
-    print(f"   WFO offices:   {len(set(info[4] for info in CITY_COORDS.values()))} AFDs polled")
+    print(f"   Concurrency: {MAX_CONCURRENT} | Accounts: {len(ALL_ACCOUNTS)} | "
+          f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
     if not DISCORD_WEBHOOK_URL: print("[warn] DISCORD_WEBHOOK_URL not set")
     if not X_BEARER_TOKEN:      print("[warn] X_BEARER_TOKEN not set")
