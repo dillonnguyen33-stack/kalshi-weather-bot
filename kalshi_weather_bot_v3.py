@@ -268,7 +268,7 @@ def classify_afd(text: str, wfo: str) -> dict:
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":200,"system":system,
+            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":system,
                   "messages":[{"role":"user","content":f"WFO: {wfo}\n\nAFD excerpt:\n{excerpt}"}]},
             timeout=15)
         r.raise_for_status()
@@ -827,7 +827,7 @@ def classify_tweet(text) -> dict:
     try:
         r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},
-            json={"model":"claude-sonnet-4-20250514","max_tokens":200,"system":sys_prompt,
+            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":sys_prompt,
                   "messages":[{"role":"user","content":f"Tweet: {text}"}]},timeout=15)
         r.raise_for_status()
         data = r.json()
