@@ -570,38 +570,41 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0
     best      = ev_data["best_side"]
     side_data = ev_data[best]
     conf      = forecast["confidence"]
-    bar       = {"high":"🟢🟢🟢","medium":"🟢🟢⚪","low":"🟢⚪⚪"}.get(conf,"⚪⚪⚪")
     t_ev      = side_data["taker_ev"]
     m_ev      = side_data["maker_ev"]
-    color     = 0x00C851 if t_ev >= FIRE_EV_THRESHOLD*100 else 0xFFBB33
+    color     = 0x1a6b3a if t_ev >= FIRE_EV_THRESHOLD*100 else 0x854f0b
+
+    # Top 3 key fields — big and visible
     fields = [
-        {"name":"📍 City",           "value":city_name,                                         "inline":True},
-        {"name":"📋 Market",         "value":market["subtitle"],                                 "inline":True},
-        {"name":"🎯 Side",           "value":best,                                               "inline":True},
-        {"name":"📊 Model prob",     "value":f"{side_data['prob']}%",                           "inline":True},
-        {"name":"📋 Kalshi implied", "value":f"{side_data['implied']}%",                        "inline":True},
-        {"name":"🔧 Bias correction","value":f"{forecast['bias_applied']:+.2f}°F",              "inline":True},
-        {"name":"📈 EV% (taker)",    "value":f"+{t_ev}%",                                       "inline":True},
-        {"name":"📈 EV% (maker)",    "value":f"+{m_ev}% ← post limit order",                   "inline":True},
-        {"name":"💰 Half Kelly",     "value":f"{side_data['taker_hk']}% (taker) / {side_data['maker_hk']}% (maker)","inline":False},
-        {"name":"💎 QK suggest",     "value":format_units(units),                               "inline":True},
-        {"name":"🌡️ Ensemble mean",  "value":f"{forecast['corrected_mean']}°F (raw {forecast['ensemble_mean']}°F)","inline":True},
-        {"name":"📐 Spread",         "value":f"±{forecast['spread']}°F",                        "inline":True},
-        {"name":"🎯 Confidence",     "value":f"{bar} {conf.capitalize()}",                      "inline":True},
+        {"name":"Side",  "value":best,               "inline":True},
+        {"name":"EV%",   "value":f"+{t_ev}%",        "inline":True},
+        {"name":"Units", "value":format_units(units),"inline":True},
+    ]
+
+    # Detail grid
+    fields += [
+        {"name":"Model prob",     "value":f"{side_data['prob']}%",       "inline":True},
+        {"name":"Kalshi implied", "value":f"{side_data['implied']}%",    "inline":True},
+        {"name":"Ensemble mean",  "value":f"{forecast['corrected_mean']}°F", "inline":True},
+        {"name":"Spread",         "value":f"±{forecast['spread']}°F",   "inline":True},
+        {"name":"Confidence",     "value":conf.capitalize(),             "inline":True},
+        {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",  "inline":True},
+        {"name":"Maker EV",       "value":f"+{m_ev}%",                  "inline":True},
     ]
     if obs_high is not None:
-        fields.append({"name":"🔴 ASOS observed high","value":f"{obs_high}°F today","inline":True})
-    for key, label in [("ecmwf_high","🌍 ECMWF"),("hrrr_high","⚡ HRRR"),("nbm_high","🎯 NBM"),
-                        ("rap_high","🔄 RAP"),("icon_high","🇩🇪 ICON"),("tomorrow_high","🤖 Tomorrow")]:
+        fields.append({"name":"ASOS high","value":f"{obs_high}°F","inline":True})
+
+    # Model sources as single footer line
+    sources = []
+    for key, label in [("ecmwf_high","ECMWF"),("hrrr_high","HRRR"),("nbm_high","NBM"),
+                        ("rap_high","RAP"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
         if forecast.get(key):
-            fields.append({"name":label,"value":f"{forecast[key]}°F","inline":True})
-    total = forecast.get("total_members", 0)
-    if total > 0:
-        fields.append({"name":"📊 Ensemble members",
-                        "value":f"{total} total ({forecast.get('gfs_members',0)} GFS + {forecast.get('ecmwf_members',0)} ECMWF)",
-                        "inline":False})
-    if tweet_hit: fields.append({"name":"🐦 Signal","value":"Met/NWS tweet","inline":True})
-    if afd_hit:   fields.append({"name":"📄 AFD signal","value":"NWS forecast discussion flagged","inline":True})
+            sources.append(f"{label} {forecast[key]}°F")
+    if tweet_hit: sources.append("tweet signal")
+    if afd_hit:   sources.append("AFD signal")
+    if sources:
+        fields.append({"name":"\u200b","value":" | ".join(sources),"inline":False})
+
     return {"color":color,"fields":fields,
             "footer":{"text":f"{market['ticker']} | {datetime.now(ET_TZ).strftime('%H:%M ET')}"}}
 
