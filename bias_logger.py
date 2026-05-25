@@ -1,1169 +1,445 @@
 """
-Kalshi Weather Temperature Bot — v3.8
+bias_logger.py — Kalshi Weather Bot Prediction Tracker
 
-Changes from v3.7:
-  v3.8 — Two bug fixes:
-          1. ASOS timezone fix: ASOS time-weight now uses each city's LOCAL
-             timezone instead of ET. LA at 12:38 PT was getting 60% ASOS weight
-             (mid-afternoon ET) instead of the correct 15% (morning PT), causing
-             the observed 64°F reading to wrongly rule out high temps above 64°F
-             early in the day. City timezone added to CITY_COORDS as 6th field.
-          2. T/B type separated dedup: T-type (above/below threshold) and B-type
-             (bucket) markets are now deduplicated independently per city.
-             Previously a T63 and B63.5 were 0.5°F apart and should have been
-             caught by BUCKET_GAP_F=3, but mixed-type sorting caused them to
-             both slip through. Now each type runs its own gap-check pass.
+Three jobs:
+  1. log_prediction()  — called by main bot on every alert candidate
+  2. score()           — called nightly by cron; fetches Kalshi results and marks won/lost
+  3. report()          — prints calibration summary; run manually anytime
 
-Install: pip install aiohttp requests
+DB path: /data/predictions.db  (Railway Volume mount)
+         Falls back to ./predictions.db if /data doesn't exist.
 """
 
-import os, asyncio, aiohttp, math, json, time, threading, requests, re
-
-try:
-    from bias_logger import log_prediction as _log_prediction
-    BIAS_LOGGING = True
-except ImportError:
-    BIAS_LOGGING = False
-from datetime import datetime, date, timezone, timedelta
+import os
+import sqlite3
+import requests
+import json
+from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
-from collections import defaultdict
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-KALSHI_BASE         = "https://external-api.kalshi.com/trade-api/v2"
-OPEN_METEO_BASE     = "https://api.open-meteo.com/v1"
-OPEN_METEO_ENS_BASE = "https://ensemble-api.open-meteo.com/v1"
-NWS_API_BASE        = "https://api.weather.gov"
-AWC_METAR_BASE      = "https://aviationweather.gov/api/data/metar"
+# ── DB PATH ───────────────────────────────────────────────────────────────────
+# Railway: mount a Volume at /data so the DB survives redeploys.
+# Locally or without a Volume: falls back to current directory.
+_DATA_DIR = "/data" if os.path.isdir("/data") else "."
+DB_PATH   = os.path.join(_DATA_DIR, "predictions.db")
 
-X_BEARER_TOKEN      = os.environ.get("X_BEARER_TOKEN", "")
-ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
-TOMORROW_IO_KEY     = os.environ.get("TOMORROW_IO_KEY", "")
-DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
+ET_TZ         = ZoneInfo("America/New_York")
+KALSHI_BASE   = "https://external-api.kalshi.com/trade-api/v2"
+KALSHI_KEY    = os.environ.get("KALSHI_API_KEY", "")   # set in Railway env vars
+KALSHI_EMAIL  = os.environ.get("KALSHI_EMAIL", "")
+KALSHI_PASS   = os.environ.get("KALSHI_PASSWORD", "")
 
-SCAN_INTERVAL_SECS  = 300
-TWEET_POLL_SECS     = 600
-ASOS_POLL_SECS      = 600
-AFD_POLL_SECS       = 3600
-FIRE_EV_THRESHOLD   = 0.25
-WATCH_EV_THRESHOLD  = 0.15
-MAX_SPREAD_FIRE     = 3.0
-MAX_SPREAD_WATCH    = 5.0
-MAX_CONCURRENT      = 8
-BUCKET_GAP_F        = 3.0
+# ── SCHEMA ────────────────────────────────────────────────────────────────────
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS predictions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pred_date       TEXT    NOT NULL,          -- YYYY-MM-DD market date
+    logged_at       TEXT    NOT NULL,          -- ISO timestamp when logged
+    city_code       TEXT    NOT NULL,
+    city_name       TEXT    NOT NULL,
+    ticker          TEXT    NOT NULL,
+    threshold_f     REAL    NOT NULL,
+    threshold_kind  TEXT    NOT NULL,          -- T or B
+    best_side       TEXT    NOT NULL,          -- YES or NO
+    model_prob      REAL    NOT NULL,          -- 0-100
+    yes_price       INTEGER NOT NULL,          -- cents
+    no_price        INTEGER NOT NULL,          -- cents
+    taker_ev        REAL    NOT NULL,          -- percent
+    ensemble_mean   REAL,
+    corrected_mean  REAL,
+    spread          REAL,
+    bias_applied    REAL,
+    confidence      TEXT,
+    obs_high        REAL,
+    result_high     REAL,                      -- actual observed high (filled by scorer)
+    won             INTEGER,                   -- 1=win 0=loss NULL=unscored
+    clv             REAL,                      -- closing line value (filled by scorer)
+    closing_price   INTEGER,                   -- final Kalshi price before settlement
+    scored_at       TEXT,                      -- ISO timestamp when scored
+    UNIQUE(ticker, best_side, logged_at)       -- prevent duplicate log rows
+);
 
-ET_TZ  = ZoneInfo("America/New_York")
-PT_TZ  = ZoneInfo("America/Los_Angeles")
-CT_TZ  = ZoneInfo("America/Chicago")
-MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.8 dillonnguyen33@gmail.com"
+CREATE TABLE IF NOT EXISTS daily_summary (
+    summary_date    TEXT PRIMARY KEY,
+    total_alerts    INTEGER,
+    fire_alerts     INTEGER,
+    watch_alerts    INTEGER,
+    scored          INTEGER,
+    wins            INTEGER,
+    losses          INTEGER,
+    win_rate        REAL,
+    avg_ev          REAL,
+    avg_clv         REAL,
+    created_at      TEXT
+);
+"""
 
-# ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
-AFD_ROUTINE_PHRASES = [
-    "no significant", "no significant changes",
-    "near normal", "close to normal", "around normal",
-    "seasonal temperatures", "typical for this time",
-    "quiet pattern", "tranquil", "uneventful",
-    "high pressure", "dry and sunny", "dry weather",
-    "dominated by high pressure",
-]
-AFD_SIGNAL_KEYWORDS = [
-    "uncertainty", "uncertain",
-    "warmer than", "cooler than",
-    "above normal", "below normal",
-    "well above", "well below",
-    "warmer than expected", "cooler than expected",
-    "model disagreement", "model spread", "model differences",
-    "pattern change", "significant change",
-    "temperature forecast", "high temperature concern",
-    "confidence", "low confidence", "high confidence",
-    "degrees warmer", "degrees cooler",
-    "surge", "anomaly", "anomalous",
-    "record", "exceptional",
-]
+def _get_conn():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-def afd_should_classify(text: str) -> tuple[bool, str]:
-    opening = text[:300].lower()
-    for phrase in AFD_ROUTINE_PHRASES:
-        if phrase in opening:
-            return False, f"routine opening: '{phrase}'"
-    body = text.lower()
-    for kw in AFD_SIGNAL_KEYWORDS:
-        if kw in body:
-            return True, f"signal keyword: '{kw}'"
-    return False, "no signal keywords found"
+def init_db():
+    conn = _get_conn()
+    conn.executescript(SCHEMA)
+    conn.commit()
+    conn.close()
 
-# ── TWEET PRE-FILTER KEYWORDS ─────────────────────────────────────────────────
-TWEET_SIGNAL_KEYWORDS = [
-    "temperature", "temp", "degrees", "°f", "°c",
-    "high of", "low of", "high temp", "low temp",
-    "warmer", "cooler", "hotter", "colder",
-    "above normal", "below normal", "above average", "below average",
-    "well above", "well below",
-    "forecast", "outlook", "update", "revised", "upgrade", "downgrade",
-    "trend", "trending", "shift", "shifting", "changing",
-    "uncertainty", "uncertain", "confidence",
-    "model", "ensemble", "gfs", "ecmwf", "nam", "hrrr", "nbm",
-    "heat", "cold snap", "warm spell", "cold spell",
-    "record", "anomaly", "anomalous", "exceptional",
-    "pattern change", "ridge", "trough", "front", "frontal",
-    "afd", "area forecast", "special weather",
-    "degrees above", "degrees below", "degrees warmer", "degrees cooler",
-    "running warm", "running cool", "running hot", "running cold",
-]
+# ── LOG PREDICTION ────────────────────────────────────────────────────────────
+def log_prediction(
+    pred_date,          # date object
+    city_code: str,
+    city_name: str,
+    ticker: str,
+    threshold_f: float,
+    forecast: dict,
+    model_prob: float,  # 0-1 float
+    yes_price: int,
+    no_price: int,
+    obs_high,           # float or None
+    best_side: str = "YES",
+    taker_ev: float = 0.0,
+    threshold_kind: str = "T",
+):
+    """
+    Called by the main bot every time it evaluates a market.
+    Silently skips duplicates (same ticker + side logged within same minute).
+    """
+    init_db()
+    logged_at = datetime.now(ET_TZ).isoformat()
+    # Deduplicate within the same minute to avoid log spam from rescans
+    minute_ts = logged_at[:16]  # YYYY-MM-DDTHH:MM
 
-def tweet_should_classify(text: str) -> tuple[bool, str]:
-    tl = text.lower()
-    for kw in TWEET_SIGNAL_KEYWORDS:
-        if kw in tl:
-            return True, f"keyword: '{kw}'"
-    return False, "no weather keywords"
-
-# ── CITY CONFIG ───────────────────────────────────────────────────────────────
-# v3.8: 6th field = local ZoneInfo for correct ASOS time-weighting
-CITY_COORDS = {
-    "NY":  (40.7128,  -74.0060, "New York City",    "KNYC", "OKX", ET_TZ),
-    "NYC": (40.7128,  -74.0060, "New York City",    "KNYC", "OKX", ET_TZ),
-    "AUS": (30.2672,  -97.7431, "Austin",           "KAUS", "EWX", CT_TZ),
-    "LAX": (34.0522, -118.2437, "Los Angeles",      "KLAX", "LOX", PT_TZ),
-    "CHI": (41.8781,  -87.6298, "Chicago",          "KMDW", "LOT", CT_TZ),
-    "MIA": (25.7617,  -80.1918, "Miami",            "KMIA", "MFL", ET_TZ),
-    "DAL": (32.7767,  -96.7970, "Dallas",           "KDFW", "FWD", CT_TZ),
-    "DC":  (38.9072,  -77.0369, "Washington DC",    "KDCA", "LWX", ET_TZ),
-    "SEA": (47.6062, -122.3321, "Seattle",          "KSEA", "SEW", PT_TZ),
-    "PHX": (33.4484, -112.0740, "Phoenix",          "KPHX", "PSR", MT_TZ),
-    "BOS": (42.3601,  -71.0589, "Boston",           "KBOS", "BOX", ET_TZ),
-    "HOU": (29.7604,  -95.3698, "Houston",          "KIAH", "HGX", CT_TZ),
-    "ATL": (33.7490,  -84.3880, "Atlanta",          "KATL", "FFC", ET_TZ),
-    "OKC": (35.4676,  -97.5164, "Oklahoma City",    "KOKC", "OUN", CT_TZ),
-    "LV":  (36.1699, -115.1398, "Las Vegas",        "KLAS", "VEF", PT_TZ),
-    "SFO": (37.7749, -122.4194, "San Francisco",    "KSFO", "MTR", PT_TZ),
-    "DEN": (39.7392, -104.9903, "Denver",           "KDEN", "BOU", MT_TZ),
-    "SA":  (29.4241,  -98.4936, "San Antonio",      "KSAT", "EWX", CT_TZ),
-    "NO":  (29.9511,  -90.0715, "New Orleans",      "KMSY", "LIX", CT_TZ),
-    "MN":  (44.9778,  -93.2650, "Minneapolis",      "KMSP", "MPX", CT_TZ),
-    "PHI": (39.9526,  -75.1652, "Philadelphia",     "KPHL", "PHI", ET_TZ),
-    "MEM": (35.1495,  -90.0490, "Memphis",          "KMEM", "MEG", CT_TZ),
-    "PI":  (40.4406,  -79.9959, "Pittsburgh",       "KPIT", "PBZ", ET_TZ),
-    "BA":  (39.2904,  -76.6122, "Baltimore",        "KBWI", "LWX", ET_TZ),
-    "CL":  (41.4993,  -81.6944, "Cleveland",        "KCLE", "CLE", ET_TZ),
-    "SD":  (32.7157, -117.1611, "San Diego",        "KSAN", "SGX", PT_TZ),
-    "KC":  (39.0997,  -94.5786, "Kansas City",      "KMCI", "EAX", CT_TZ),
-    "SL":  (38.6270,  -90.1994, "St. Louis",        "KSTL", "LSX", CT_TZ),
-    "PO":  (45.5051, -122.6750, "Portland",         "KPDX", "PQR", PT_TZ),
-    "AL":  (35.2220,  -80.8431, "Charlotte",        "KCLT", "GSP", ET_TZ),
-    "IN":  (39.7684,  -86.1581, "Indianapolis",     "KIND", "IND", ET_TZ),
-    "COL": (39.9612,  -82.9988, "Columbus",         "KCMH", "ILN", ET_TZ),
-    "TUC": (32.2226, -110.9747, "Tucson",           "KTUS", "TWC", MT_TZ),
-    "EL":  (31.7619, -106.4850, "El Paso",          "KELP", "EPZ", MT_TZ),
-    "MIL": (43.0389,  -87.9065, "Milwaukee",        "KMKE", "MKX", CT_TZ),
-    "RAL": (35.7796,  -78.6382, "Raleigh",          "KRDU", "RAH", ET_TZ),
-    "TAM": (27.9506,  -82.4572, "Tampa",            "KTPA", "TBW", ET_TZ),
-    "SLC": (40.7608, -111.8910, "Salt Lake City",   "KSLC", "SLC", MT_TZ),
-    "OL":  (36.1627,  -86.7816, "Nashville",        "KBNA", "OHX", CT_TZ),
-    "DE":  (42.3314,  -83.0458, "Detroit",          "KDTW", "DTX", ET_TZ),
-}
-
-# ── BIAS CORRECTIONS ──────────────────────────────────────────────────────────
-CITY_BIAS_F = {
-    "NY":  [ 0.8,  0.7,  0.5,  0.3,  0.2,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.7],
-    "CHI": [ 1.2,  1.0,  0.8,  0.4,  0.2,  0.0, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
-    "LAX": [-0.5, -0.4, -0.3, -0.2, -0.2, -0.3, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
-    "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  0.0, -0.2, -0.2,  0.0,  0.1,  0.2,  0.3],
-    "PH":  [ 0.7,  0.6,  0.5,  0.3,  0.1,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.6],
-    "AT":  [ 0.5,  0.4,  0.3,  0.2,  0.1,  0.0, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
-    "MN":  [ 1.5,  1.3,  1.0,  0.5,  0.2,  0.0, -0.5, -0.4,  0.0,  0.6,  1.0,  1.4],
-    "SF":  [-0.8, -0.7, -0.6, -0.5, -0.5, -0.6, -0.7, -0.7, -0.6, -0.5, -0.6, -0.7],
-    "DA":  [ 0.3,  0.2,  0.1,  0.0, -0.1, -0.3, -0.6, -0.5, -0.2,  0.0,  0.2,  0.3],
-    "BO":  [ 0.9,  0.8,  0.6,  0.4,  0.2,  0.0, -0.3, -0.2,  0.0,  0.4,  0.6,  0.8],
-    "PHX": [-0.4, -0.3, -0.2, -0.1,  0.0, -0.3, -0.8, -0.7, -0.3, -0.1, -0.2, -0.3],
-    "DEN": [ 0.6,  0.5,  0.4,  0.2,  0.1,  0.0, -0.4, -0.3,  0.0,  0.3,  0.5,  0.6],
-    "SE":  [-0.3, -0.3, -0.2, -0.1,  0.0,  0.0, -0.2, -0.2, -0.1,  0.0, -0.2, -0.3],
-    "HO":  [ 0.2,  0.1,  0.0, -0.1, -0.2, -0.4, -0.6, -0.6, -0.3, -0.1,  0.1,  0.2],
-    "LV":  [-0.5, -0.4, -0.2,  0.0,  0.1, -0.2, -0.8, -0.7, -0.2,  0.0, -0.2, -0.4],
-}
-DEFAULT_BIAS = [0.0] * 12
-
-def get_bias(city_code: str) -> float:
-    month = datetime.now().month - 1
-    return CITY_BIAS_F.get(city_code, DEFAULT_BIAS)[month]
-
-def get_city_tz(city_code: str) -> ZoneInfo:
-    """v3.8: return city's local timezone for correct ASOS time-weighting."""
-    info = CITY_COORDS.get(city_code)
-    if info and len(info) >= 6:
-        return info[5]
-    return ET_TZ
-
-# ── RUNTIME STATE ─────────────────────────────────────────────────────────────
-asos_observed: dict[str, float]  = {}
-afd_last_hash: dict[str, str]    = {}
-seen_tweet_ids: set              = set()
-seen_afd_ids: set                = set()
-tweet_flagged_cities: set        = set()
-afd_flagged_cities: set          = set()
-posted_alert_keys: set           = set()
-last_reset_date                  = None
-_lock = threading.Lock()
-
-# ── DAILY RESET ───────────────────────────────────────────────────────────────
-def maybe_reset_daily():
-    global posted_alert_keys, last_reset_date
-    today = datetime.now(ET_TZ).date()
-    if last_reset_date is None:
-        last_reset_date = today
-        return
-    if today > last_reset_date:
-        print("[reset] New day — clearing posted alert keys")
-        posted_alert_keys.clear()
-        last_reset_date = today
-
-# ── TWITTER ACCOUNTS ──────────────────────────────────────────────────────────
-NWS_CITY_OFFICES = [
-    "NWSNewYork","NWSPhiladelphia","NWSBaltimore","NWSChicago","NWSDetroit",
-    "NWSCleveland","NWSPittsburgh","NWSLosAngeles","NWSSanDiego","NWSBayArea",
-    "NWSMiami","NWSTampaBay","NWSJacksonville","NWSAtlanta","NWSCharlotte",
-    "NWSRaleigh","NWSNashville","NWSMemphis","NWSNewOrleans","NWSHouston",
-    "NWSSanAntonio","NWSDallas","NWSMinneapolis","NWSMilwaukee","NWSIndianapolis",
-    "NWSColumbus","NWSCincinnati","NWSStLouis","NWSKansasCity","NWSOklahoma",
-    "NWSDenver","NWSSaltLake","NWSPhoenix","NWSTucson","NWSLasVegas",
-    "NWSSeattle","NWSPortland","NWSAlbuquerque","NWSElPaso","NWSBoston","NWSAlbany",
-]
-NWS_NATIONAL = [
-    "NWS","NWSWPC","NWSCPC","NWStornado","NWSSevereTstorm",
-    "NHC_Atlantic","NHC_Pacific","NWSstormreports",
-]
-MET_ACCOUNTS = [
-    "JimCantore","StuOstro","Ariweather","mikebettes","chadmyersCNN",
-    "capitalweather","AndrewFreedman","accuweather","MarkNegriBWX",
-    "EricFisher","ReedTimmerAccu","ryanhallyall","spaghettimodels",
-    "weatherbell","TaraWallace_Wx",
-]
-ALL_ACCOUNTS = NWS_CITY_OFFICES + NWS_NATIONAL + MET_ACCOUNTS
-
-CITY_KEYWORD_MAP = {
-    "new york":"NY","nyc":"NY","central park":"NY","manhattan":"NY",
-    "chicago":"CHI","windy city":"CHI",
-    "los angeles":"LAX","socal":"LAX","l.a.":"LAX",
-    "miami":"MIA","south florida":"MIA",
-    "philadelphia":"PH","philly":"PH",
-    "atlanta":"AT","atl":"AT",
-    "minneapolis":"MN","twin cities":"MN",
-    "san francisco":"SF","bay area":"SF",
-    "dallas":"DA","dfw":"DA","fort worth":"DA",
-    "boston":"BO","houston":"HO","detroit":"DE","seattle":"SE",
-    "phoenix":"PHX","denver":"DEN","las vegas":"LV","san diego":"SD",
-    "kansas city":"KC","st. louis":"SL","saint louis":"SL",
-    "new orleans":"NO","nola":"NO","cleveland":"CL","pittsburgh":"PI",
-    "baltimore":"BA","washington":"DC","d.c.":"DC","nashville":"OL",
-    "memphis":"MEM","san antonio":"SA","austin":"AUS","portland":"PO",
-    "salt lake":"SLC","charlotte":"AL","indianapolis":"IN","columbus":"COL",
-    "oklahoma city":"OK","okc":"OK","tucson":"TUC","el paso":"EL",
-    "milwaukee":"MIL","raleigh":"RAL","tampa":"TAM",
-}
-
-# ── KALSHI FEE MATH ───────────────────────────────────────────────────────────
-def kalshi_taker_fee(price_cents: int) -> float:
-    p = price_cents / 100
-    return 0.07 * p * (1 - p)
-
-def kalshi_maker_fee(price_cents: int) -> float:
-    return kalshi_taker_fee(price_cents) * 0.25
-
-def compute_ev_kelly(model_prob: float, yes_price: int, no_price: int) -> dict:
-    results = {}
-    for side, price, prob in [("YES", yes_price, model_prob),
-                               ("NO",  no_price,  1 - model_prob)]:
-        p       = price / 100
-        t_fee   = kalshi_taker_fee(price)
-        m_fee   = kalshi_maker_fee(price)
-        win     = 1 - p
-        t_ev    = prob * (win - t_fee) - (1 - prob) * p
-        m_ev    = prob * (win - m_fee) - (1 - prob) * p
-        t_kelly = max(0, (prob * win - (1 - prob) * p) / win) if win > 0 else 0
-        m_kelly = max(0, t_kelly * (1 + (t_fee - m_fee) / win)) if win > 0 else 0
-        results[side] = {
-            "prob":          round(prob * 100, 1),
-            "implied":       round(p * 100, 1),
-            "taker_ev":      round(t_ev * 100, 1),
-            "maker_ev":      round(m_ev * 100, 1),
-            "taker_hk":      round(t_kelly * 0.5 * 100, 1),
-            "maker_hk":      round(m_kelly * 0.5 * 100, 1),
-            "taker_fee_pct": round(t_fee / win * 100, 1) if win > 0 else 0,
-        }
-    best = max(("YES", "NO"), key=lambda s: results[s]["taker_ev"])
-    if results[best]["taker_ev"] <= 0:
-        best = None
-    return {"best_side": best, "YES": results["YES"], "NO": results["NO"]}
-
-# ── ASOS ──────────────────────────────────────────────────────────────────────
-def fetch_asos_high(city_code: str) -> float | None:
-    info = CITY_COORDS.get(city_code)
-    if not info: return None
-    icao = info[3]
+    conn = _get_conn()
     try:
-        r = requests.get(AWC_METAR_BASE,
-            params={"ids": icao, "format": "json", "hours": 14},
-            headers={"User-Agent": NWS_UA}, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if not data: return None
-        temps = [obs.get("temp") for obs in data if obs.get("temp") is not None]
-        if not temps: return None
-        return round(max(temps) * 9 / 5 + 32, 1)
+        # Check if we already logged this ticker+side in the same minute
+        existing = conn.execute(
+            "SELECT id FROM predictions WHERE ticker=? AND best_side=? AND logged_at LIKE ?",
+            (ticker, best_side, f"{minute_ts}%")
+        ).fetchone()
+        if existing:
+            return  # already logged this minute, skip
+
+        conn.execute("""
+            INSERT OR IGNORE INTO predictions
+            (pred_date, logged_at, city_code, city_name, ticker,
+             threshold_f, threshold_kind, best_side, model_prob,
+             yes_price, no_price, taker_ev,
+             ensemble_mean, corrected_mean, spread, bias_applied,
+             confidence, obs_high)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            str(pred_date),
+            logged_at,
+            city_code,
+            city_name,
+            ticker,
+            threshold_f,
+            threshold_kind,
+            best_side,
+            round(model_prob * 100, 2),
+            yes_price,
+            no_price,
+            taker_ev,
+            forecast.get("ensemble_mean"),
+            forecast.get("corrected_mean"),
+            forecast.get("spread"),
+            forecast.get("bias_applied"),
+            forecast.get("confidence"),
+            obs_high,
+        ))
+        conn.commit()
+        print(f"[bias_logger] logged {ticker} {best_side} EV={taker_ev}%")
     except Exception as e:
-        print(f"[asos] {city_code}/{icao}: {e}")
+        print(f"[bias_logger] log error: {e}")
+    finally:
+        conn.close()
+
+# ── KALSHI AUTH ───────────────────────────────────────────────────────────────
+_kalshi_token = None
+
+def _get_kalshi_token():
+    global _kalshi_token
+    if _kalshi_token:
+        return _kalshi_token
+    if not KALSHI_EMAIL or not KALSHI_PASS:
+        print("[scorer] KALSHI_EMAIL / KALSHI_PASSWORD not set — cannot fetch results")
+        return None
+    try:
+        r = requests.post(f"{KALSHI_BASE}/login",
+            json={"email": KALSHI_EMAIL, "password": KALSHI_PASS}, timeout=10)
+        r.raise_for_status()
+        _kalshi_token = r.json().get("token")
+        return _kalshi_token
+    except Exception as e:
+        print(f"[scorer] Kalshi auth failed: {e}")
         return None
 
-def asos_poll_loop():
-    print(f"[asos] Starting observation poll for {len(CITY_COORDS)} cities")
-    while True:
-        for code in CITY_COORDS:
-            high = fetch_asos_high(code)
-            if high is not None:
-                with _lock:
-                    asos_observed[code] = high
-        time.sleep(ASOS_POLL_SECS)
+def _kalshi_headers():
+    token = _get_kalshi_token()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
 
-# ── NWS AFD PARSER ────────────────────────────────────────────────────────────
-def fetch_afd_text(wfo: str) -> str | None:
+# ── FETCH MARKET RESULT ───────────────────────────────────────────────────────
+def _fetch_market_result(ticker: str) -> dict | None:
+    """
+    Returns dict with keys: result ('yes'/'no'/''), closing_yes_price
+    """
     try:
-        r = requests.get(f"{NWS_API_BASE}/products/types/AFD/locations/{wfo}",
-            headers={"User-Agent": NWS_UA, "Accept": "application/geo+json"}, timeout=10)
-        r.raise_for_status()
-        products = r.json().get("@graph", [])
-        if not products: return None
-        latest_id = products[0].get("id")
-        if not latest_id or latest_id in seen_afd_ids: return None
-        seen_afd_ids.add(latest_id)
-        r2 = requests.get(f"{NWS_API_BASE}/products/{latest_id}",
-            headers={"User-Agent": NWS_UA}, timeout=10)
-        r2.raise_for_status()
-        return r2.json().get("productText", "")
-    except Exception as e:
-        print(f"[afd] {wfo}: {e}")
-        return None
-
-def classify_afd(text: str, wfo: str) -> dict:
-    if not ANTHROPIC_API_KEY or not text:
-        return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
-    excerpt = text[:1500]
-    system = (
-        "You classify NWS Area Forecast Discussion (AFD) text for weather market signals. "
-        "Respond ONLY with valid JSON. "
-        "A SIGNAL = the AFD mentions: model disagreement, uncertain temperature forecast, "
-        "pattern change affecting high temps, significant warm/cold deviation from normal, "
-        "or forecaster explicitly flagging temperature forecast confidence issues. "
-        "Routine stable forecasts are NOT signals. "
-        '{"is_signal":bool,"cities":["city names"],"direction":"warmer"|"cooler"|"uncertain"|"",'
-        '"confidence":"high"|"medium"|"low","summary":"one sentence or empty string"}'
-    )
-    try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
-                     "content-type":"application/json"},
-            json={"model":"claude-haiku-4-5-20251001","max_tokens":200,"system":system,
-                  "messages":[{"role":"user","content":f"WFO: {wfo}\n\nAFD excerpt:\n{excerpt}"}]},
-            timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if "content" not in data or not data["content"]:
-            return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
-        return json.loads(data["content"][0]["text"].strip())
-    except json.JSONDecodeError:
-        return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
-    except Exception as e:
-        print(f"[claude/afd] {e}")
-        return {"is_signal": False, "cities": [], "direction": "", "summary": ""}
-
-def names_to_codes(cities: list[str]) -> list[str]:
-    codes = []
-    for city in cities:
-        cl = city.lower()
-        for kw, code in CITY_KEYWORD_MAP.items():
-            if kw in cl:
-                codes.append(code); break
-    return list(set(codes))
-
-def wfo_to_city_codes(wfo: str) -> list[str]:
-    mapping = {
-        "OKX":["NY"],"LOT":["CHI","MIL"],"LOX":["LAX","SD"],
-        "MFL":["MIA","TAM"],"PHI":["PH","BA","DC"],"LWX":["BA","DC"],
-        "FFC":["AT"],"MPX":["MN"],"MTR":["SF"],"FWD":["DA"],"BOX":["BO"],
-        "HGX":["HO"],"DTX":["DE","CL"],"SEW":["SE"],"PSR":["PHX","TUC"],
-        "BOU":["DEN"],"VEF":["LV"],"SGX":["SD"],"EAX":["KC"],"LSX":["SL"],
-        "LIX":["NO"],"CLE":["CL","PI"],"PBZ":["PI"],"OHX":["OL"],
-        "MEG":["MEM"],"EWX":["SA","AUS"],"PQR":["PO"],"SLC":["SLC"],
-        "GSP":["AL","RAL"],"IND":["IN"],"ILN":["COL"],"OUN":["OK"],
-        "TWC":["TUC"],"EPZ":["EL"],"MKX":["MIL"],"RAH":["RAL"],"TBW":["TAM"],
-    }
-    return mapping.get(wfo.upper(), [])
-
-def afd_scanner_loop():
-    wfos = list(set(info[4] for info in CITY_COORDS.values()))
-    print(f"[afd] Monitoring {len(wfos)} NWS forecast offices")
-    afd_total = afd_skipped = afd_classified = 0
-    while True:
-        for wfo in wfos:
-            text = fetch_afd_text(wfo)
-            if not text: continue
-            afd_total += 1
-            should_classify, reason = afd_should_classify(text)
-            if not should_classify:
-                afd_skipped += 1
-                print(f"[afd] {wfo} skipped ({reason}) — {afd_skipped}/{afd_total} filtered")
-                continue
-            afd_classified += 1
-            print(f"[afd] {wfo} → Claude ({reason}) — {afd_classified}/{afd_total} classified")
-            clf = classify_afd(text, wfo)
-            time.sleep(2)
-            if clf.get("is_signal"):
-                codes = names_to_codes(clf.get("cities", []))
-                if not codes: codes = wfo_to_city_codes(wfo)
-                if codes:
-                    with _lock: afd_flagged_cities.update(codes)
-                    print(f"[afd] Signal {wfo}: {codes} | {clf.get('direction')} | {clf.get('summary')}")
-        time.sleep(AFD_POLL_SECS)
-
-# ── ASYNC FORECAST ENGINE ─────────────────────────────────────────────────────
-async def _get_json(session: aiohttp.ClientSession, url: str, params: dict) -> dict:
-    async with session.get(url, params=params) as r:
-        return await r.json()
-
-async def fetch_ecmwf(session, lat, lon, ds) -> float | None:
-    try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/ecmwf", {
-            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds})
-        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
-        return max(temps) if temps else None
-    except: return None
-
-async def fetch_hrrr(session, lat, lon, ds) -> float | None:
-    try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
-            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"hrrr"})
-        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
-        return max(temps) if temps else None
-    except: return None
-
-async def fetch_rap(session, lat, lon, ds) -> float | None:
-    try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
-            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"rap"})
-        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
-        return max(temps) if temps else None
-    except: return None
-
-async def fetch_gfs_ensemble(session, lat, lon, ds) -> list[float]:
-    try:
-        members = ",".join([f"temperature_2m_member{i:02d}" for i in range(1,32)])
-        data = await _get_json(session, f"{OPEN_METEO_ENS_BASE}/ensemble", {
-            "latitude":lat,"longitude":lon,"hourly":members,
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"gfs_seamless"})
-        hourly = data.get("hourly",{})
-        highs = []
-        for i in range(1,32):
-            temps = [t for t in (hourly.get(f"temperature_2m_member{i:02d}") or []) if t is not None]
-            if temps: highs.append(max(temps))
-        return highs
-    except: return []
-
-async def fetch_nbm(session, lat, lon, ds) -> float | None:
-    try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
-            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"nbm"})
-        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
-        return max(temps) if temps else None
-    except: return None
-
-async def fetch_icon(session, lat, lon, ds) -> float | None:
-    try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
-            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"icon_seamless"})
-        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
-        return max(temps) if temps else None
-    except: return None
-
-async def fetch_ecmwf_ensemble(session, lat, lon, ds) -> list[float]:
-    try:
-        members = ",".join([f"temperature_2m_member{i:02d}" for i in range(0,51)])
-        data = await _get_json(session, f"{OPEN_METEO_ENS_BASE}/ensemble", {
-            "latitude":lat,"longitude":lon,"hourly":members,
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"ecmwf_ifs025"})
-        hourly = data.get("hourly",{})
-        highs = []
-        for i in range(0,51):
-            temps = [t for t in (hourly.get(f"temperature_2m_member{i:02d}") or []) if t is not None]
-            if temps: highs.append(max(temps))
-        return highs
-    except: return []
-
-async def fetch_tomorrow_io(session, lat, lon, ds) -> float | None:
-    if not TOMORROW_IO_KEY: return None
-    try:
-        async with session.get("https://api.tomorrow.io/v4/weather/forecast",
-            params={"location":f"{lat},{lon}","apikey":TOMORROW_IO_KEY,"units":"imperial",
-                    "timesteps":"1d","fields":"temperatureMax",
-                    "startTime":f"{ds}T00:00:00Z","endTime":f"{ds}T23:59:59Z"}) as r:
-            data = await r.json()
-            days = data.get("timelines",{}).get("daily",[])
-            return days[0].get("values",{}).get("temperatureMax") if days else None
-    except: return None
-
-async def get_forecast(session, semaphore, city_code, target_date) -> dict | None:
-    info = CITY_COORDS.get(city_code)
-    if not info: return None
-    lat, lon = info[0], info[1]
-    ds = target_date.isoformat()
-    async with semaphore:
-        ecmwf, hrrr, rap, gfs, nbm, icon, ecmwf_ens, tomorrow = await asyncio.gather(
-            fetch_ecmwf(session, lat, lon, ds),
-            fetch_hrrr(session, lat, lon, ds),
-            fetch_rap(session, lat, lon, ds),
-            fetch_gfs_ensemble(session, lat, lon, ds),
-            fetch_nbm(session, lat, lon, ds),
-            fetch_icon(session, lat, lon, ds),
-            fetch_ecmwf_ensemble(session, lat, lon, ds),
-            fetch_tomorrow_io(session, lat, lon, ds),
-            return_exceptions=True,
-        )
-    if isinstance(ecmwf, Exception):     ecmwf     = None
-    if isinstance(hrrr, Exception):      hrrr      = None
-    if isinstance(rap, Exception):       rap       = None
-    if isinstance(gfs, Exception):       gfs       = []
-    if isinstance(nbm, Exception):       nbm       = None
-    if isinstance(icon, Exception):      icon      = None
-    if isinstance(ecmwf_ens, Exception): ecmwf_ens = []
-    if isinstance(tomorrow, Exception):  tomorrow  = None
-
-    all_members = list(gfs) + list(ecmwf_ens)
-    if not all_members and ecmwf is None and hrrr is None and nbm is None:
-        return None
-
-    blend = list(all_members)
-    if nbm:      blend += [nbm] * 5
-    if ecmwf:    blend += [ecmwf, ecmwf]
-    if hrrr:     blend += [hrrr, hrrr]
-    if rap:      blend += [rap, rap]
-    if icon:     blend.append(icon)
-    if tomorrow: blend.append(tomorrow)
-    if not blend: return None
-
-    mean = sum(blend) / len(blend)
-    if len(all_members) >= 2:
-        am     = sum(all_members) / len(all_members)
-        spread = math.sqrt(sum((x-am)**2 for x in all_members) / len(all_members))
-    elif len(blend) >= 2:
-        spread = math.sqrt(sum((x-mean)**2 for x in blend) / len(blend))
-    else:
-        spread = 2.5
-
-    bias           = get_bias(city_code)
-    corrected_mean = mean + bias
-    if len(all_members) < 10:
-        spread = max(spread, 1.5)
-    conf = "high" if spread < 2.0 else ("medium" if spread < 4.0 else "low")
-    return {
-        "ensemble_mean":  round(mean, 1),
-        "corrected_mean": round(corrected_mean, 1),
-        "bias_applied":   round(bias, 2),
-        "spread":         round(spread, 2),
-        "ecmwf_high":     round(ecmwf, 1)    if ecmwf    else None,
-        "hrrr_high":      round(hrrr, 1)     if hrrr     else None,
-        "nbm_high":       round(nbm, 1)      if nbm      else None,
-        "rap_high":       round(rap, 1)      if rap      else None,
-        "icon_high":      round(icon, 1)     if icon     else None,
-        "tomorrow_high":  round(tomorrow, 1) if tomorrow else None,
-        "gfs_members":    len(gfs),
-        "ecmwf_members":  len(ecmwf_ens),
-        "total_members":  len(all_members),
-        "confidence":     conf,
-        "nbm_weight":     5,
-    }
-
-# ── PROBABILITY MODEL ─────────────────────────────────────────────────────────
-def _normal_cdf(x: float, mean: float, spread: float) -> float:
-    if spread == 0:
-        return 0.0 if x < mean else 1.0
-    z = (x - mean) / spread
-    t = 1 / (1 + 0.2316419 * abs(z))
-    p = t * (0.319381530 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))))
-    phi = 1 - (1 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * z * z) * p
-    return round(phi if z >= 0 else 1 - phi, 6)
-
-def model_probability(forecast: dict, threshold: float, city_code: str,
-                      kind: str = "T", lo: float = None, hi: float = None) -> float:
-    mean   = forecast["corrected_mean"]
-    spread = max(forecast["spread"], 0.5)
-
-    with _lock:
-        obs_high = asos_observed.get(city_code)
-
-    asos_weight = 0.0
-    asos_prob   = 0.5
-    if obs_high is not None:
-        # v3.8: use city's LOCAL timezone, not ET
-        city_tz   = get_city_tz(city_code)
-        now_local = datetime.now(city_tz)
-        hour      = now_local.hour
-        if hour >= 18:   asos_weight = 0.95
-        elif hour >= 16: asos_weight = 0.85
-        elif hour >= 14: asos_weight = 0.60
-        elif hour >= 12: asos_weight = 0.40
-        else:            asos_weight = 0.15
-
-    if kind == "B" and lo is not None and hi is not None:
-        ensemble_prob = _normal_cdf(hi, mean, spread) - _normal_cdf(lo, mean, spread)
-        if obs_high is not None:
-            asos_prob = 0.97 if lo <= obs_high < hi else 0.03
-    else:
-        ensemble_prob = 1.0 - _normal_cdf(threshold, mean, spread)
-        if obs_high is not None:
-            asos_prob = 0.98 if obs_high >= threshold else 0.02
-
-    if obs_high is not None:
-        prob = asos_weight * asos_prob + (1 - asos_weight) * ensemble_prob
-    else:
-        prob = ensemble_prob
-
-    return round(max(0.01, min(0.99, prob)), 4)
-
-def longshot_probability_adjustment(implied_p: float) -> float:
-    if implied_p < 0.10: return -0.03
-    if implied_p > 0.90: return +0.03
-    return 0.0
-
-# ── DISCORD ───────────────────────────────────────────────────────────────────
-def post_discord(webhook, content, embeds=None):
-    if not webhook: return
-    try:
-        requests.post(webhook, json={"content":content,"embeds":embeds or []}, timeout=10)
-    except Exception as e:
-        print(f"[discord] {e}")
-
-def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire) -> float:
-    signal_boost = tweet_hit and afd_hit
-    if ev_pct >= 25:
-        if confidence == "high":     return 2.0 if signal_boost else 1.5
-        elif confidence == "medium": return 1.0
-        else:                        return 0.5
-    elif ev_pct >= 15:
-        if confidence == "high":     return 1.0
-        elif confidence == "medium": return 0.5
-        else:                        return 0.0
-    return 0.0
-
-def format_units(units: float) -> str:
-    if units == 0: return "0u — flag only"
-    return f"{int(units)}u" if units == int(units) else f"{units}u"
-
-def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0) -> dict:
-    city_code = market["city_code"]
-    best      = ev_data["best_side"]
-    side_data = ev_data[best]
-    conf      = forecast["confidence"]
-    t_ev      = side_data["taker_ev"]
-    m_ev      = side_data["maker_ev"]
-    color     = 0x1a6b3a if t_ev >= FIRE_EV_THRESHOLD*100 else 0x854f0b
-
-    fields = [
-        {"name":"Side",  "value":best,               "inline":True},
-        {"name":"EV%",   "value":f"+{t_ev}%",        "inline":True},
-        {"name":"Units", "value":format_units(units),"inline":True},
-    ]
-    fields += [
-        {"name":"Model prob",     "value":f"{side_data['prob']}%",           "inline":True},
-        {"name":"Kalshi implied", "value":f"{side_data['implied']}%",        "inline":True},
-        {"name":"Ensemble mean",  "value":f"{forecast['corrected_mean']}°F", "inline":True},
-        {"name":"Spread",         "value":f"±{forecast['spread']}°F",        "inline":True},
-        {"name":"Confidence",     "value":conf.capitalize(),                 "inline":True},
-        {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",       "inline":True},
-        {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
-    ]
-    if obs_high is not None:
-        # v3.8: show city local time alongside ASOS reading
-        city_tz   = get_city_tz(city_code)
-        local_hr  = datetime.now(city_tz).strftime("%H:%M")
-        fields.append({"name":"ASOS high","value":f"{obs_high}°F @ {local_hr} local","inline":True})
-
-    sources = []
-    for key, label in [("ecmwf_high","ECMWF"),("hrrr_high","HRRR"),("nbm_high","NBM"),
-                        ("rap_high","RAP"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
-        if forecast.get(key):
-            sources.append(f"{label} {forecast[key]}°F")
-    if tweet_hit: sources.append("tweet signal")
-    if afd_hit:   sources.append("AFD signal")
-    if sources:
-        fields.append({"name":"\u200b","value":" | ".join(sources),"inline":False})
-
-    return {"color":color,"fields":fields,
-            "footer":{"text":f"{market['ticker']} | {datetime.now(ET_TZ).strftime('%H:%M ET')}"}}
-
-# ── KALSHI MARKET DISCOVERY ───────────────────────────────────────────────────
-def parse_threshold_from_ticker(ticker: str) -> tuple[float | None, str]:
-    parts = ticker.rsplit("-", 1)
-    if len(parts) < 2: return None, ""
-    suffix = parts[1]
-    if suffix.startswith("T"):
-        try: return float(suffix[1:]), "T"
-        except ValueError: return None, ""
-    if suffix.startswith("B"):
-        try: return float(suffix[1:]) + 0.5, "B"
-        except ValueError: return None, ""
-    return None, ""
-
-def parse_market(m: dict) -> dict | None:
-    ticker = m.get("ticker", "")
-    if not ticker: return None
-    event_ticker = m.get("event_ticker", "") or ""
-    series = event_ticker.split("-")[0] if event_ticker else ""
-    if not any(series.startswith(p) for p in ("KXHIGH","KXHIGHT","KXLOWT")): return None
-    if series.startswith("KXLOWT"):    return None
-    elif series.startswith("KXHIGHT"): city_code = series[len("KXHIGHT"):]
-    else:                              city_code = series[len("KXHIGH"):]
-    if not city_code: return None
-    threshold, kind = parse_threshold_from_ticker(ticker)
-    if threshold is None: return None
-    yes_price = max(1, min(99, round(float(m.get("yes_ask_dollars") or 0.5) * 100)))
-    no_price  = max(1, min(99, round(float(m.get("no_ask_dollars")  or 0.5) * 100)))
-    subtitle  = m.get("title", "") or m.get("yes_sub_title", "") or ticker
-    return {"ticker":ticker,"series":series,"city_code":city_code,
-            "threshold_f":threshold,"threshold_kind":kind,
-            "yes_price":yes_price,"no_price":no_price,"subtitle":subtitle}
-
-ALL_TEMP_SERIES = [
-    "KXHIGHNY","KXHIGHAUS","KXHIGHLAX","KXHIGHCHI","KXHIGHMIA",
-    "KXHIGHTDAL","KXHIGHTDC","KXHIGHTSEA","KXHIGHTPHX","KXHIGHTBOS",
-    "KXHIGHTHOU","KXHIGHTATL","KXHIGHTOKC","KXHIGHTLV","KXHIGHTSFO",
-    "KXHIGHTDEN","KXHIGHTSA","KXHIGHTNO","KXHIGHTMN","KXHIGHTPHI",
-    "KXHIGHTMEM","KXHIGHTPI","KXHIGHTBA","KXHIGHTCL","KXHIGHTSD",
-    "KXHIGHTKC","KXHIGHTSL","KXHIGHTPO","KXHIGHTAL","KXHIGHTIN",
-    "KXHIGHTEL","KXHIGHTMIL","KXHIGHTRAL","KXHIGHTTAM","KXHIGHTSLC",
-    "KXHIGHTCOL","KXHIGHTTUC","KXHIGHTDE","KXHIGHTOL",
-    "KXLOWTNYC","KXLOWTDAL","KXLOWTDC","KXLOWTSEA","KXLOWTPHX",
-    "KXLOWTBOS","KXLOWTHOU","KXLOWTATL","KXLOWTOKC","KXLOWTLV",
-    "KXLOWTSFO","KXLOWTAUS","KXLOWTLAX","KXLOWTCHI","KXLOWTMIA",
-    "KXLOWTDEN","KXLOWTSA","KXLOWTNO","KXLOWTMN","KXLOWTPHI",
-    "KXLOWTMEM","KXLOWTPI","KXLOWTBA","KXLOWTCL","KXLOWTSD",
-    "KXLOWTKC","KXLOWTSL","KXLOWTPO","KXLOWTAL","KXLOWTIN",
-    "KXLOWTEL","KXLOWTMIL","KXLOWTRAL","KXLOWTTAM","KXLOWTSLC",
-    "KXLOWTCOL","KXLOWTTUC","KXLOWTDE","KXLOWTOL",
-]
-KXHIGH_SERIES = ALL_TEMP_SERIES
-
-_market_cache: list[dict] = []
-_market_cache_ts: float   = 0.0
-MARKET_CACHE_TTL          = 280
-
-def get_active_kalshi_markets() -> list[dict]:
-    global _market_cache, _market_cache_ts
-    with _lock:
-        cache_age = time.time() - _market_cache_ts
-        if _market_cache and cache_age < MARKET_CACHE_TTL:
-            raw = list(_market_cache)
-            markets = [m for m in (parse_market(r) for r in raw) if m]
-            print(f"[kalshi] {len(markets)} markets (cache {cache_age:.0f}s old)")
-            return markets
-    markets_raw = []
-    for series in KXHIGH_SERIES:
-        try:
-            r = requests.get(f"{KALSHI_BASE}/markets",
-                params={"status":"open","series_ticker":series,"limit":25}, timeout=10)
-            if r.status_code == 429:
-                print(f"[kalshi] Rate limited, waiting 30s...")
-                time.sleep(30)
-                r = requests.get(f"{KALSHI_BASE}/markets",
-                    params={"status":"open","series_ticker":series,"limit":25}, timeout=10)
-            r.raise_for_status()
-            markets_raw.extend(r.json().get("markets", []))
-        except Exception as e:
-            print(f"[kalshi] {series}: {e}")
-        time.sleep(0.5)
-    markets = [m for m in (parse_market(r) for r in markets_raw) if m]
-    print(f"[kalshi] {len(markets)} active temperature markets")
-    return markets
-
-# ── ASYNC SCAN ────────────────────────────────────────────────────────────────
-async def scan_market_async(session, semaphore, market, today, tweet_cities, afd_cities):
-    cc = market["city_code"]
-    if cc not in CITY_COORDS: return None
-
-    alert_key = f"{market['ticker']}_{today}"
-    with _lock:
-        if alert_key in posted_alert_keys:
+        r = requests.get(f"{KALSHI_BASE}/markets/{ticker}",
+            headers=_kalshi_headers(), timeout=10)
+        if r.status_code == 404:
             return None
-
-    forecast = await get_forecast(session, semaphore, cc, today)
-    if not forecast: return None
-
-    threshold = market["threshold_f"]
-    kind      = market["threshold_kind"]
-
-    if kind == "B":
-        lo   = threshold - 0.5
-        hi   = threshold + 0.5
-        prob = model_probability(forecast, threshold, cc, kind="B", lo=lo, hi=hi)
-    else:
-        lo, hi = None, None
-        prob   = model_probability(forecast, threshold, cc, kind="T")
-
-    implied_p = market["yes_price"] / 100
-    adj       = longshot_probability_adjustment(implied_p)
-    prob      = max(0.01, min(0.99, prob + adj))
-
-    ev_data = compute_ev_kelly(prob, market["yes_price"], market["no_price"])
-    best    = ev_data["best_side"]
-    if not best: return None
-
-    side_data = ev_data[best]
-    t_ev      = side_data["taker_ev"]
-    spread    = forecast["spread"]
-
-    with _lock:
-        obs_high = asos_observed.get(cc)
-    tweet_hit = bool(tweet_cities and cc in tweet_cities)
-    afd_hit   = bool(afd_cities and cc in afd_cities)
-
-    if BIAS_LOGGING:
-        try:
-            _log_prediction(
-                today, cc, CITY_COORDS[cc][2], market["ticker"], threshold,
-                forecast, prob, market["yes_price"], market["no_price"],
-                obs_high, best_side=best,
-                taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
-            )
-        except Exception as _e:
-            print(f"[bias_logger] {_e}")
-
-    fire  = t_ev >= FIRE_EV_THRESHOLD*100 and spread <= MAX_SPREAD_FIRE
-    watch = t_ev >= WATCH_EV_THRESHOLD*100 and spread <= MAX_SPREAD_WATCH
-    city  = CITY_COORDS[cc][2]
-    tag   = "🔥" if fire else ("⚠️" if watch else ("🐦" if tweet_hit or afd_hit else "—"))
-    print(f"[scan] {city} [{kind}]: model={side_data['prob']}% "
-          f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
-
-    if fire or watch or ((tweet_hit or afd_hit) and t_ev > 0):
-        return {
-            "market":    market,
-            "forecast":  forecast,
-            "ev_data":   ev_data,
-            "obs_high":  obs_high,
-            "tweet":     tweet_hit,
-            "afd":       afd_hit,
-            "fire":      fire,
-            "taker_ev":  t_ev,
-            "threshold": threshold,
-            "kind":      kind,       # v3.8: pass kind for separated dedup
-            "alert_key": alert_key,
-        }
-    return None
-
-# ── v3.8: T/B SEPARATED BUCKET DEDUPLICATION ─────────────────────────────────
-def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
-    """
-    Per city, run gap-check separately for T-type and B-type markets.
-    This prevents a T63 and B63.5 from slipping through together because
-    they're only 0.5°F apart but were previously sorted in the same pass.
-    Within each type, sort by EV descending and greedily select alerts
-    that are at least BUCKET_GAP_F away from already-selected thresholds.
-    """
-    # Group by city AND kind
-    groups: dict[tuple, list] = defaultdict(list)
-    for res in raw_results:
-        key = (res["market"]["city_code"], res["kind"])
-        groups[key].append(res)
-
-    kept = []
-    for (cc, kind), alerts in groups.items():
-        alerts.sort(key=lambda x: -x["taker_ev"])
-        selected_thresholds = []
-        for alert in alerts:
-            thresh = alert["threshold"]
-            too_close = any(abs(thresh - s) < BUCKET_GAP_F for s in selected_thresholds)
-            if not too_close:
-                selected_thresholds.append(thresh)
-                kept.append(alert)
-                print(f"[dedup] {cc}/{kind} keeping thresh={thresh}°F EV={alert['taker_ev']}%")
-            else:
-                nearest = min(selected_thresholds, key=lambda s: abs(thresh - s))
-                print(f"[dedup] {cc}/{kind} dropping thresh={thresh}°F (near {nearest}°F)")
-    return kept
-
-async def run_scan_async(force_codes=None):
-    maybe_reset_daily()
-    ts      = datetime.now(ET_TZ).strftime("%H:%M ET")
-    markets = get_active_kalshi_markets()
-    if not markets:
-        post_discord(DISCORD_LOG_WEBHOOK, f"📊 **Scan done** {ts} | 0 markets found")
-        return
-    if force_codes:
-        markets = [m for m in markets if m["city_code"] in force_codes]
-
-    today = date.today()
-
-    def ticker_date(ticker):
-        try:
-            part   = ticker.split("-")[1]
-            months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                      "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-            yr  = 2000 + int(part[0:2])
-            mon = months[part[2:5]]
-            day = int(part[5:7])
-            return date(yr, mon, day)
-        except:
-            return today
-    markets = [m for m in markets if ticker_date(m["ticker"]) > today]
-
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT+4)
-    timeout   = aiohttp.ClientTimeout(total=30)
-
-    with _lock:
-        tweet_cities = set(tweet_flagged_cities)
-        afd_cities   = set(afd_flagged_cities)
-
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        raw_results = await asyncio.gather(
-            *[scan_market_async(session,semaphore,m,today,tweet_cities,afd_cities) for m in markets],
-            return_exceptions=True,
-        )
-
-    valid_results = [r for r in raw_results if r is not None and not isinstance(r, Exception)]
-    filtered      = deduplicate_buckets(valid_results)
-    print(f"[dedup] {len(valid_results)} raw → {len(filtered)} after T/B separated dedup")
-
-    alerts = 0
-    for res in filtered:
-        market   = res["market"]
-        forecast = res["forecast"]
-        ev_data  = res["ev_data"]
-        city     = CITY_COORDS.get(market["city_code"],(None,None,market["city_code"]))[2]
-        best     = ev_data["best_side"]
-        t_ev_res = ev_data[best]["taker_ev"]
-        fire     = res["fire"]
-        emoji    = "🔥" if fire else "⚠️"
-        units    = recommend_units(t_ev_res, forecast["confidence"], res["tweet"], res["afd"], fire)
-        embed    = build_embed(market,forecast,ev_data,res["obs_high"],res["tweet"],res["afd"],units)
-        post_discord(DISCORD_WEBHOOK_URL, f"{emoji} **{city} — {market['subtitle']}**", [embed])
-        with _lock:
-            posted_alert_keys.add(res["alert_key"])
-        alerts += 1
-
-    msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
-           f"{len(valid_results)} raw | {alerts} posted")
-    if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
-    post_discord(DISCORD_LOG_WEBHOOK, msg)
-    print(f"[scan] Done — {alerts} posted ({len(valid_results)} raw)")
-
-def run_scan(force_codes=None):
-    asyncio.run(run_scan_async(force_codes))
-
-# ── TWITTER ───────────────────────────────────────────────────────────────────
-def get_user_ids(usernames):
-    if not X_BEARER_TOKEN: return {}
-    hdr, ids = {"Authorization":f"Bearer {X_BEARER_TOKEN}"}, {}
-    for i in range(0,len(usernames),100):
-        try:
-            r = requests.get("https://api.twitter.com/2/users/by",
-                params={"usernames":",".join(usernames[i:i+100]),"user.fields":"id,username"},
-                headers=hdr,timeout=10)
-            r.raise_for_status()
-            for u in r.json().get("data",[]):
-                ids[u["username"].lower()] = u["id"]
-        except Exception as e: print(f"[twitter] {e}")
-    return ids
-
-def classify_tweet(text) -> dict:
-    if not ANTHROPIC_API_KEY:
-        return {"is_signal":False,"cities":[],"direction":"","summary":""}
-    sys_prompt = (
-        "You classify meteorologist/NWS tweets for temperature market signals. "
-        "Respond ONLY with valid JSON. SIGNAL = meaningful forecast CHANGE. "
-        '{"is_signal":bool,"cities":["names"],"direction":"warmer"|"cooler"|"uncertain"|"",'
-        '"confidence":"high"|"medium"|"low","summary":"one sentence or empty"}'
-    )
-    try:
-        r = requests.post("https://api.anthropic.com/v1/messages",
-            headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
-                     "content-type":"application/json"},
-            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":sys_prompt,
-                  "messages":[{"role":"user","content":f"Tweet: {text}"}]},
-            timeout=15)
         r.raise_for_status()
-        data = r.json()
-        if "content" not in data or not data["content"]:
-            return {"is_signal":False,"cities":[],"direction":"","summary":""}
-        return json.loads(data["content"][0]["text"].strip())
-    except json.JSONDecodeError:
-        return {"is_signal":False,"cities":[],"direction":"","summary":""}
+        m = r.json().get("market", {})
+        result        = m.get("result", "")          # 'yes', 'no', or ''
+        closing_price = m.get("last_price")          # last traded price in cents
+        return {"result": result, "closing_price": closing_price}
     except Exception as e:
-        print(f"[claude] {e}")
-        return {"is_signal":False,"cities":[],"direction":"","summary":""}
+        print(f"[scorer] fetch {ticker}: {e}")
+        return None
 
-def fetch_timeline(uid, since_id):
-    if not X_BEARER_TOKEN: return []
-    hdr    = {"Authorization":f"Bearer {X_BEARER_TOKEN}"}
-    params = {"max_results":10,"tweet.fields":"id,text,created_at","exclude":"retweets,replies"}
-    if since_id: params["since_id"] = since_id
-    try:
-        r = requests.get(f"https://api.twitter.com/2/users/{uid}/tweets",
-                         params=params,headers=hdr,timeout=10)
-        r.raise_for_status()
-        return r.json().get("data",[])
-    except: return []
+# ── SCORE ─────────────────────────────────────────────────────────────────────
+def score(target_date: date | None = None):
+    """
+    Fetch results from Kalshi for all unscored predictions on target_date
+    (defaults to yesterday ET). Mark each as won=1 or won=0.
+    Also computes CLV = closing_price - entry_price for the side we took.
 
-def tweet_scanner_loop(user_ids):
-    print(f"[twitter] Monitoring {len(user_ids)} accounts")
-    user_since    = {uid: None for uid in user_ids.values()}
-    tw_total      = 0
-    tw_skipped    = 0
-    tw_classified = 0
-    while True:
-        for username, uid in user_ids.items():
-            for tweet in fetch_timeline(uid, user_since.get(uid)):
-                tid = tweet["id"]
-                if tid in seen_tweet_ids: continue
-                seen_tweet_ids.add(tid)
-                user_since[uid] = tid
-                tw_total += 1
-                should_classify, reason = tweet_should_classify(tweet["text"])
-                if not should_classify:
-                    tw_skipped += 1
-                    print(f"[twitter] @{username} skipped ({reason}) — {tw_skipped}/{tw_total}")
-                    continue
-                tw_classified += 1
-                clf = classify_tweet(tweet["text"])
-                time.sleep(1)
-                if clf.get("is_signal"):
-                    codes = names_to_codes(clf.get("cities",[]))
-                    if codes:
-                        with _lock: tweet_flagged_cities.update(codes)
-                        print(f"[twitter] Signal @{username}: {codes} | "
-                              f"{clf.get('direction')} | {clf.get('summary')}")
-        time.sleep(TWEET_POLL_SECS)
+    Run via cron: `python bias_logger.py score`
+    """
+    init_db()
+    if target_date is None:
+        target_date = (datetime.now(ET_TZ) - timedelta(days=1)).date()
 
-# ── PRICE WATCHER ─────────────────────────────────────────────────────────────
-PRICE_POLL_SECS    = 120
-PRICE_MOVE_TRIGGER = 3
-price_snapshot: dict[str, tuple[int, int]] = {}
+    ds = str(target_date)
+    print(f"[scorer] Scoring predictions for {ds}")
 
-def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
-    global _market_cache, _market_cache_ts
-    prices      = {}
-    markets_raw = []
-    for series in KXHIGH_SERIES:
-        try:
-            r = requests.get(f"{KALSHI_BASE}/markets",
-                params={"status":"open","series_ticker":series,"limit":25}, timeout=8)
-            if r.status_code == 429:
-                time.sleep(30)
-                r = requests.get(f"{KALSHI_BASE}/markets",
-                    params={"status":"open","series_ticker":series,"limit":25}, timeout=8)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as e:
-            print(f"[price_watcher] {series}: {e}")
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM predictions WHERE pred_date=? AND won IS NULL",
+        (ds,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"[scorer] No unscored predictions for {ds}")
+        return
+
+    print(f"[scorer] Found {len(rows)} unscored predictions")
+    scored = wins = losses = 0
+
+    for row in rows:
+        ticker    = row["ticker"]
+        best_side = row["best_side"]
+        entry_yes = row["yes_price"]
+        entry_no  = row["no_price"]
+
+        info = _fetch_market_result(ticker)
+        if info is None:
+            print(f"[scorer] {ticker}: not found on Kalshi, skipping")
             continue
-        for m in data.get("markets", []):
-            ticker    = m.get("ticker", "")
-            city_code = series.replace("KXHIGH", "")
-            yes_price = max(1, min(99, round(float(m.get("yes_ask_dollars") or 0.5) * 100)))
-            no_price  = max(1, min(99, round(float(m.get("no_ask_dollars")  or 0.5) * 100)))
-            if ticker:
-                prices[ticker] = (yes_price, no_price, city_code)
-                markets_raw.append(m)
-        time.sleep(0.5)
-    with _lock:
-        _market_cache    = markets_raw
-        _market_cache_ts = time.time()
-    return prices
 
-def price_watcher_loop():
-    global price_snapshot
-    print(f"[price_watcher] Starting — {PRICE_POLL_SECS}s poll, {PRICE_MOVE_TRIGGER}¢ trigger")
-    price_snapshot = {t: (y, n) for t, (y, n, _) in fetch_current_prices().items()}
-    time.sleep(PRICE_POLL_SECS)
-    while True:
-        current      = fetch_current_prices()
-        moved_cities = set()
-        for ticker, (yes_new, no_new, city_code) in current.items():
-            prev = price_snapshot.get(ticker)
-            if prev is None:
-                price_snapshot[ticker] = (yes_new, no_new)
-                continue
-            yes_old, no_old = prev
-            if abs(yes_new-yes_old) >= PRICE_MOVE_TRIGGER or abs(no_new-no_old) >= PRICE_MOVE_TRIGGER:
-                moved_cities.add(city_code)
-                direction = "↑" if yes_new > yes_old else "↓"
-                print(f"[price_watcher] {city_code} {ticker}: {yes_old}¢→{yes_new}¢ {direction}")
-            price_snapshot[ticker] = (yes_new, no_new)
-        if moved_cities:
-            known = {c for c in moved_cities if c in CITY_COORDS}
-            if known:
-                print(f"[price_watcher] Move detected → rescan: {known}")
-                run_scan(force_codes=known)
-        time.sleep(PRICE_POLL_SECS)
+        result        = info["result"]          # 'yes' or 'no'
+        closing_price = info["closing_price"]   # cents
 
-def signal_rescan_loop():
-    while True:
-        time.sleep(60)
-        with _lock:
-            cities = set(tweet_flagged_cities) | set(afd_flagged_cities)
-            if cities:
-                tweet_flagged_cities.clear()
-                afd_flagged_cities.clear()
-        if cities:
-            print(f"[rescan] Signal-triggered: {cities}")
-            run_scan(force_codes=cities)
+        if result not in ("yes", "no"):
+            print(f"[scorer] {ticker}: not yet settled (result='{result}'), skipping")
+            continue
 
-# ── ENTRY POINT ───────────────────────────────────────────────────────────────
-def main():
-    print("🌡️  Kalshi Weather Bot v3.8")
-    print(f"   v3.8: ASOS uses city local timezone (not ET) for time-weighting")
-    print(f"         T-type and B-type markets deduplicated independently")
-    print(f"   v3.7: Tweet pre-filter | Cross-scan dedup | NBM weight 5x")
-    print(f"   v3.6: AFD → Haiku + AFD pre-filter")
-    print(f"   v3.5: Bucket dedup BUCKET_GAP_F={BUCKET_GAP_F}°F")
-    print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
-          f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
+        # Did our side win?
+        won = 1 if result.upper() == best_side else 0
 
-    if not DISCORD_WEBHOOK_URL: print("[warn] DISCORD_WEBHOOK_URL not set")
-    if not X_BEARER_TOKEN:      print("[warn] X_BEARER_TOKEN not set")
-    if not ANTHROPIC_API_KEY:   print("[warn] ANTHROPIC_API_KEY not set")
+        # CLV: closing price of our side vs our entry price
+        # Positive CLV = we got better price than where market closed
+        if best_side == "YES":
+            entry_price   = entry_yes
+            closing_side  = closing_price if closing_price else entry_yes
+        else:
+            entry_price   = entry_no
+            # NO price = 100 - YES price
+            closing_side  = (100 - closing_price) if closing_price else entry_no
 
-    threading.Thread(target=asos_poll_loop,    daemon=True).start()
-    threading.Thread(target=afd_scanner_loop,  daemon=True).start()
+        clv = closing_side - entry_price  # positive = we beat the close
 
-    user_ids = {}
-    if X_BEARER_TOKEN:
-        print(f"[twitter] Resolving {len(ALL_ACCOUNTS)} account IDs...")
-        user_ids = get_user_ids(ALL_ACCOUNTS)
-        print(f"[twitter] Resolved {len(user_ids)}/{len(ALL_ACCOUNTS)}")
-    if user_ids:
-        threading.Thread(target=tweet_scanner_loop, args=(user_ids,), daemon=True).start()
+        conn = _get_conn()
+        conn.execute("""
+            UPDATE predictions
+            SET won=?, clv=?, closing_price=?, scored_at=?
+            WHERE id=?
+        """, (won, clv, closing_price, datetime.now(ET_TZ).isoformat(), row["id"]))
+        conn.commit()
+        conn.close()
 
-    threading.Thread(target=price_watcher_loop, daemon=True).start()
-    threading.Thread(target=signal_rescan_loop, daemon=True).start()
+        status = "✅ WIN" if won else "❌ LOSS"
+        print(f"[scorer] {ticker} {best_side}: {status} | CLV={clv:+d}¢")
+        scored += 1
+        if won:
+            wins += 1
+        else:
+            losses += 1
 
-    print("[main] Waiting 100s for price watcher to populate market cache...")
-    time.sleep(100)
+    win_rate = round(wins / scored * 100, 1) if scored else 0
+    print(f"\n[scorer] Done: {scored} scored | {wins}W {losses}L | Win rate: {win_rate}%")
 
-    while True:
-        try:
-            now_et = datetime.now(ET_TZ)
-            if now_et.weekday() == 3 and 3 <= now_et.hour < 5:
-                print(f"[main] Kalshi maintenance window — sleeping 30 min")
-                time.sleep(1800)
-                continue
-            run_scan()
-        except Exception as e:
-            print(f"[error] {e}")
-        time.sleep(SCAN_INTERVAL_SECS)
+    # Write daily summary
+    _write_daily_summary(ds)
 
+def _write_daily_summary(ds: str):
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM predictions WHERE pred_date=? AND won IS NOT NULL", (ds,)
+    ).fetchall()
+    all_rows = conn.execute(
+        "SELECT * FROM predictions WHERE pred_date=?", (ds,)
+    ).fetchall()
+
+    total   = len(all_rows)
+    scored  = len(rows)
+    wins    = sum(1 for r in rows if r["won"] == 1)
+    losses  = sum(1 for r in rows if r["won"] == 0)
+    wr      = round(wins / scored * 100, 1) if scored else 0
+    avg_ev  = round(sum(r["taker_ev"] for r in all_rows) / total, 1) if total else 0
+    avg_clv = round(sum(r["clv"] for r in rows if r["clv"] is not None) / scored, 1) if scored else 0
+
+    conn.execute("""
+        INSERT OR REPLACE INTO daily_summary
+        (summary_date, total_alerts, fire_alerts, watch_alerts, scored,
+         wins, losses, win_rate, avg_ev, avg_clv, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (ds, total, 0, 0, scored, wins, losses, wr, avg_ev, avg_clv,
+          datetime.now(ET_TZ).isoformat()))
+    conn.commit()
+    conn.close()
+
+# ── REPORT ────────────────────────────────────────────────────────────────────
+def report(days: int = 7):
+    """
+    Print calibration report for the last N days.
+    Run manually: `python bias_logger.py report`
+    """
+    init_db()
+    since = str((datetime.now(ET_TZ) - timedelta(days=days)).date())
+
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT * FROM predictions WHERE pred_date >= ? AND won IS NOT NULL ORDER BY pred_date",
+        (since,)
+    ).fetchall()
+    conn.close()
+
+    if not rows:
+        print(f"[report] No scored predictions in the last {days} days.")
+        return
+
+    total  = len(rows)
+    wins   = sum(1 for r in rows if r["won"] == 1)
+    losses = total - wins
+    wr     = round(wins / total * 100, 1)
+    avg_ev = round(sum(r["taker_ev"] for r in rows) / total, 1)
+    clv_rows = [r["clv"] for r in rows if r["clv"] is not None]
+    avg_clv  = round(sum(clv_rows) / len(clv_rows), 1) if clv_rows else 0
+
+    print(f"\n{'='*55}")
+    print(f"  BIAS CALIBRATION REPORT  (last {days} days)")
+    print(f"{'='*55}")
+    print(f"  Total scored : {total}  ({wins}W / {losses}L)")
+    print(f"  Win rate     : {wr}%")
+    print(f"  Avg EV       : +{avg_ev}%")
+    print(f"  Avg CLV      : {avg_clv:+.1f}¢  ({'✅ positive' if avg_clv >= 0 else '❌ negative'})")
+
+    # ── Per-city breakdown ────────────────────────────────────────────────────
+    print(f"\n  {'CITY':<18} {'BETS':>5} {'WIN%':>6} {'AVG EV':>8} {'AVG CLV':>8}  FLAG")
+    print(f"  {'-'*58}")
+    cities = sorted(set(r["city_code"] for r in rows))
+    for cc in cities:
+        cr    = [r for r in rows if r["city_code"] == cc]
+        cw    = sum(1 for r in cr if r["won"] == 1)
+        cwr   = round(cw / len(cr) * 100, 1)
+        cev   = round(sum(r["taker_ev"] for r in cr) / len(cr), 1)
+        cclv  = [r["clv"] for r in cr if r["clv"] is not None]
+        cavg  = round(sum(cclv) / len(cclv), 1) if cclv else 0
+        name  = cr[0]["city_name"][:16]
+        flag  = ""
+        if len(cr) >= 3:
+            if cwr < 45:   flag = "← recalibrate bias (too low)"
+            elif cwr > 75: flag = "← recalibrate bias (too high)"
+            if cavg < -5:  flag = flag or "← negative CLV"
+        print(f"  {name:<18} {len(cr):>5} {cwr:>5.1f}% {cev:>+7.1f}% {cavg:>+7.1f}¢  {flag}")
+
+    # ── Confidence bucket breakdown ───────────────────────────────────────────
+    print(f"\n  {'CONFIDENCE':<12} {'BETS':>5} {'WIN%':>6}  (model calibration)")
+    print(f"  {'-'*35}")
+    for conf in ("high", "medium", "low"):
+        cr  = [r for r in rows if r["confidence"] == conf]
+        if not cr: continue
+        cw  = sum(1 for r in cr if r["won"] == 1)
+        cwr = round(cw / len(cr) * 100, 1)
+        print(f"  {conf:<12} {len(cr):>5} {cwr:>5.1f}%")
+
+    # ── Side breakdown ────────────────────────────────────────────────────────
+    print(f"\n  {'SIDE':<8} {'BETS':>5} {'WIN%':>6}")
+    print(f"  {'-'*22}")
+    for side in ("YES", "NO"):
+        sr  = [r for r in rows if r["best_side"] == side]
+        if not sr: continue
+        sw  = sum(1 for r in sr if r["won"] == 1)
+        swr = round(sw / len(sr) * 100, 1)
+        print(f"  {side:<8} {len(sr):>5} {swr:>5.1f}%")
+
+    # ── Daily summary ─────────────────────────────────────────────────────────
+    print(f"\n  {'DATE':<12} {'BETS':>5} {'WIN%':>6} {'CLV':>8}")
+    print(f"  {'-'*35}")
+    dates = sorted(set(r["pred_date"] for r in rows))
+    for ds in dates:
+        dr   = [r for r in rows if r["pred_date"] == ds]
+        dw   = sum(1 for r in dr if r["won"] == 1)
+        dwr  = round(dw / len(dr) * 100, 1)
+        dclv = [r["clv"] for r in dr if r["clv"] is not None]
+        davg = round(sum(dclv) / len(dclv), 1) if dclv else 0
+        print(f"  {ds:<12} {len(dr):>5} {dwr:>5.1f}% {davg:>+7.1f}¢")
+
+    print(f"\n{'='*55}\n")
+
+# ── CLI ENTRY ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    main()
+    import sys
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
+
+    if cmd == "score":
+        # Optional: pass a date like `python bias_logger.py score 2026-05-24`
+        if len(sys.argv) > 2:
+            target = date.fromisoformat(sys.argv[2])
+        else:
+            target = None
+        score(target)
+
+    elif cmd == "report":
+        days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
+        report(days)
+
+    elif cmd == "init":
+        init_db()
+        print(f"[bias_logger] DB initialized at {DB_PATH}")
+
+    elif cmd == "dump":
+        # Quick raw dump of last 50 rows
+        init_db()
+        conn = _get_conn()
+        rows = conn.execute(
+            "SELECT pred_date, city_code, ticker, best_side, taker_ev, won, clv "
+            "FROM predictions ORDER BY id DESC LIMIT 50"
+        ).fetchall()
+        conn.close()
+        print(f"{'DATE':<12} {'CITY':<6} {'TICKER':<40} {'SIDE':<5} {'EV%':>6} {'WON':>4} {'CLV':>6}")
+        print("-" * 85)
+        for r in rows:
+            won_str = "✅" if r["won"] == 1 else ("❌" if r["won"] == 0 else "—")
+            clv_str = f"{r['clv']:+.0f}¢" if r["clv"] is not None else "—"
+            print(f"{r['pred_date']:<12} {r['city_code']:<6} {r['ticker']:<40} "
+                  f"{r['best_side']:<5} {r['taker_ev']:>+5.1f}% {won_str:>4} {clv_str:>6}")
+
+    else:
+        print(f"Unknown command: {cmd}")
+        print("Usage: python bias_logger.py [score|report|init|dump] [optional args]")
