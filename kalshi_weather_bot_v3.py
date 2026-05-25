@@ -1,18 +1,17 @@
 """
-Kalshi Weather Temperature Bot — v3.8
+Kalshi Weather Temperature Bot — v3.9
 
-Changes from v3.7:
-  v3.8 — Two bug fixes:
-          1. ASOS timezone fix: ASOS time-weight now uses each city's LOCAL
-             timezone instead of ET. LA at 12:38 PT was getting 60% ASOS weight
-             (mid-afternoon ET) instead of the correct 15% (morning PT), causing
-             the observed 64°F reading to wrongly rule out high temps above 64°F
-             early in the day. City timezone added to CITY_COORDS as 6th field.
-          2. T/B type separated dedup: T-type (above/below threshold) and B-type
-             (bucket) markets are now deduplicated independently per city.
-             Previously a T63 and B63.5 were 0.5°F apart and should have been
-             caught by BUCKET_GAP_F=3, but mixed-type sorting caused them to
-             both slip through. Now each type runs its own gap-check pass.
+Changes from v3.8:
+  v3.9 — Two additions:
+          1. NBM probabilistic percentiles: fetch_nbm_probabilistic() pulls
+             p10/p25/p50/p75/p90 daily high temps from Open-Meteo's NBM model.
+             These 5 percentile values are added as pseudo-ensemble members,
+             giving the CDF-based probability model a better spread estimate
+             than the deterministic NBM alone. NBM percentiles are weighted 3x
+             in the blend (total NBM contribution: 5x det + 3x 5 percentiles).
+          2. Forecast debug logging: after each city forecast fetch, logs which
+             deterministic models returned data vs. failed, plus ensemble member
+             counts. Visible in Railway logs as [forecast] lines.
 
 Install: pip install aiohttp requests
 """
@@ -56,7 +55,7 @@ ET_TZ  = ZoneInfo("America/New_York")
 PT_TZ  = ZoneInfo("America/Los_Angeles")
 CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.8 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.9 dillonnguyen33@gmail.com"
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -120,7 +119,6 @@ def tweet_should_classify(text: str) -> tuple[bool, str]:
     return False, "no weather keywords"
 
 # ── CITY CONFIG ───────────────────────────────────────────────────────────────
-# v3.8: 6th field = local ZoneInfo for correct ASOS time-weighting
 CITY_COORDS = {
     "NY":  (40.7128,  -74.0060, "New York City",    "KNYC", "OKX", ET_TZ),
     "NYC": (40.7128,  -74.0060, "New York City",    "KNYC", "OKX", ET_TZ),
@@ -189,7 +187,6 @@ def get_bias(city_code: str) -> float:
     return CITY_BIAS_F.get(city_code, DEFAULT_BIAS)[month]
 
 def get_city_tz(city_code: str) -> ZoneInfo:
-    """v3.8: return city's local timezone for correct ASOS time-weighting."""
     info = CITY_COORDS.get(city_code)
     if info and len(info) >= 6:
         return info[5]
@@ -473,12 +470,43 @@ async def fetch_gfs_ensemble(session, lat, lon, ds) -> list[float]:
 
 async def fetch_nbm(session, lat, lon, ds) -> float | None:
     try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
+        data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
             "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
             "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"nbm"})
         temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
         return max(temps) if temps else None
     except: return None
+
+async def fetch_nbm_probabilistic(session, lat, lon, ds) -> list[float]:
+    """
+    v3.9: Pull NBM percentile forecast temps (p10/p25/p50/p75/p90).
+    Each percentile's daily max is treated as a pseudo-ensemble member,
+    giving the CDF-based probability model a better spread estimate than
+    the deterministic NBM alone. Returns up to 5 values.
+    """
+    try:
+        variables = ",".join([
+            "temperature_2m_p10", "temperature_2m_p25", "temperature_2m_p50",
+            "temperature_2m_p75", "temperature_2m_p90"
+        ])
+        data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
+            "latitude": lat, "longitude": lon,
+            "hourly": variables,
+            "temperature_unit": "fahrenheit",
+            "start_date": ds, "end_date": ds,
+            "models": "nbm"
+        })
+        hourly = data.get("hourly", {})
+        highs = []
+        for pct in ["temperature_2m_p10", "temperature_2m_p25", "temperature_2m_p50",
+                    "temperature_2m_p75", "temperature_2m_p90"]:
+            temps = [t for t in (hourly.get(pct) or []) if t is not None]
+            if temps:
+                highs.append(max(temps))
+        return highs
+    except Exception as e:
+        print(f"[nbm_prob] {lat},{lon}: {e}")
+        return []
 
 async def fetch_icon(session, lat, lon, ds) -> float | None:
     try:
@@ -521,12 +549,14 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     lat, lon = info[0], info[1]
     ds = target_date.isoformat()
     async with semaphore:
-        ecmwf, hrrr, rap, gfs, nbm, icon, ecmwf_ens, tomorrow = await asyncio.gather(
+        (ecmwf, hrrr, rap, gfs, nbm, nbm_prob,
+         icon, ecmwf_ens, tomorrow) = await asyncio.gather(
             fetch_ecmwf(session, lat, lon, ds),
             fetch_hrrr(session, lat, lon, ds),
             fetch_rap(session, lat, lon, ds),
             fetch_gfs_ensemble(session, lat, lon, ds),
             fetch_nbm(session, lat, lon, ds),
+            fetch_nbm_probabilistic(session, lat, lon, ds),   # v3.9
             fetch_icon(session, lat, lon, ds),
             fetch_ecmwf_ensemble(session, lat, lon, ds),
             fetch_tomorrow_io(session, lat, lon, ds),
@@ -537,16 +567,34 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     if isinstance(rap, Exception):       rap       = None
     if isinstance(gfs, Exception):       gfs       = []
     if isinstance(nbm, Exception):       nbm       = None
+    if isinstance(nbm_prob, Exception):  nbm_prob  = []
     if isinstance(icon, Exception):      icon      = None
     if isinstance(ecmwf_ens, Exception): ecmwf_ens = []
     if isinstance(tomorrow, Exception):  tomorrow  = None
+
+    # ── v3.9: debug log which models returned data ────────────────────────────
+    det_models = {
+        "ECMWF": ecmwf, "HRRR": hrrr, "RAP": rap,
+        "NBM": nbm, "ICON": icon, "Tomorrow": tomorrow
+    }
+    available = [k for k, v in det_models.items() if v is not None]
+    missing   = [k for k, v in det_models.items() if v is None]
+    print(
+        f"[forecast] {city_code} | "
+        f"det={len(available)}/6 ({', '.join(available) or 'none'}) | "
+        f"missing=({', '.join(missing) or 'none'}) | "
+        f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs "
+        f"NBM_pct={len(nbm_prob)}pts"
+    )
+    # ─────────────────────────────────────────────────────────────────────────
 
     all_members = list(gfs) + list(ecmwf_ens)
     if not all_members and ecmwf is None and hrrr is None and nbm is None:
         return None
 
     blend = list(all_members)
-    if nbm:      blend += [nbm] * 5
+    if nbm:      blend += [nbm] * 5          # deterministic NBM weighted 5x
+    if nbm_prob: blend += nbm_prob * 3        # v3.9: each percentile weighted 3x
     if ecmwf:    blend += [ecmwf, ecmwf]
     if hrrr:     blend += [hrrr, hrrr]
     if rap:      blend += [rap, rap]
@@ -581,6 +629,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         "tomorrow_high":  round(tomorrow, 1) if tomorrow else None,
         "gfs_members":    len(gfs),
         "ecmwf_members":  len(ecmwf_ens),
+        "nbm_pct_points": len(nbm_prob),     # v3.9
         "total_members":  len(all_members),
         "confidence":     conf,
         "nbm_weight":     5,
@@ -607,7 +656,6 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
     asos_weight = 0.0
     asos_prob   = 0.5
     if obs_high is not None:
-        # v3.8: use city's LOCAL timezone, not ET
         city_tz   = get_city_tz(city_code)
         now_local = datetime.now(city_tz)
         hour      = now_local.hour
@@ -686,7 +734,6 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
     if obs_high is not None:
-        # v3.8: show city local time alongside ASOS reading
         city_tz   = get_city_tz(city_code)
         local_hr  = datetime.now(city_tz).strftime("%H:%M")
         fields.append({"name":"ASOS high","value":f"{obs_high}°F @ {local_hr} local","inline":True})
@@ -696,6 +743,9 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0
                         ("rap_high","RAP"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
         if forecast.get(key):
             sources.append(f"{label} {forecast[key]}°F")
+    # v3.9: show NBM percentile point count in embed if available
+    if forecast.get("nbm_pct_points"):
+        sources.append(f"NBM_pct {forecast['nbm_pct_points']}pts")
     if tweet_hit: sources.append("tweet signal")
     if afd_hit:   sources.append("AFD signal")
     if sources:
@@ -858,21 +908,13 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
             "fire":      fire,
             "taker_ev":  t_ev,
             "threshold": threshold,
-            "kind":      kind,       # v3.8: pass kind for separated dedup
+            "kind":      kind,
             "alert_key": alert_key,
         }
     return None
 
 # ── v3.8: T/B SEPARATED BUCKET DEDUPLICATION ─────────────────────────────────
 def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
-    """
-    Per city, run gap-check separately for T-type and B-type markets.
-    This prevents a T63 and B63.5 from slipping through together because
-    they're only 0.5°F apart but were previously sorted in the same pass.
-    Within each type, sort by EV descending and greedily select alerts
-    that are at least BUCKET_GAP_F away from already-selected thresholds.
-    """
-    # Group by city AND kind
     groups: dict[tuple, list] = defaultdict(list)
     for res in raw_results:
         key = (res["market"]["city_code"], res["kind"])
@@ -1123,12 +1165,11 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.8")
-    print(f"   v3.8: ASOS uses city local timezone (not ET) for time-weighting")
-    print(f"         T-type and B-type markets deduplicated independently")
+    print("🌡️  Kalshi Weather Bot v3.9")
+    print(f"   v3.9: NBM probabilistic percentiles (p10/p25/p50/p75/p90) added as ensemble members")
+    print(f"         Forecast debug logging shows model availability per city per scan")
+    print(f"   v3.8: ASOS uses city local timezone | T/B dedup separated")
     print(f"   v3.7: Tweet pre-filter | Cross-scan dedup | NBM weight 5x")
-    print(f"   v3.6: AFD → Haiku + AFD pre-filter")
-    print(f"   v3.5: Bucket dedup BUCKET_GAP_F={BUCKET_GAP_F}°F")
     print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
