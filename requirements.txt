@@ -1,2 +1,3 @@
 aiohttp
 requests
+psycopg2-binary
