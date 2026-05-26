@@ -1,445 +1,327 @@
 """
-bias_logger.py — Kalshi Weather Bot Prediction Tracker
+bias_logger.py — Kalshi Weather Bot prediction tracker (PostgreSQL version)
+
+Switched from SQLite to PostgreSQL so both the bot service and cron scorer
+service can share the same database over the network on Railway.
+
+Requires: pip install psycopg2-binary
 
 Three jobs:
-  1. log_prediction()  — called by main bot on every alert candidate
-  2. score()           — called nightly by cron; fetches Kalshi results and marks won/lost
-  3. report()          — prints calibration summary; run manually anytime
+  1. log_prediction()     — called by the bot on every alert
+  2. score_settlements()  — run by cron nightly, fetches Kalshi results
+  3. calibration_report() — prints accuracy + CLV table
 
-DB path: /data/predictions.db  (Railway Volume mount)
-         Falls back to ./predictions.db if /data doesn't exist.
+Usage:
+  python3 bias_logger.py score           # score yesterday's markets
+  python3 bias_logger.py score 2026-05-25  # score a specific date
+  python3 bias_logger.py report          # full calibration report
+  python3 bias_logger.py report NYC      # report for one city
+  python3 bias_logger.py report --days 30
+  python3 bias_logger.py summary         # quick one-liner
 """
 
-import os
-import sqlite3
-import requests
-import json
-from datetime import datetime, date, timedelta
+import os, sys, requests
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-# ── DB PATH ───────────────────────────────────────────────────────────────────
-# Railway: mount a Volume at /data so the DB survives redeploys.
-# Locally or without a Volume: falls back to current directory.
-_DATA_DIR = "/data" if os.path.isdir("/data") else "."
-DB_PATH   = os.path.join(_DATA_DIR, "predictions.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ET_TZ        = ZoneInfo("America/New_York")
+KALSHI_BASE  = "https://external-api.kalshi.com/trade-api/v2"
 
-ET_TZ         = ZoneInfo("America/New_York")
-KALSHI_BASE   = "https://external-api.kalshi.com/trade-api/v2"
-KALSHI_KEY    = os.environ.get("KALSHI_API_KEY", "")   # set in Railway env vars
-KALSHI_EMAIL  = os.environ.get("KALSHI_EMAIL", "")
-KALSHI_PASS   = os.environ.get("KALSHI_PASSWORD", "")
+# ── DB CONNECTION ─────────────────────────────────────────────────────────────
+def get_conn():
+    import psycopg2
+    return psycopg2.connect(DATABASE_URL)
 
 # ── SCHEMA ────────────────────────────────────────────────────────────────────
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS predictions (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    pred_date       TEXT    NOT NULL,          -- YYYY-MM-DD market date
-    logged_at       TEXT    NOT NULL,          -- ISO timestamp when logged
-    city_code       TEXT    NOT NULL,
-    city_name       TEXT    NOT NULL,
-    ticker          TEXT    NOT NULL,
-    threshold_f     REAL    NOT NULL,
-    threshold_kind  TEXT    NOT NULL,          -- T or B
-    best_side       TEXT    NOT NULL,          -- YES or NO
-    model_prob      REAL    NOT NULL,          -- 0-100
-    yes_price       INTEGER NOT NULL,          -- cents
-    no_price        INTEGER NOT NULL,          -- cents
-    taker_ev        REAL    NOT NULL,          -- percent
+    id              SERIAL PRIMARY KEY,
+    logged_at       TEXT NOT NULL,
+    market_date     TEXT NOT NULL,
+    city_code       TEXT NOT NULL,
+    city_name       TEXT NOT NULL,
+    ticker          TEXT NOT NULL UNIQUE,
+    threshold_f     REAL NOT NULL,
+    threshold_kind  TEXT NOT NULL,
+    model_prob      REAL NOT NULL,
+    yes_price       INTEGER NOT NULL,
+    no_price        INTEGER NOT NULL,
+    best_side       TEXT,
+    taker_ev        REAL,
     ensemble_mean   REAL,
-    corrected_mean  REAL,
     spread          REAL,
-    bias_applied    REAL,
     confidence      TEXT,
-    obs_high        REAL,
-    result_high     REAL,                      -- actual observed high (filled by scorer)
-    won             INTEGER,                   -- 1=win 0=loss NULL=unscored
-    clv             REAL,                      -- closing line value (filled by scorer)
-    closing_price   INTEGER,                   -- final Kalshi price before settlement
-    scored_at       TEXT,                      -- ISO timestamp when scored
-    UNIQUE(ticker, best_side, logged_at)       -- prevent duplicate log rows
+    bias_applied    REAL,
+    asos_obs_high   REAL,
+    ecmwf_high      REAL,
+    nbm_high        REAL,
+    hrrr_high       REAL,
+    icon_high       REAL,
+    settled         INTEGER DEFAULT 0,
+    actual_high_f   REAL,
+    yes_result      INTEGER,
+    model_correct   INTEGER,
+    closing_yes_price INTEGER,
+    clv             REAL
 );
-
-CREATE TABLE IF NOT EXISTS daily_summary (
-    summary_date    TEXT PRIMARY KEY,
-    total_alerts    INTEGER,
-    fire_alerts     INTEGER,
-    watch_alerts    INTEGER,
-    scored          INTEGER,
-    wins            INTEGER,
-    losses          INTEGER,
-    win_rate        REAL,
-    avg_ev          REAL,
-    avg_clv         REAL,
-    created_at      TEXT
-);
+CREATE INDEX IF NOT EXISTS idx_market_date ON predictions(market_date);
+CREATE INDEX IF NOT EXISTS idx_city        ON predictions(city_code);
+CREATE INDEX IF NOT EXISTS idx_settled     ON predictions(settled);
 """
 
-def _get_conn():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = _get_conn()
-    conn.executescript(SCHEMA)
-    conn.commit()
-    conn.close()
+def ensure_schema():
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute(SCHEMA)
+        conn.commit()
+    finally:
+        conn.close()
 
 # ── LOG PREDICTION ────────────────────────────────────────────────────────────
 def log_prediction(
-    pred_date,          # date object
-    city_code: str,
-    city_name: str,
-    ticker: str,
-    threshold_f: float,
-    forecast: dict,
-    model_prob: float,  # 0-1 float
-    yes_price: int,
-    no_price: int,
-    obs_high,           # float or None
-    best_side: str = "YES",
-    taker_ev: float = 0.0,
-    threshold_kind: str = "T",
+    market_date, city_code, city_name, ticker, threshold_f,
+    forecast, model_prob, yes_price, no_price, asos_obs_high,
+    best_side=None, taker_ev=None, threshold_kind="T",
 ):
-    """
-    Called by the main bot every time it evaluates a market.
-    Silently skips duplicates (same ticker + side logged within same minute).
-    """
-    init_db()
-    logged_at = datetime.now(ET_TZ).isoformat()
-    # Deduplicate within the same minute to avoid log spam from rescans
-    minute_ts = logged_at[:16]  # YYYY-MM-DDTHH:MM
-
-    conn = _get_conn()
+    ensure_schema()
+    conn = get_conn()
     try:
-        # Check if we already logged this ticker+side in the same minute
-        existing = conn.execute(
-            "SELECT id FROM predictions WHERE ticker=? AND best_side=? AND logged_at LIKE ?",
-            (ticker, best_side, f"{minute_ts}%")
-        ).fetchone()
-        if existing:
-            return  # already logged this minute, skip
-
-        conn.execute("""
-            INSERT OR IGNORE INTO predictions
-            (pred_date, logged_at, city_code, city_name, ticker,
-             threshold_f, threshold_kind, best_side, model_prob,
-             yes_price, no_price, taker_ev,
-             ensemble_mean, corrected_mean, spread, bias_applied,
-             confidence, obs_high)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO predictions (
+                logged_at, market_date, city_code, city_name, ticker,
+                threshold_f, threshold_kind, model_prob, yes_price, no_price,
+                best_side, taker_ev, ensemble_mean, spread, confidence,
+                bias_applied, asos_obs_high, ecmwf_high, nbm_high, hrrr_high, icon_high
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (ticker) DO NOTHING
         """, (
-            str(pred_date),
-            logged_at,
-            city_code,
-            city_name,
-            ticker,
-            threshold_f,
-            threshold_kind,
-            best_side,
-            round(model_prob * 100, 2),
-            yes_price,
-            no_price,
-            taker_ev,
-            forecast.get("ensemble_mean"),
-            forecast.get("corrected_mean"),
-            forecast.get("spread"),
-            forecast.get("bias_applied"),
-            forecast.get("confidence"),
-            obs_high,
+            datetime.now(ET_TZ).isoformat(),
+            str(market_date), city_code, city_name, ticker,
+            threshold_f, threshold_kind, model_prob, yes_price, no_price,
+            best_side, taker_ev,
+            forecast.get("ensemble_mean"), forecast.get("spread"),
+            forecast.get("confidence"),   forecast.get("bias_applied"),
+            asos_obs_high,
+            forecast.get("ecmwf_high"),   forecast.get("nbm_high"),
+            forecast.get("hrrr_high"),    forecast.get("icon_high"),
         ))
         conn.commit()
-        print(f"[bias_logger] logged {ticker} {best_side} EV={taker_ev}%")
     except Exception as e:
         print(f"[bias_logger] log error: {e}")
     finally:
         conn.close()
 
-# ── KALSHI AUTH ───────────────────────────────────────────────────────────────
-_kalshi_token = None
-
-def _get_kalshi_token():
-    global _kalshi_token
-    if _kalshi_token:
-        return _kalshi_token
-    if not KALSHI_EMAIL or not KALSHI_PASS:
-        print("[scorer] KALSHI_EMAIL / KALSHI_PASSWORD not set — cannot fetch results")
-        return None
+# ── SETTLEMENT SCORING ────────────────────────────────────────────────────────
+def fetch_kalshi_result(ticker):
     try:
-        r = requests.post(f"{KALSHI_BASE}/login",
-            json={"email": KALSHI_EMAIL, "password": KALSHI_PASS}, timeout=10)
-        r.raise_for_status()
-        _kalshi_token = r.json().get("token")
-        return _kalshi_token
-    except Exception as e:
-        print(f"[scorer] Kalshi auth failed: {e}")
-        return None
-
-def _kalshi_headers():
-    token = _get_kalshi_token()
-    if token:
-        return {"Authorization": f"Bearer {token}"}
-    return {}
-
-# ── FETCH MARKET RESULT ───────────────────────────────────────────────────────
-def _fetch_market_result(ticker: str) -> dict | None:
-    """
-    Returns dict with keys: result ('yes'/'no'/''), closing_yes_price
-    """
-    try:
-        r = requests.get(f"{KALSHI_BASE}/markets/{ticker}",
-            headers=_kalshi_headers(), timeout=10)
-        if r.status_code == 404:
-            return None
+        r = requests.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=10)
         r.raise_for_status()
         m = r.json().get("market", {})
-        result        = m.get("result", "")          # 'yes', 'no', or ''
-        closing_price = m.get("last_price")          # last traded price in cents
-        return {"result": result, "closing_price": closing_price}
+        if m.get("status") not in ("settled", "finalized"):
+            return None
+        result = m.get("result", "")
+        yes_result = 1 if result == "yes" else (0 if result == "no" else None)
+        if yes_result is None:
+            return None
+        closing = m.get("last_price")
+        closing_cents = round(float(closing) * 100) if closing else None
+        return {"yes_result": yes_result, "closing_yes_price": closing_cents}
     except Exception as e:
-        print(f"[scorer] fetch {ticker}: {e}")
+        print(f"[bias_logger] fetch result {ticker}: {e}")
         return None
 
-# ── SCORE ─────────────────────────────────────────────────────────────────────
-def score(target_date: date | None = None):
-    """
-    Fetch results from Kalshi for all unscored predictions on target_date
-    (defaults to yesterday ET). Mark each as won=1 or won=0.
-    Also computes CLV = closing_price - entry_price for the side we took.
-
-    Run via cron: `python bias_logger.py score`
-    """
-    init_db()
+def score_settlements(target_date=None):
+    ensure_schema()
     if target_date is None:
-        target_date = (datetime.now(ET_TZ) - timedelta(days=1)).date()
-
-    ds = str(target_date)
-    print(f"[scorer] Scoring predictions for {ds}")
-
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT * FROM predictions WHERE pred_date=? AND won IS NULL",
-        (ds,)
-    ).fetchall()
-    conn.close()
+        target_date = date.today() - timedelta(days=1)
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, ticker, best_side, yes_price, model_prob
+            FROM predictions
+            WHERE settled = 0 AND market_date <= %s
+            ORDER BY market_date
+        """, (str(target_date),))
+        rows = cur.fetchall()
+    finally:
+        conn.close()
 
     if not rows:
-        print(f"[scorer] No unscored predictions for {ds}")
+        print(f"[scorer] No unscored predictions for {target_date} or earlier")
         return
 
-    print(f"[scorer] Found {len(rows)} unscored predictions")
-    scored = wins = losses = 0
+    print(f"[scorer] Scoring {len(rows)} predictions...")
+    scored = 0
 
     for row in rows:
-        ticker    = row["ticker"]
-        best_side = row["best_side"]
-        entry_yes = row["yes_price"]
-        entry_no  = row["no_price"]
-
-        info = _fetch_market_result(ticker)
-        if info is None:
-            print(f"[scorer] {ticker}: not found on Kalshi, skipping")
+        rid, ticker, best_side, yes_price, model_prob = row
+        result = fetch_kalshi_result(ticker)
+        if result is None:
+            print(f"  ⏳ {ticker}: not settled yet")
             continue
 
-        result        = info["result"]          # 'yes' or 'no'
-        closing_price = info["closing_price"]   # cents
+        yes_result    = result["yes_result"]
+        closing_price = result["closing_yes_price"]
 
-        if result not in ("yes", "no"):
-            print(f"[scorer] {ticker}: not yet settled (result='{result}'), skipping")
-            continue
-
-        # Did our side win?
-        won = 1 if result.upper() == best_side else 0
-
-        # CLV: closing price of our side vs our entry price
-        # Positive CLV = we got better price than where market closed
         if best_side == "YES":
-            entry_price   = entry_yes
-            closing_side  = closing_price if closing_price else entry_yes
+            model_correct = 1 if yes_result == 1 else 0
+            entry_price   = yes_price
+        elif best_side == "NO":
+            model_correct = 1 if yes_result == 0 else 0
+            entry_price   = 100 - yes_price
         else:
-            entry_price   = entry_no
-            # NO price = 100 - YES price
-            closing_side  = (100 - closing_price) if closing_price else entry_no
+            model_correct = None
+            entry_price   = None
 
-        clv = closing_side - entry_price  # positive = we beat the close
+        clv = None
+        if closing_price is not None and entry_price is not None:
+            if best_side == "YES":
+                clv = round(closing_price - entry_price, 1)
+            else:
+                clv = round((100 - closing_price) - entry_price, 1)
 
-        conn = _get_conn()
-        conn.execute("""
-            UPDATE predictions
-            SET won=?, clv=?, closing_price=?, scored_at=?
-            WHERE id=?
-        """, (won, clv, closing_price, datetime.now(ET_TZ).isoformat(), row["id"]))
-        conn.commit()
-        conn.close()
+        conn = get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE predictions
+                SET settled=1, yes_result=%s, model_correct=%s,
+                    closing_yes_price=%s, clv=%s
+                WHERE id=%s
+            """, (yes_result, model_correct, closing_price, clv, rid))
+            conn.commit()
+        finally:
+            conn.close()
 
-        status = "✅ WIN" if won else "❌ LOSS"
-        print(f"[scorer] {ticker} {best_side}: {status} | CLV={clv:+d}¢")
+        status = "✓" if model_correct else "✗"
+        clv_str = f"CLV {clv:+.0f}¢" if clv is not None else "no CLV"
+        print(f"  {status} {ticker}: {'YES' if yes_result else 'NO'} won | {clv_str}")
         scored += 1
-        if won:
-            wins += 1
-        else:
-            losses += 1
 
-    win_rate = round(wins / scored * 100, 1) if scored else 0
-    print(f"\n[scorer] Done: {scored} scored | {wins}W {losses}L | Win rate: {win_rate}%")
+    print(f"[scorer] Scored {scored}/{len(rows)} predictions")
 
-    # Write daily summary
-    _write_daily_summary(ds)
-
-def _write_daily_summary(ds: str):
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT * FROM predictions WHERE pred_date=? AND won IS NOT NULL", (ds,)
-    ).fetchall()
-    all_rows = conn.execute(
-        "SELECT * FROM predictions WHERE pred_date=?", (ds,)
-    ).fetchall()
-
-    total   = len(all_rows)
-    scored  = len(rows)
-    wins    = sum(1 for r in rows if r["won"] == 1)
-    losses  = sum(1 for r in rows if r["won"] == 0)
-    wr      = round(wins / scored * 100, 1) if scored else 0
-    avg_ev  = round(sum(r["taker_ev"] for r in all_rows) / total, 1) if total else 0
-    avg_clv = round(sum(r["clv"] for r in rows if r["clv"] is not None) / scored, 1) if scored else 0
-
-    conn.execute("""
-        INSERT OR REPLACE INTO daily_summary
-        (summary_date, total_alerts, fire_alerts, watch_alerts, scored,
-         wins, losses, win_rate, avg_ev, avg_clv, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-    """, (ds, total, 0, 0, scored, wins, losses, wr, avg_ev, avg_clv,
-          datetime.now(ET_TZ).isoformat()))
-    conn.commit()
-    conn.close()
-
-# ── REPORT ────────────────────────────────────────────────────────────────────
-def report(days: int = 7):
-    """
-    Print calibration report for the last N days.
-    Run manually: `python bias_logger.py report`
-    """
-    init_db()
-    since = str((datetime.now(ET_TZ) - timedelta(days=days)).date())
-
-    conn = _get_conn()
-    rows = conn.execute(
-        "SELECT * FROM predictions WHERE pred_date >= ? AND won IS NOT NULL ORDER BY pred_date",
-        (since,)
-    ).fetchall()
-    conn.close()
+# ── CALIBRATION REPORT ────────────────────────────────────────────────────────
+def calibration_report(city_filter=None, days=90):
+    ensure_schema()
+    cutoff = str(date.today() - timedelta(days=days))
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        query = """
+            SELECT city_code, city_name, model_prob, best_side, taker_ev,
+                   model_correct, clv, ensemble_mean, spread, market_date, ticker
+            FROM predictions
+            WHERE settled = 1 AND market_date >= %s
+        """
+        params = [cutoff]
+        if city_filter:
+            query += " AND city_code = %s"
+            params.append(city_filter.upper())
+        query += " ORDER BY market_date"
+        cur.execute(query, params)
+        rows = cur.fetchall()
+    finally:
+        conn.close()
 
     if not rows:
-        print(f"[report] No scored predictions in the last {days} days.")
+        print(f"No settled predictions (last {days} days)")
         return
 
-    total  = len(rows)
-    wins   = sum(1 for r in rows if r["won"] == 1)
-    losses = total - wins
-    wr     = round(wins / total * 100, 1)
-    avg_ev = round(sum(r["taker_ev"] for r in rows) / total, 1)
-    clv_rows = [r["clv"] for r in rows if r["clv"] is not None]
-    avg_clv  = round(sum(clv_rows) / len(clv_rows), 1) if clv_rows else 0
+    total   = len(rows)
+    correct = sum(1 for r in rows if r[5] == 1)
+    clv_vals = [r[6] for r in rows if r[6] is not None]
+    avg_clv  = sum(clv_vals) / len(clv_vals) if clv_vals else None
 
-    print(f"\n{'='*55}")
-    print(f"  BIAS CALIBRATION REPORT  (last {days} days)")
-    print(f"{'='*55}")
-    print(f"  Total scored : {total}  ({wins}W / {losses}L)")
-    print(f"  Win rate     : {wr}%")
-    print(f"  Avg EV       : +{avg_ev}%")
-    print(f"  Avg CLV      : {avg_clv:+.1f}¢  ({'✅ positive' if avg_clv >= 0 else '❌ negative'})")
+    print(f"\n{'='*60}")
+    print(f"CALIBRATION REPORT — last {days} days")
+    if city_filter: print(f"City: {city_filter.upper()}")
+    print(f"{'='*60}")
+    print(f"Total scored: {total}")
+    print(f"Accuracy:     {correct}/{total} = {correct/total*100:.1f}%")
+    if avg_clv is not None:
+        flag = "✓ beating close" if avg_clv > 0 else "✗ worse than close"
+        print(f"Avg CLV:      {avg_clv:+.1f}¢  ({flag})")
 
-    # ── Per-city breakdown ────────────────────────────────────────────────────
-    print(f"\n  {'CITY':<18} {'BETS':>5} {'WIN%':>6} {'AVG EV':>8} {'AVG CLV':>8}  FLAG")
-    print(f"  {'-'*58}")
-    cities = sorted(set(r["city_code"] for r in rows))
-    for cc in cities:
-        cr    = [r for r in rows if r["city_code"] == cc]
-        cw    = sum(1 for r in cr if r["won"] == 1)
-        cwr   = round(cw / len(cr) * 100, 1)
-        cev   = round(sum(r["taker_ev"] for r in cr) / len(cr), 1)
-        cclv  = [r["clv"] for r in cr if r["clv"] is not None]
-        cavg  = round(sum(cclv) / len(cclv), 1) if cclv else 0
-        name  = cr[0]["city_name"][:16]
-        flag  = ""
-        if len(cr) >= 3:
-            if cwr < 45:   flag = "← recalibrate bias (too low)"
-            elif cwr > 75: flag = "← recalibrate bias (too high)"
-            if cavg < -5:  flag = flag or "← negative CLV"
-        print(f"  {name:<18} {len(cr):>5} {cwr:>5.1f}% {cev:>+7.1f}% {cavg:>+7.1f}¢  {flag}")
+    print(f"\n{'─'*60}")
+    print(f"{'Prob bucket':<15} {'Predicted':>10} {'Actual%':>8} {'N':>5} {'Bias':>8}")
+    print(f"{'─'*60}")
+    for lo, hi in [(0.50,0.60),(0.60,0.70),(0.70,0.80),(0.80,0.90),(0.90,1.00)]:
+        bucket = [r for r in rows if lo <= r[2] < hi]
+        if not bucket: continue
+        n = len(bucket)
+        wins = sum(1 for r in bucket if r[5] == 1)
+        win_pct = wins / n * 100
+        mid = (lo + hi) / 2 * 100
+        bias = win_pct - mid
+        flag = "  ← overconfident" if bias < -5 else ("  ← underconfident" if bias > 5 else "")
+        print(f"{int(lo*100)}-{int(hi*100)}%{'':<10} {mid:>9.0f}% {win_pct:>7.1f}% {n:>5}  {bias:+.1f}%{flag}")
 
-    # ── Confidence bucket breakdown ───────────────────────────────────────────
-    print(f"\n  {'CONFIDENCE':<12} {'BETS':>5} {'WIN%':>6}  (model calibration)")
-    print(f"  {'-'*35}")
-    for conf in ("high", "medium", "low"):
-        cr  = [r for r in rows if r["confidence"] == conf]
-        if not cr: continue
-        cw  = sum(1 for r in cr if r["won"] == 1)
-        cwr = round(cw / len(cr) * 100, 1)
-        print(f"  {conf:<12} {len(cr):>5} {cwr:>5.1f}%")
+    from collections import defaultdict
+    city_stats = defaultdict(lambda: {"n":0,"correct":0,"clv":[],"ev":[]})
+    for r in rows:
+        cs = city_stats[r[0]]
+        cs["n"] += 1
+        cs["correct"] += r[5] or 0
+        if r[6] is not None: cs["clv"].append(r[6])
+        if r[4] is not None: cs["ev"].append(r[4])
 
-    # ── Side breakdown ────────────────────────────────────────────────────────
-    print(f"\n  {'SIDE':<8} {'BETS':>5} {'WIN%':>6}")
-    print(f"  {'-'*22}")
-    for side in ("YES", "NO"):
-        sr  = [r for r in rows if r["best_side"] == side]
-        if not sr: continue
-        sw  = sum(1 for r in sr if r["won"] == 1)
-        swr = round(sw / len(sr) * 100, 1)
-        print(f"  {side:<8} {len(sr):>5} {swr:>5.1f}%")
+    print(f"\n{'─'*60}")
+    print(f"{'City':<20} {'N':>4} {'Acc%':>6} {'Avg EV%':>8} {'Avg CLV':>8}")
+    print(f"{'─'*60}")
+    for code, cs in sorted(city_stats.items(), key=lambda x: -x[1]["n"]):
+        n      = cs["n"]
+        acc    = cs["correct"] / n * 100
+        avg_ev = sum(cs["ev"]) / len(cs["ev"]) if cs["ev"] else 0
+        avg_c  = sum(cs["clv"]) / len(cs["clv"]) if cs["clv"] else None
+        clv_s  = f"{avg_c:+.1f}¢" if avg_c is not None else "  n/a"
+        avg_prob = sum(r[2] for r in rows if r[0] == code) / n
+        gap = (cs["correct"] / n) - avg_prob
+        flag = "  ← recalibrate" if gap < -0.08 else ""
+        print(f"{code:<20} {n:>4} {acc:>5.1f}% {avg_ev:>7.1f}% {clv_s:>8}{flag}")
 
-    # ── Daily summary ─────────────────────────────────────────────────────────
-    print(f"\n  {'DATE':<12} {'BETS':>5} {'WIN%':>6} {'CLV':>8}")
-    print(f"  {'-'*35}")
-    dates = sorted(set(r["pred_date"] for r in rows))
-    for ds in dates:
-        dr   = [r for r in rows if r["pred_date"] == ds]
-        dw   = sum(1 for r in dr if r["won"] == 1)
-        dwr  = round(dw / len(dr) * 100, 1)
-        dclv = [r["clv"] for r in dr if r["clv"] is not None]
-        davg = round(sum(dclv) / len(dclv), 1) if dclv else 0
-        print(f"  {ds:<12} {len(dr):>5} {dwr:>5.1f}% {davg:>+7.1f}¢")
+    print(f"\n{'─'*60}")
+    print("Recent predictions (last 10):")
+    for r in list(rows)[-10:]:
+        status = "✓" if r[5] else "✗"
+        clv_s  = f"CLV {r[6]:+.0f}¢" if r[6] is not None else ""
+        print(f"  {status} {r[9]} {r[0]:<6} model={r[2]*100:.0f}% "
+              f"side={r[3] or '?'} ev={r[4] or 0:.1f}%  {clv_s}")
+    print(f"{'='*60}\n")
 
-    print(f"\n{'='*55}\n")
-
-# ── CLI ENTRY ─────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "report"
+    args = sys.argv[1:]
 
-    if cmd == "score":
-        # Optional: pass a date like `python bias_logger.py score 2026-05-24`
-        if len(sys.argv) > 2:
-            target = date.fromisoformat(sys.argv[2])
-        else:
-            target = None
-        score(target)
+    if not args or args[0] == "report":
+        city, days = None, 90
+        for a in args[1:]:
+            if a.startswith("--days="):   days = int(a.split("=")[1])
+            elif a == "--days" and args.index(a)+1 < len(args):
+                days = int(args[args.index(a)+1])
+            elif not a.startswith("--"):  city = a
+        calibration_report(city_filter=city, days=days)
 
-    elif cmd == "report":
-        days = int(sys.argv[2]) if len(sys.argv) > 2 else 7
-        report(days)
+    elif args[0] == "score":
+        target = date.fromisoformat(args[1]) if len(args) > 1 else None
+        score_settlements(target)
 
-    elif cmd == "init":
-        init_db()
-        print(f"[bias_logger] DB initialized at {DB_PATH}")
-
-    elif cmd == "dump":
-        # Quick raw dump of last 50 rows
-        init_db()
-        conn = _get_conn()
-        rows = conn.execute(
-            "SELECT pred_date, city_code, ticker, best_side, taker_ev, won, clv "
-            "FROM predictions ORDER BY id DESC LIMIT 50"
-        ).fetchall()
+    elif args[0] == "summary":
+        ensure_schema()
+        conn = get_conn()
+        cur  = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM predictions")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM predictions WHERE settled=1")
+        scored = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM predictions WHERE model_correct=1")
+        correct = cur.fetchone()[0]
         conn.close()
-        print(f"{'DATE':<12} {'CITY':<6} {'TICKER':<40} {'SIDE':<5} {'EV%':>6} {'WON':>4} {'CLV':>6}")
-        print("-" * 85)
-        for r in rows:
-            won_str = "✅" if r["won"] == 1 else ("❌" if r["won"] == 0 else "—")
-            clv_str = f"{r['clv']:+.0f}¢" if r["clv"] is not None else "—"
-            print(f"{r['pred_date']:<12} {r['city_code']:<6} {r['ticker']:<40} "
-                  f"{r['best_side']:<5} {r['taker_ev']:>+5.1f}% {won_str:>4} {clv_str:>6}")
-
+        print(f"Total logged: {total} | Scored: {scored} | Pending: {total-scored}")
+        if scored:
+            print(f"Accuracy: {correct}/{scored} = {correct/scored*100:.1f}%")
     else:
-        print(f"Unknown command: {cmd}")
-        print("Usage: python bias_logger.py [score|report|init|dump] [optional args]")
+        print(__doc__)
