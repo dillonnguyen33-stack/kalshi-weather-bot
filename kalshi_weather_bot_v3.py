@@ -1,7 +1,16 @@
 """
 Kalshi Weather Temperature Bot — v3.10
 
-Changes from v3.9:
+Changes from v3.10:
+  v3.11 — Fix broken Open-Meteo model strings:
+           HRRR: "hrrr" → "ncep_hrrr_conus" (API renamed model)
+           NBM:  "nbm"  → "ncep_nbm_conus"  (API renamed model)
+           RAP:  removed entirely — no longer available in Open-Meteo API
+           These three models were silently returning None on every city,
+           causing the model to run on only ECMWF + ICON + Tomorrow.io,
+           flooring spread at 1.5°F, and producing fake 90%+ EV signals.
+           With HRRR and NBM restored the model now has 5-6 deterministic
+           sources and a realistic spread estimate.
   v3.10 — Two fixes for same-day market coverage:
            1. Date filter fix: changed ticker_date filter from > today to >= today.
               Previously ALL same-day markets were discarded before scanning.
@@ -440,19 +449,14 @@ async def fetch_hrrr(session, lat, lon, ds) -> float | None:
     try:
         data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
             "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"hrrr"})
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"ncep_hrrr_conus"})
         temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
         return max(temps) if temps else None
     except: return None
 
 async def fetch_rap(session, lat, lon, ds) -> float | None:
-    try:
-        data = await _get_json(session, f"{OPEN_METEO_BASE}/gfs", {
-            "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"rap"})
-        temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
-        return max(temps) if temps else None
-    except: return None
+    """RAP model removed from Open-Meteo API — always returns None."""
+    return None
 
 async def fetch_gfs_ensemble(session, lat, lon, ds) -> list[float]:
     try:
@@ -472,7 +476,7 @@ async def fetch_nbm(session, lat, lon, ds) -> float | None:
     try:
         data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
             "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"nbm"})
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"ncep_nbm_conus"})
         temps = [t for t in (data.get("hourly",{}).get("temperature_2m") or []) if t is not None]
         return max(temps) if temps else None
     except: return None
@@ -485,7 +489,7 @@ async def fetch_nbm_probabilistic(session, lat, lon, ds) -> list[float]:
         ])
         data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
             "latitude":lat,"longitude":lon,"hourly":variables,
-            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"nbm"})
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"ncep_nbm_conus"})
         hourly = data.get("hourly",{})
         highs = []
         for pct in ["temperature_2m_p10","temperature_2m_p25","temperature_2m_p50",
@@ -1189,12 +1193,13 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.10")
+    print("🌡️  Kalshi Weather Bot v3.11")
     print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
     print(f"          Discord alerts labeled 📍 TODAY vs 📅 TOMORROW")
-    print(f"   v3.9: NBM probabilistic percentiles | Forecast debug logging")
+    print(f"   v3.11: HRRR→ncep_hrrr_conus | NBM→ncep_nbm_conus | RAP removed
+   v3.9: NBM probabilistic percentiles | Forecast debug logging")
     print(f"   v3.8: City-local ASOS timezone | T/B dedup separated")
     print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
