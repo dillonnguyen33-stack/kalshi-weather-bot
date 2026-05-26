@@ -1,19 +1,20 @@
 """
-Kalshi Weather Temperature Bot — v3.9
+Kalshi Weather Temperature Bot — v3.10
 
-Changes from v3.8:
-  v3.9 — Two additions:
-          1. NBM probabilistic percentiles: fetch_nbm_probabilistic() pulls
-             p10/p25/p50/p75/p90 daily high temps from Open-Meteo's NBM model.
-             These 5 percentile values are added as pseudo-ensemble members,
-             giving the CDF-based probability model a better spread estimate
-             than the deterministic NBM alone. NBM percentiles are weighted 3x
-             in the blend (total NBM contribution: 5x det + 3x 5 percentiles).
-          2. Forecast debug logging: after each city forecast fetch, logs which
-             deterministic models returned data vs. failed, plus ensemble member
-             counts. Visible in Railway logs as [forecast] lines.
+Changes from v3.9:
+  v3.10 — Two fixes for same-day market coverage:
+           1. Date filter fix: changed ticker_date filter from > today to >= today.
+              Previously ALL same-day markets were discarded before scanning.
+              Kalshi's status=open filter already excludes settled markets so
+              the date filter was redundant and wrong. Now same-day open markets
+              are scanned and can generate alerts throughout the day.
+           2. Next-day ASOS zero-weight: if a market settles tomorrow (not today),
+              ASOS weight is forced to 0.0 regardless of time of day. Today's
+              observed high is irrelevant to tomorrow's forecast and was causing
+              inflated confidence on next-day markets. Same-day markets continue
+              to use the time-weighted ASOS schedule as before.
 
-Install: pip install aiohttp requests
+Install: pip install aiohttp requests psycopg2-binary
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -55,7 +56,7 @@ ET_TZ  = ZoneInfo("America/New_York")
 PT_TZ  = ZoneInfo("America/Los_Angeles")
 CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.9 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.10 dillonnguyen33@gmail.com"
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -194,7 +195,6 @@ def get_city_tz(city_code: str) -> ZoneInfo:
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
 asos_observed: dict[str, float]  = {}
-afd_last_hash: dict[str, str]    = {}
 seen_tweet_ids: set              = set()
 seen_afd_ids: set                = set()
 tweet_flagged_cities: set        = set()
@@ -478,35 +478,22 @@ async def fetch_nbm(session, lat, lon, ds) -> float | None:
     except: return None
 
 async def fetch_nbm_probabilistic(session, lat, lon, ds) -> list[float]:
-    """
-    v3.9: Pull NBM percentile forecast temps (p10/p25/p50/p75/p90).
-    Each percentile's daily max is treated as a pseudo-ensemble member,
-    giving the CDF-based probability model a better spread estimate than
-    the deterministic NBM alone. Returns up to 5 values.
-    """
     try:
         variables = ",".join([
-            "temperature_2m_p10", "temperature_2m_p25", "temperature_2m_p50",
-            "temperature_2m_p75", "temperature_2m_p90"
+            "temperature_2m_p10","temperature_2m_p25","temperature_2m_p50",
+            "temperature_2m_p75","temperature_2m_p90"
         ])
         data = await _get_json(session, f"{OPEN_METEO_BASE}/forecast", {
-            "latitude": lat, "longitude": lon,
-            "hourly": variables,
-            "temperature_unit": "fahrenheit",
-            "start_date": ds, "end_date": ds,
-            "models": "nbm"
-        })
-        hourly = data.get("hourly", {})
+            "latitude":lat,"longitude":lon,"hourly":variables,
+            "temperature_unit":"fahrenheit","start_date":ds,"end_date":ds,"models":"nbm"})
+        hourly = data.get("hourly",{})
         highs = []
-        for pct in ["temperature_2m_p10", "temperature_2m_p25", "temperature_2m_p50",
-                    "temperature_2m_p75", "temperature_2m_p90"]:
+        for pct in ["temperature_2m_p10","temperature_2m_p25","temperature_2m_p50",
+                    "temperature_2m_p75","temperature_2m_p90"]:
             temps = [t for t in (hourly.get(pct) or []) if t is not None]
-            if temps:
-                highs.append(max(temps))
+            if temps: highs.append(max(temps))
         return highs
-    except Exception as e:
-        print(f"[nbm_prob] {lat},{lon}: {e}")
-        return []
+    except: return []
 
 async def fetch_icon(session, lat, lon, ds) -> float | None:
     try:
@@ -556,7 +543,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
             fetch_rap(session, lat, lon, ds),
             fetch_gfs_ensemble(session, lat, lon, ds),
             fetch_nbm(session, lat, lon, ds),
-            fetch_nbm_probabilistic(session, lat, lon, ds),   # v3.9
+            fetch_nbm_probabilistic(session, lat, lon, ds),
             fetch_icon(session, lat, lon, ds),
             fetch_ecmwf_ensemble(session, lat, lon, ds),
             fetch_tomorrow_io(session, lat, lon, ds),
@@ -572,29 +559,26 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     if isinstance(ecmwf_ens, Exception): ecmwf_ens = []
     if isinstance(tomorrow, Exception):  tomorrow  = None
 
-    # ── v3.9: debug log which models returned data ────────────────────────────
     det_models = {
-        "ECMWF": ecmwf, "HRRR": hrrr, "RAP": rap,
-        "NBM": nbm, "ICON": icon, "Tomorrow": tomorrow
+        "ECMWF":ecmwf,"HRRR":hrrr,"RAP":rap,
+        "NBM":nbm,"ICON":icon,"Tomorrow":tomorrow
     }
-    available = [k for k, v in det_models.items() if v is not None]
-    missing   = [k for k, v in det_models.items() if v is None]
+    available = [k for k,v in det_models.items() if v is not None]
+    missing   = [k for k,v in det_models.items() if v is None]
     print(
-        f"[forecast] {city_code} | "
-        f"det={len(available)}/6 ({', '.join(available) or 'none'}) | "
+        f"[forecast] {city_code} | det={len(available)}/6 "
+        f"({', '.join(available) or 'none'}) | "
         f"missing=({', '.join(missing) or 'none'}) | "
-        f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs "
-        f"NBM_pct={len(nbm_prob)}pts"
+        f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs NBM_pct={len(nbm_prob)}pts"
     )
-    # ─────────────────────────────────────────────────────────────────────────
 
     all_members = list(gfs) + list(ecmwf_ens)
     if not all_members and ecmwf is None and hrrr is None and nbm is None:
         return None
 
     blend = list(all_members)
-    if nbm:      blend += [nbm] * 5          # deterministic NBM weighted 5x
-    if nbm_prob: blend += nbm_prob * 3        # v3.9: each percentile weighted 3x
+    if nbm:      blend += [nbm] * 5
+    if nbm_prob: blend += nbm_prob * 3
     if ecmwf:    blend += [ecmwf, ecmwf]
     if hrrr:     blend += [hrrr, hrrr]
     if rap:      blend += [rap, rap]
@@ -629,7 +613,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         "tomorrow_high":  round(tomorrow, 1) if tomorrow else None,
         "gfs_members":    len(gfs),
         "ecmwf_members":  len(ecmwf_ens),
-        "nbm_pct_points": len(nbm_prob),     # v3.9
+        "nbm_pct_points": len(nbm_prob),
         "total_members":  len(all_members),
         "confidence":     conf,
         "nbm_weight":     5,
@@ -646,7 +630,8 @@ def _normal_cdf(x: float, mean: float, spread: float) -> float:
     return round(phi if z >= 0 else 1 - phi, 6)
 
 def model_probability(forecast: dict, threshold: float, city_code: str,
-                      kind: str = "T", lo: float = None, hi: float = None) -> float:
+                      kind: str = "T", lo: float = None, hi: float = None,
+                      is_next_day: bool = False) -> float:
     mean   = forecast["corrected_mean"]
     spread = max(forecast["spread"], 0.5)
 
@@ -655,7 +640,10 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
 
     asos_weight = 0.0
     asos_prob   = 0.5
-    if obs_high is not None:
+
+    # v3.10: zero out ASOS weight for next-day markets — today's observed
+    # high is irrelevant to tomorrow's forecast
+    if obs_high is not None and not is_next_day:
         city_tz   = get_city_tz(city_code)
         now_local = datetime.now(city_tz)
         hour      = now_local.hour
@@ -667,14 +655,14 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
 
     if kind == "B" and lo is not None and hi is not None:
         ensemble_prob = _normal_cdf(hi, mean, spread) - _normal_cdf(lo, mean, spread)
-        if obs_high is not None:
+        if obs_high is not None and not is_next_day:
             asos_prob = 0.97 if lo <= obs_high < hi else 0.03
     else:
         ensemble_prob = 1.0 - _normal_cdf(threshold, mean, spread)
-        if obs_high is not None:
+        if obs_high is not None and not is_next_day:
             asos_prob = 0.98 if obs_high >= threshold else 0.02
 
-    if obs_high is not None:
+    if obs_high is not None and not is_next_day:
         prob = asos_weight * asos_prob + (1 - asos_weight) * ensemble_prob
     else:
         prob = ensemble_prob
@@ -694,8 +682,15 @@ def post_discord(webhook, content, embeds=None):
     except Exception as e:
         print(f"[discord] {e}")
 
-def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire) -> float:
+def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire, is_next_day) -> float:
+    # v3.10: next-day markets get lower unit sizing — less certainty
     signal_boost = tweet_hit and afd_hit
+    if is_next_day:
+        if ev_pct >= 35:
+            return 1.0 if confidence == "high" else 0.5
+        elif ev_pct >= 25:
+            return 0.5 if confidence == "high" else 0.0
+        return 0.0
     if ev_pct >= 25:
         if confidence == "high":     return 2.0 if signal_boost else 1.5
         elif confidence == "medium": return 1.0
@@ -710,7 +705,8 @@ def format_units(units: float) -> str:
     if units == 0: return "0u — flag only"
     return f"{int(units)}u" if units == int(units) else f"{units}u"
 
-def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0) -> dict:
+def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit,
+                units=0, is_next_day=False) -> dict:
     city_code = market["city_code"]
     best      = ev_data["best_side"]
     side_data = ev_data[best]
@@ -733,17 +729,19 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit, units=0
         {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",       "inline":True},
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
-    if obs_high is not None:
-        city_tz   = get_city_tz(city_code)
-        local_hr  = datetime.now(city_tz).strftime("%H:%M")
+    # v3.10: show ASOS only for same-day, flag next-day clearly
+    if obs_high is not None and not is_next_day:
+        city_tz  = get_city_tz(city_code)
+        local_hr = datetime.now(city_tz).strftime("%H:%M")
         fields.append({"name":"ASOS high","value":f"{obs_high}°F @ {local_hr} local","inline":True})
+    if is_next_day:
+        fields.append({"name":"Market type","value":"📅 Next-day forecast","inline":True})
 
     sources = []
     for key, label in [("ecmwf_high","ECMWF"),("hrrr_high","HRRR"),("nbm_high","NBM"),
                         ("rap_high","RAP"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
         if forecast.get(key):
             sources.append(f"{label} {forecast[key]}°F")
-    # v3.9: show NBM percentile point count in embed if available
     if forecast.get("nbm_pct_points"):
         sources.append(f"NBM_pct {forecast['nbm_pct_points']}pts")
     if tweet_hit: sources.append("tweet signal")
@@ -838,6 +836,19 @@ def get_active_kalshi_markets() -> list[dict]:
     print(f"[kalshi] {len(markets)} active temperature markets")
     return markets
 
+# ── TICKER DATE HELPER ────────────────────────────────────────────────────────
+def ticker_date(ticker: str) -> date:
+    try:
+        part   = ticker.split("-")[1]
+        months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                  "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
+        yr  = 2000 + int(part[0:2])
+        mon = months[part[2:5]]
+        day = int(part[5:7])
+        return date(yr, mon, day)
+    except:
+        return date.today()
+
 # ── ASYNC SCAN ────────────────────────────────────────────────────────────────
 async def scan_market_async(session, semaphore, market, today, tweet_cities, afd_cities):
     cc = market["city_code"]
@@ -848,7 +859,12 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
         if alert_key in posted_alert_keys:
             return None
 
-    forecast = await get_forecast(session, semaphore, cc, today)
+    # v3.10: determine if this is a next-day market
+    settle_date  = ticker_date(market["ticker"])
+    is_next_day  = settle_date > today
+    target_date  = settle_date  # fetch forecast for the correct settlement date
+
+    forecast = await get_forecast(session, semaphore, cc, target_date)
     if not forecast: return None
 
     threshold = market["threshold_f"]
@@ -857,10 +873,12 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     if kind == "B":
         lo   = threshold - 0.5
         hi   = threshold + 0.5
-        prob = model_probability(forecast, threshold, cc, kind="B", lo=lo, hi=hi)
+        prob = model_probability(forecast, threshold, cc, kind="B", lo=lo, hi=hi,
+                                 is_next_day=is_next_day)
     else:
         lo, hi = None, None
-        prob   = model_probability(forecast, threshold, cc, kind="T")
+        prob   = model_probability(forecast, threshold, cc, kind="T",
+                                   is_next_day=is_next_day)
 
     implied_p = market["yes_price"] / 100
     adj       = longshot_probability_adjustment(implied_p)
@@ -873,6 +891,10 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     side_data = ev_data[best]
     t_ev      = side_data["taker_ev"]
     spread    = forecast["spread"]
+
+    # v3.10: next-day markets need higher EV to fire (35% fire, 25% watch)
+    fire_thresh  = 0.35 if is_next_day else FIRE_EV_THRESHOLD
+    watch_thresh = 0.25 if is_next_day else WATCH_EV_THRESHOLD
 
     with _lock:
         obs_high = asos_observed.get(cc)
@@ -890,38 +912,40 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
         except Exception as _e:
             print(f"[bias_logger] {_e}")
 
-    fire  = t_ev >= FIRE_EV_THRESHOLD*100 and spread <= MAX_SPREAD_FIRE
-    watch = t_ev >= WATCH_EV_THRESHOLD*100 and spread <= MAX_SPREAD_WATCH
+    fire  = t_ev >= fire_thresh*100  and spread <= MAX_SPREAD_FIRE
+    watch = t_ev >= watch_thresh*100 and spread <= MAX_SPREAD_WATCH
     city  = CITY_COORDS[cc][2]
+    day_tag = "tmrw" if is_next_day else "today"
     tag   = "🔥" if fire else ("⚠️" if watch else ("🐦" if tweet_hit or afd_hit else "—"))
-    print(f"[scan] {city} [{kind}]: model={side_data['prob']}% "
+    print(f"[scan] {city} [{kind}/{day_tag}]: model={side_data['prob']}% "
           f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
 
     if fire or watch or ((tweet_hit or afd_hit) and t_ev > 0):
         return {
-            "market":    market,
-            "forecast":  forecast,
-            "ev_data":   ev_data,
-            "obs_high":  obs_high,
-            "tweet":     tweet_hit,
-            "afd":       afd_hit,
-            "fire":      fire,
-            "taker_ev":  t_ev,
-            "threshold": threshold,
-            "kind":      kind,
-            "alert_key": alert_key,
+            "market":      market,
+            "forecast":    forecast,
+            "ev_data":     ev_data,
+            "obs_high":    obs_high,
+            "tweet":       tweet_hit,
+            "afd":         afd_hit,
+            "fire":        fire,
+            "taker_ev":    t_ev,
+            "threshold":   threshold,
+            "kind":        kind,
+            "alert_key":   alert_key,
+            "is_next_day": is_next_day,
         }
     return None
 
-# ── v3.8: T/B SEPARATED BUCKET DEDUPLICATION ─────────────────────────────────
+# ── BUCKET DEDUPLICATION ──────────────────────────────────────────────────────
 def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
     groups: dict[tuple, list] = defaultdict(list)
     for res in raw_results:
-        key = (res["market"]["city_code"], res["kind"])
+        key = (res["market"]["city_code"], res["kind"], res["is_next_day"])
         groups[key].append(res)
 
     kept = []
-    for (cc, kind), alerts in groups.items():
+    for (cc, kind, next_day), alerts in groups.items():
         alerts.sort(key=lambda x: -x["taker_ev"])
         selected_thresholds = []
         for alert in alerts:
@@ -930,7 +954,8 @@ def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
             if not too_close:
                 selected_thresholds.append(thresh)
                 kept.append(alert)
-                print(f"[dedup] {cc}/{kind} keeping thresh={thresh}°F EV={alert['taker_ev']}%")
+                print(f"[dedup] {cc}/{kind}/{'tmrw' if next_day else 'today'} "
+                      f"keeping thresh={thresh}°F EV={alert['taker_ev']}%")
             else:
                 nearest = min(selected_thresholds, key=lambda s: abs(thresh - s))
                 print(f"[dedup] {cc}/{kind} dropping thresh={thresh}°F (near {nearest}°F)")
@@ -948,18 +973,9 @@ async def run_scan_async(force_codes=None):
 
     today = date.today()
 
-    def ticker_date(ticker):
-        try:
-            part   = ticker.split("-")[1]
-            months = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
-                      "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12}
-            yr  = 2000 + int(part[0:2])
-            mon = months[part[2:5]]
-            day = int(part[5:7])
-            return date(yr, mon, day)
-        except:
-            return today
-    markets = [m for m in markets if ticker_date(m["ticker"]) > today]
+    # v3.10: keep all open markets (same-day AND next-day)
+    # Kalshi status=open already excludes settled markets — no date filter needed
+    # markets list is used as-is
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT+4)
@@ -977,30 +993,40 @@ async def run_scan_async(force_codes=None):
 
     valid_results = [r for r in raw_results if r is not None and not isinstance(r, Exception)]
     filtered      = deduplicate_buckets(valid_results)
-    print(f"[dedup] {len(valid_results)} raw → {len(filtered)} after T/B separated dedup")
+
+    same_day_count = sum(1 for r in filtered if not r["is_next_day"])
+    next_day_count = sum(1 for r in filtered if r["is_next_day"])
+    print(f"[dedup] {len(valid_results)} raw → {len(filtered)} after dedup "
+          f"({same_day_count} same-day, {next_day_count} next-day)")
 
     alerts = 0
     for res in filtered:
-        market   = res["market"]
-        forecast = res["forecast"]
-        ev_data  = res["ev_data"]
-        city     = CITY_COORDS.get(market["city_code"],(None,None,market["city_code"]))[2]
-        best     = ev_data["best_side"]
-        t_ev_res = ev_data[best]["taker_ev"]
-        fire     = res["fire"]
-        emoji    = "🔥" if fire else "⚠️"
-        units    = recommend_units(t_ev_res, forecast["confidence"], res["tweet"], res["afd"], fire)
-        embed    = build_embed(market,forecast,ev_data,res["obs_high"],res["tweet"],res["afd"],units)
-        post_discord(DISCORD_WEBHOOK_URL, f"{emoji} **{city} — {market['subtitle']}**", [embed])
+        market      = res["market"]
+        forecast    = res["forecast"]
+        ev_data     = res["ev_data"]
+        is_next_day = res["is_next_day"]
+        city        = CITY_COORDS.get(market["city_code"],(None,None,market["city_code"]))[2]
+        best        = ev_data["best_side"]
+        t_ev_res    = ev_data[best]["taker_ev"]
+        fire        = res["fire"]
+        emoji       = "🔥" if fire else "⚠️"
+        day_label   = "📅 TOMORROW" if is_next_day else "📍 TODAY"
+        units       = recommend_units(t_ev_res, forecast["confidence"],
+                                      res["tweet"], res["afd"], fire, is_next_day)
+        embed       = build_embed(market, forecast, ev_data, res["obs_high"],
+                                  res["tweet"], res["afd"], units, is_next_day)
+        post_discord(DISCORD_WEBHOOK_URL,
+                     f"{emoji} **{city} — {market['subtitle']}** {day_label}", [embed])
         with _lock:
             posted_alert_keys.add(res["alert_key"])
         alerts += 1
 
     msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
-           f"{len(valid_results)} raw | {alerts} posted")
+           f"{len(valid_results)} raw | {alerts} posted "
+           f"({same_day_count} today / {next_day_count} tmrw)")
     if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
     post_discord(DISCORD_LOG_WEBHOOK, msg)
-    print(f"[scan] Done — {alerts} posted ({len(valid_results)} raw)")
+    print(f"[scan] Done — {alerts} posted ({same_day_count} today / {next_day_count} tmrw)")
 
 def run_scan(force_codes=None):
     asyncio.run(run_scan_async(force_codes))
@@ -1062,9 +1088,7 @@ def fetch_timeline(uid, since_id):
 def tweet_scanner_loop(user_ids):
     print(f"[twitter] Monitoring {len(user_ids)} accounts")
     user_since    = {uid: None for uid in user_ids.values()}
-    tw_total      = 0
-    tw_skipped    = 0
-    tw_classified = 0
+    tw_total = tw_skipped = tw_classified = 0
     while True:
         for username, uid in user_ids.items():
             for tweet in fetch_timeline(uid, user_since.get(uid)):
@@ -1096,7 +1120,7 @@ price_snapshot: dict[str, tuple[int, int]] = {}
 
 def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
     global _market_cache, _market_cache_ts
-    prices      = {}
+    prices = {}
     markets_raw = []
     for series in KXHIGH_SERIES:
         try:
@@ -1165,11 +1189,13 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.9")
-    print(f"   v3.9: NBM probabilistic percentiles (p10/p25/p50/p75/p90) added as ensemble members")
-    print(f"         Forecast debug logging shows model availability per city per scan")
-    print(f"   v3.8: ASOS uses city local timezone | T/B dedup separated")
-    print(f"   v3.7: Tweet pre-filter | Cross-scan dedup | NBM weight 5x")
+    print("🌡️  Kalshi Weather Bot v3.10")
+    print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
+    print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
+    print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
+    print(f"          Discord alerts labeled 📍 TODAY vs 📅 TOMORROW")
+    print(f"   v3.9: NBM probabilistic percentiles | Forecast debug logging")
+    print(f"   v3.8: City-local ASOS timezone | T/B dedup separated")
     print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
