@@ -645,8 +645,6 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
     asos_weight = 0.0
     asos_prob   = 0.5
 
-    # v3.10: zero out ASOS weight for next-day markets — today's observed
-    # high is irrelevant to tomorrow's forecast
     if obs_high is not None and not is_next_day:
         city_tz   = get_city_tz(city_code)
         now_local = datetime.now(city_tz)
@@ -687,7 +685,6 @@ def post_discord(webhook, content, embeds=None):
         print(f"[discord] {e}")
 
 def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire, is_next_day) -> float:
-    # v3.10: next-day markets get lower unit sizing — less certainty
     signal_boost = tweet_hit and afd_hit
     if is_next_day:
         if ev_pct >= 35:
@@ -733,7 +730,6 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit,
         {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",       "inline":True},
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
-    # v3.10: show ASOS only for same-day, flag next-day clearly
     if obs_high is not None and not is_next_day:
         city_tz  = get_city_tz(city_code)
         local_hr = datetime.now(city_tz).strftime("%H:%M")
@@ -863,10 +859,9 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
         if alert_key in posted_alert_keys:
             return None
 
-    # v3.10: determine if this is a next-day market
     settle_date  = ticker_date(market["ticker"])
     is_next_day  = settle_date > today
-    target_date  = settle_date  # fetch forecast for the correct settlement date
+    target_date  = settle_date
 
     forecast = await get_forecast(session, semaphore, cc, target_date)
     if not forecast: return None
@@ -896,7 +891,6 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     t_ev      = side_data["taker_ev"]
     spread    = forecast["spread"]
 
-    # v3.10: next-day markets need higher EV to fire (35% fire, 25% watch)
     fire_thresh  = 0.35 if is_next_day else FIRE_EV_THRESHOLD
     watch_thresh = 0.25 if is_next_day else WATCH_EV_THRESHOLD
 
@@ -976,10 +970,6 @@ async def run_scan_async(force_codes=None):
         markets = [m for m in markets if m["city_code"] in force_codes]
 
     today = date.today()
-
-    # v3.10: keep all open markets (same-day AND next-day)
-    # Kalshi status=open already excludes settled markets — no date filter needed
-    # markets list is used as-is
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT+4)
@@ -1063,7 +1053,8 @@ def classify_tweet(text) -> dict:
         r = requests.post("https://api.anthropic.com/v1/messages",
             headers={"x-api-key":ANTHROPIC_API_KEY,"anthropic-version":"2023-06-01",
                      "content-type":"application/json"},
-            json={"model":"claude-sonnet-4-6","max_tokens":200,"system":sys_prompt,
+            json={"model":"claude-haiku-4-5-20251001",  # ← changed from claude-sonnet-4-6
+                  "max_tokens":200,"system":sys_prompt,
                   "messages":[{"role":"user","content":f"Tweet: {text}"}]},
             timeout=15)
         r.raise_for_status()
@@ -1198,8 +1189,9 @@ def main():
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
     print(f"          Discord alerts labeled 📍 TODAY vs 📅 TOMORROW")
-    print(f"   v3.11: HRRR→ncep_hrrr_conus | NBM→ncep_nbm_conus | RAP removed
-   v3.9: NBM probabilistic percentiles | Forecast debug logging")
+    print(f"   v3.11: HRRR→ncep_hrrr_conus | NBM→ncep_nbm_conus | RAP removed")
+    print(f"   v3.11: Tweet classifier → claude-haiku (was sonnet, ~10x cost reduction)")
+    print(f"   v3.9: NBM probabilistic percentiles | Forecast debug logging")
     print(f"   v3.8: City-local ASOS timezone | T/B dedup separated")
     print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
