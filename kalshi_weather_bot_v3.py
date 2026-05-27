@@ -1210,8 +1210,8 @@ def main():
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
     print(f"          Discord alerts labeled 📍 TODAY vs 📅 TOMORROW")
-    print(f"   v3.11: HRRR→ncep_hrrr_conus | NBM→ncep_nbm_conus | RAP removed
-   v3.9: NBM probabilistic percentiles | Forecast debug logging")
+    print(f"   v3.11: HRRR->ncep_hrrr_conus | NBM->ncep_nbm_conus | RAP removed")
+    print(f"   v3.9: NBM probabilistic percentiles | Forecast debug logging")
     print(f"   v3.8: City-local ASOS timezone | T/B dedup separated")
     print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
