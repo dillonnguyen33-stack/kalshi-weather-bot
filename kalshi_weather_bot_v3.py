@@ -1,27 +1,19 @@
 """
-Kalshi Weather Temperature Bot — v3.10
+Kalshi Weather Temperature Bot — v3.12
 
-Changes from v3.10:
+Changes from v3.11:
+  v3.12 — Fix yes_price / no_price logging bug.
+           Previous code used yes_ask_dollars which is 1.00 (illiquid ask)
+           on most markets, causing all prices to log as 1 or 99.
+           Fix: use last_price_dollars as primary source, fall back to
+           midpoint of bid/ask, then 0.5 if nothing is available.
+           This gives us real market prices for edge/EV tracking.
+
   v3.11 — Fix broken Open-Meteo model strings:
-           HRRR: "hrrr" → "ncep_hrrr_conus" (API renamed model)
-           NBM:  "nbm"  → "ncep_nbm_conus"  (API renamed model)
-           RAP:  removed entirely — no longer available in Open-Meteo API
-           These three models were silently returning None on every city,
-           causing the model to run on only ECMWF + ICON + Tomorrow.io,
-           flooring spread at 1.5°F, and producing fake 90%+ EV signals.
-           With HRRR and NBM restored the model now has 5-6 deterministic
-           sources and a realistic spread estimate.
-  v3.10 — Two fixes for same-day market coverage:
-           1. Date filter fix: changed ticker_date filter from > today to >= today.
-              Previously ALL same-day markets were discarded before scanning.
-              Kalshi's status=open filter already excludes settled markets so
-              the date filter was redundant and wrong. Now same-day open markets
-              are scanned and can generate alerts throughout the day.
-           2. Next-day ASOS zero-weight: if a market settles tomorrow (not today),
-              ASOS weight is forced to 0.0 regardless of time of day. Today's
-              observed high is irrelevant to tomorrow's forecast and was causing
-              inflated confidence on next-day markets. Same-day markets continue
-              to use the time-weighted ASOS schedule as before.
+           HRRR: "hrrr" → "ncep_hrrr_conus"
+           NBM:  "nbm"  → "ncep_nbm_conus"
+           RAP:  removed entirely
+  v3.10 — Same-day market coverage + next-day ASOS zero-weight
 
 Install: pip install aiohttp requests psycopg2-binary
 """
@@ -77,7 +69,7 @@ ET_TZ  = ZoneInfo("America/New_York")
 PT_TZ  = ZoneInfo("America/Los_Angeles")
 CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.10 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.12 dillonnguyen33@gmail.com"
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -657,8 +649,6 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
     asos_weight = 0.0
     asos_prob   = 0.5
 
-    # v3.10: zero out ASOS weight for next-day markets — today's observed
-    # high is irrelevant to tomorrow's forecast
     if obs_high is not None and not is_next_day:
         city_tz   = get_city_tz(city_code)
         now_local = datetime.now(city_tz)
@@ -699,7 +689,6 @@ def post_discord(webhook, content, embeds=None):
         print(f"[discord] {e}")
 
 def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire, is_next_day) -> float:
-    # v3.10: next-day markets get lower unit sizing — less certainty
     signal_boost = tweet_hit and afd_hit
     if is_next_day:
         if ev_pct >= 35:
@@ -745,7 +734,6 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit,
         {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",       "inline":True},
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
-    # v3.10: show ASOS only for same-day, flag next-day clearly
     if obs_high is not None and not is_next_day:
         city_tz  = get_city_tz(city_code)
         local_hr = datetime.now(city_tz).strftime("%H:%M")
@@ -781,6 +769,28 @@ def parse_threshold_from_ticker(ticker: str) -> tuple[float | None, str]:
         except ValueError: return None, ""
     return None, ""
 
+def get_market_price(m: dict) -> int:
+    """
+    v3.12: Get real market price in cents.
+    Use last_price_dollars as primary source (most reliable for active markets).
+    Fall back to midpoint of bid/ask if last_price is zero or missing.
+    Final fallback is 50 cents (true uncertainty).
+    """
+    last     = float(m.get("last_price_dollars") or 0.0)
+    yes_bid  = float(m.get("yes_bid_dollars") or 0.0)
+    yes_ask  = float(m.get("yes_ask_dollars") or 1.0)
+
+    if last > 0.0:
+        price = last
+    elif yes_bid > 0.0 and yes_ask < 1.0:
+        price = (yes_bid + yes_ask) / 2
+    elif yes_bid > 0.0:
+        price = yes_bid
+    else:
+        price = 0.5  # true unknown
+
+    return max(1, min(99, round(price * 100)))
+
 def parse_market(m: dict) -> dict | None:
     ticker = m.get("ticker", "")
     if not ticker: return None
@@ -793,8 +803,11 @@ def parse_market(m: dict) -> dict | None:
     if not city_code: return None
     threshold, kind = parse_threshold_from_ticker(ticker)
     if threshold is None: return None
-    yes_price = max(1, min(99, round(float(m.get("yes_ask_dollars") or 0.5) * 100)))
-    no_price  = max(1, min(99, round(float(m.get("no_ask_dollars")  or 0.5) * 100)))
+
+    # v3.12: use real market price instead of illiquid ask
+    yes_price = get_market_price(m)
+    no_price  = 100 - yes_price
+
     subtitle  = m.get("title", "") or m.get("yes_sub_title", "") or ticker
     return {"ticker":ticker,"series":series,"city_code":city_code,
             "threshold_f":threshold,"threshold_kind":kind,
@@ -875,10 +888,9 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
         if alert_key in posted_alert_keys:
             return None
 
-    # v3.10: determine if this is a next-day market
     settle_date  = ticker_date(market["ticker"])
     is_next_day  = settle_date > today
-    target_date  = settle_date  # fetch forecast for the correct settlement date
+    target_date  = settle_date
 
     forecast = await get_forecast(session, semaphore, cc, target_date)
     if not forecast: return None
@@ -908,7 +920,6 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
     t_ev      = side_data["taker_ev"]
     spread    = forecast["spread"]
 
-    # v3.10: next-day markets need higher EV to fire (35% fire, 25% watch)
     fire_thresh  = 0.35 if is_next_day else FIRE_EV_THRESHOLD
     watch_thresh = 0.25 if is_next_day else WATCH_EV_THRESHOLD
 
@@ -988,10 +999,6 @@ async def run_scan_async(force_codes=None):
         markets = [m for m in markets if m["city_code"] in force_codes]
 
     today = date.today()
-
-    # v3.10: keep all open markets (same-day AND next-day)
-    # Kalshi status=open already excludes settled markets — no date filter needed
-    # markets list is used as-is
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT+4)
@@ -1154,8 +1161,8 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
         for m in data.get("markets", []):
             ticker    = m.get("ticker", "")
             city_code = series.replace("KXHIGH", "")
-            yes_price = max(1, min(99, round(float(m.get("yes_ask_dollars") or 0.5) * 100)))
-            no_price  = max(1, min(99, round(float(m.get("no_ask_dollars")  or 0.5) * 100)))
+            yes_price = get_market_price(m)
+            no_price  = 100 - yes_price
             if ticker:
                 prices[ticker] = (yes_price, no_price, city_code)
                 markets_raw.append(m)
@@ -1205,14 +1212,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.11")
-    print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
-    print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
-    print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
-    print(f"          Discord alerts labeled 📍 TODAY vs 📅 TOMORROW")
+    print("🌡️  Kalshi Weather Bot v3.12")
+    print(f"   v3.12: Real market prices via last_price_dollars (fixes 1/99 logging bug)")
     print(f"   v3.11: HRRR->ncep_hrrr_conus | NBM->ncep_nbm_conus | RAP removed")
-    print(f"   v3.9: NBM probabilistic percentiles | Forecast debug logging")
-    print(f"   v3.8: City-local ASOS timezone | T/B dedup separated")
+    print(f"   v3.10: Same-day markets scanned | Next-day ASOS zeroed | EV thresholds raised")
     print(f"   Cities: {len(CITY_COORDS)} | Accounts: {len(ALL_ACCOUNTS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
