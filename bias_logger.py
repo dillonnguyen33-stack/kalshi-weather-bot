@@ -120,14 +120,26 @@ def fetch_kalshi_result(ticker):
         r = requests.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=10)
         r.raise_for_status()
         m = r.json().get("market", {})
+
+        # Debug: print all price/result fields so we can verify what Kalshi returns
+        price_fields = {k: v for k, v in m.items() if "price" in k.lower() or "result" in k.lower()}
+        print(f"[debug] {ticker} fields: {price_fields}")
+
         if m.get("status") not in ("settled", "finalized"):
             return None
         result = m.get("result", "")
         yes_result = 1 if result == "yes" else (0 if result == "no" else None)
         if yes_result is None:
             return None
-        closing = m.get("last_price")
+
+        # Try close_price first, then yes_bid, then last_price as fallback
+        closing = (
+            m.get("close_price") or
+            m.get("yes_bid") or
+            m.get("last_price")
+        )
         closing_cents = round(float(closing) * 100) if closing else None
+
         return {"yes_result": yes_result, "closing_yes_price": closing_cents}
     except Exception as e:
         print(f"[bias_logger] fetch result {ticker}: {e}")
@@ -198,7 +210,7 @@ def score_settlements(target_date=None):
             conn.close()
 
         status = "✓" if model_correct else "✗"
-        clv_str = f"CLV {clv:+.0f}¢" if clv is not None else "no CLV"
+        clv_str = f"CLV {clv:+.0f}¢" if clv is not None else "no CLV (closing price unavailable)"
         print(f"  {status} {ticker}: {'YES' if yes_result else 'NO'} won | {clv_str}")
         scored += 1
 
