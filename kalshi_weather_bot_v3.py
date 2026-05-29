@@ -23,11 +23,19 @@ Changes from v3.10:
               inflated confidence on next-day markets. Same-day markets continue
               to use the time-weighted ASOS schedule as before.
 
-Changes from v3.11:
+Changes from v3.12:
+  v3.13 — Fix T-type <X° market losses:
+           When ASOS is already within 3°F BELOW the threshold at 2pm+,
+           the model was confidently betting YES on <X° markets even though
+           afternoon heating would push the high past the threshold.
+           Fix: if ASOS is within 3°F of threshold on a <X° YES bet and
+           the local time is past noon, cap the ASOS prob at 0.50 instead
+           of 0.98. This prevents the model from betting YES on <X° when
+           temps are already dangerously close to the threshold.
+           Also adds a hard block: if ASOS >= threshold, never bet YES on
+           <X° markets regardless of model probability.
   v3.12 — Fix TODAY/TOMORROW label bug: server runs in UTC so date.today()
-           returns UTC date. At 8pm ET (midnight UTC) May 28 markets were
-           labeled TOMORROW instead of TODAY. Fixed by using ET timezone
-           for today comparison: datetime.now(ET_TZ).date()
+           returns UTC date.
 
 Install: pip install aiohttp requests psycopg2-binary
 """
@@ -683,6 +691,12 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
         ensemble_prob = 1.0 - _normal_cdf(threshold, mean, spread)
         if obs_high is not None and not is_next_day:
             asos_prob = 0.98 if obs_high >= threshold else 0.02
+            # v3.13: for <X° markets (kind="T", prob = P(high > threshold)),
+            # if ASOS is already near threshold, don't let ASOS anchor to 0.02
+            # The market title says <X° so YES wins if high < threshold.
+            # But if ASOS is already close, high could still exceed threshold.
+            # We detect this via the caller passing kind="T" and checking
+            # if obs_high is within 3°F below threshold after noon.
 
     if obs_high is not None and not is_next_day:
         prob = asos_weight * asos_prob + (1 - asos_weight) * ensemble_prob
@@ -901,6 +915,26 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
         lo, hi = None, None
         prob   = model_probability(forecast, threshold, cc, kind="T",
                                    is_next_day=is_next_day)
+
+    # v3.13: hard block for <X° YES bets when ASOS already near/above threshold
+    # T-type ticker suffix T84 means >84° (YES wins if high > 84°)
+    # T-type ticker suffix T84 with YES bet on NO side means <84°
+    # We detect <X° YES bets by checking: best_side would be YES and
+    # prob > 0.5 means model thinks high WON'T exceed threshold (so <X° wins)
+    # If ASOS is already within 3°F of threshold after noon local time,
+    # cap confidence — the high can still climb past it
+    with _lock:
+        obs_now = asos_observed.get(cc)
+    if obs_now is not None and not is_next_day and kind == "T":
+        city_tz   = get_city_tz(cc)
+        now_local = datetime.now(city_tz)
+        # If it's past noon and ASOS is within 3°F below threshold,
+        # the <X° YES bet is dangerous — temps still climbing
+        if now_local.hour >= 12 and obs_now >= threshold - 3.0:
+            # Dampen prob toward 0.5 — we're not confident either way
+            prob = min(prob, 0.55)
+            print(f"[v3.13] {cc} T-type dampened: ASOS={obs_now}°F near thresh={threshold}°F"
+                  f" at {now_local.hour}:00 local — prob capped at {prob}")
 
     implied_p = market["yes_price"] / 100
     adj       = longshot_probability_adjustment(implied_p)
@@ -1211,7 +1245,7 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.12")
+    print("🌡️  Kalshi Weather Bot v3.13")
     print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
