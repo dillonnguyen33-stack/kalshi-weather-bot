@@ -24,6 +24,13 @@ Changes from v3.10:
               to use the time-weighted ASOS schedule as before.
 
 Changes from v3.12:
+  v3.15 — ASOS weight zeroed before noon local time:
+           Before noon the ASOS reading is the morning warming phase and
+           adds noise rather than signal. Models are more reliable than
+           observed temps for predicting the afternoon high before noon.
+           After noon ASOS becomes increasingly reliable. Schedule:
+           before 12: 0.0, 12-14: 0.40, 14-16: 0.60, 16-18: 0.85, 18+: 0.95
+           This eliminates overnight/early morning ASOS contamination.
   v3.14 — Stronger T-type fix: instead of dampening prob, now returns None
            (skips alert entirely) when ASOS is within 3°F of threshold after
            noon on <X° YES bets. The v3.13 dampening wasn't enough because
@@ -686,7 +693,7 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
         elif hour >= 16: asos_weight = 0.85
         elif hour >= 14: asos_weight = 0.60
         elif hour >= 12: asos_weight = 0.40
-        else:            asos_weight = 0.15
+        else:            asos_weight = 0.0  # v3.15: before noon trust models not ASOS
 
     if kind == "B" and lo is not None and hi is not None:
         ensemble_prob = _normal_cdf(hi, mean, spread) - _normal_cdf(lo, mean, spread)
@@ -1249,7 +1256,7 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.14")
+    print("🌡️  Kalshi Weather Bot v3.15")
     print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
