@@ -24,7 +24,12 @@ Changes from v3.10:
               to use the time-weighted ASOS schedule as before.
 
 Changes from v3.12:
-  v3.13 — Fix T-type <X° market losses:
+  v3.14 — Stronger T-type fix: instead of dampening prob, now returns None
+           (skips alert entirely) when ASOS is within 3°F of threshold after
+           noon on <X° YES bets. The v3.13 dampening wasn't enough because
+           Kalshi pricing at 1¢ still showed massive EV even at 55% prob.
+           Also blocks >X° NO bets when ASOS already exceeded threshold.
+  v3.13 — Fix T-type <X° market losses (soft dampening — replaced by v3.14):
            When ASOS is already within 3°F BELOW the threshold at 2pm+,
            the model was confidently betting YES on <X° markets even though
            afternoon heating would push the high past the threshold.
@@ -916,25 +921,24 @@ async def scan_market_async(session, semaphore, market, today, tweet_cities, afd
         prob   = model_probability(forecast, threshold, cc, kind="T",
                                    is_next_day=is_next_day)
 
-    # v3.13: hard block for <X° YES bets when ASOS already near/above threshold
-    # T-type ticker suffix T84 means >84° (YES wins if high > 84°)
-    # T-type ticker suffix T84 with YES bet on NO side means <84°
-    # We detect <X° YES bets by checking: best_side would be YES and
-    # prob > 0.5 means model thinks high WON'T exceed threshold (so <X° wins)
-    # If ASOS is already within 3°F of threshold after noon local time,
-    # cap confidence — the high can still climb past it
+    # v3.14: hard block for T-type markets when ASOS invalidates the bet
+    # For <X° YES bets: if ASOS is already AT or ABOVE threshold, skip entirely
+    # For <X° YES bets: if ASOS is within 3°F of threshold after noon, skip
+    # For >X° NO bets: if ASOS already exceeds threshold, skip entirely
     with _lock:
         obs_now = asos_observed.get(cc)
     if obs_now is not None and not is_next_day and kind == "T":
         city_tz   = get_city_tz(cc)
         now_local = datetime.now(city_tz)
-        # If it's past noon and ASOS is within 3°F below threshold,
-        # the <X° YES bet is dangerous — temps still climbing
-        if now_local.hour >= 12 and obs_now >= threshold - 3.0:
-            # Dampen prob toward 0.5 — we're not confident either way
-            prob = min(prob, 0.55)
-            print(f"[v3.13] {cc} T-type dampened: ASOS={obs_now}°F near thresh={threshold}°F"
-                  f" at {now_local.hour}:00 local — prob capped at {prob}")
+        # prob > 0.5 means model thinks high WON'T exceed threshold
+        # This is a <X° YES bet — ASOS near threshold means high will likely exceed it
+        if prob > 0.5 and now_local.hour >= 12 and obs_now >= threshold - 3.0:
+            print(f"[v3.14] {cc} T-type BLOCKED: ASOS={obs_now}°F near/above thresh={threshold}°F"
+                  f" at {now_local.hour}:00 local — skipping <X° YES bet")
+            return None
+        # prob < 0.5 means model thinks high WILL exceed threshold
+        # This is a >X° YES bet — if ASOS already exceeded threshold, it's a lock
+        # Don't block these, they're fine
 
     implied_p = market["yes_price"] / 100
     adj       = longshot_probability_adjustment(implied_p)
@@ -1245,7 +1249,7 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.13")
+    print("🌡️  Kalshi Weather Bot v3.14")
     print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
