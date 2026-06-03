@@ -1,4 +1,4 @@
-"""
+\"""
 Kalshi Weather Temperature Bot — v3.10
 
 Changes from v3.10:
@@ -24,6 +24,18 @@ Changes from v3.10:
               to use the time-weighted ASOS schedule as before.
 
 Changes from v3.12:
+  v3.18 — Four critical fixes based on calibration data:
+           1. Block ALL YES bets — data shows YES bets win 0-5% vs NO bets 67-85%
+              The model has directional edge (NO) but not precision edge (YES)
+              YES bets require exact 1F bucket prediction; model spread is 2-3F
+           2. Move logging AFTER fire/watch check — previously logging every
+              scanned market inflated calibration counts to 50-80/day when only
+              10-20 alerts actually fired. Now only logs bets that actually post.
+           3. Afternoon re-alert window — dedup key resets after 2pm local time
+              so ASOS-confirmed afternoon alerts can fire even if same ticker
+              already fired at midnight. This is where the real edge lives.
+           4. Minimum gap rule for B-type NO bets — bucket lo must be at least
+              2x spread above ensemble mean to avoid borderline coin-flip bets
   v3.17 — Remove Twitter scanner (pay-per-use API burning $25/2wks with zero value)
            Add AIFS (ECMWF AI model) as deterministic source
            Add ICON ensemble (40 members) for better spread calculation
@@ -114,7 +126,7 @@ ET_TZ  = ZoneInfo("America/New_York")
 PT_TZ  = ZoneInfo("America/Los_Angeles")
 CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.17 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.18 dillonnguyen33@gmail.com"
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -925,7 +937,15 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     cc = market["city_code"]
     if cc not in CITY_COORDS: return None
 
-    alert_key = f"{market['ticker']}_{today}"
+    # v3.18 Fix 3: Afternoon re-alert window
+    # After 2pm local time, use a different key so ASOS-confirmed alerts can fire
+    # even if the same ticker already fired at midnight with pure forecast data
+    city_tz_check = get_city_tz(cc)
+    now_local_check = datetime.now(city_tz_check)
+    if not (ticker_date(market["ticker"]) > datetime.now(ET_TZ).date()) and now_local_check.hour >= 14:
+        alert_key = f"{market['ticker']}_{today}_afternoon"
+    else:
+        alert_key = f"{market['ticker']}_{today}"
     with _lock:
         if alert_key in posted_alert_keys:
             return None
@@ -946,6 +966,15 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
         hi   = threshold + 0.5
         prob = model_probability(forecast, threshold, cc, kind="B", lo=lo, hi=hi,
                                  is_next_day=is_next_day)
+        # v3.18 Fix 4: Minimum gap rule for B-type NO bets
+        # Bucket lo must be at least 2x spread above ensemble mean
+        # Prevents borderline coin-flip bets like mean=95.1F vs bucket 95-96F
+        if prob < 0.5:  # NO bet
+            gap = lo - forecast["corrected_mean"]
+            min_gap = forecast["spread"] * 2.0
+            if gap < min_gap:
+                print(f"[v3.18] {cc} B-type NO blocked: gap={gap:.1f}F < min={min_gap:.1f}F")
+                return None
     else:
         lo, hi = None, None
         prob   = model_probability(forecast, threshold, cc, kind="T",
@@ -987,9 +1016,13 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     best    = ev_data["best_side"]
     if not best: return None
 
-    # v3.16 Fix 6: Skip markets priced at 5 cents or less — model is likely wrong
-    if best == "YES" and market["yes_price"] <= 5:
+    # v3.18 Fix 1: Block ALL YES bets — data shows 0-5% win rate vs 67-85% for NO
+    # YES bets require precision (exact 1F bucket) that model spread of 2-3F cannot provide
+    # NO bets only require direction which the model does well
+    if best == "YES":
         return None
+
+    # v3.16 Fix 6: Skip markets priced at 5 cents or less — model is likely wrong
     if best == "NO" and market["no_price"] <= 5:
         return None
 
@@ -1006,17 +1039,6 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     tweet_hit = False  # v3.17: Twitter removed
     afd_hit   = bool(afd_cities and cc in afd_cities)
 
-    if BIAS_LOGGING:
-        try:
-            _log_prediction(
-                today, cc, CITY_COORDS[cc][2], market["ticker"], threshold,
-                forecast, prob, market["yes_price"], market["no_price"],
-                obs_high, best_side=best,
-                taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
-            )
-        except Exception as _e:
-            print(f"[bias_logger] {_e}")
-
     fire  = t_ev >= fire_thresh*100  and spread <= MAX_SPREAD_FIRE
     watch = t_ev >= watch_thresh*100 and spread <= MAX_SPREAD_WATCH
     city  = CITY_COORDS[cc][2]
@@ -1026,6 +1048,18 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
           f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
 
     if fire or watch or ((tweet_hit or afd_hit) and t_ev > 0):
+        # v3.18 Fix 2: Only log predictions that actually fire alerts
+        # Previously logged every scanned market inflating calibration counts
+        if BIAS_LOGGING:
+            try:
+                _log_prediction(
+                    today, cc, CITY_COORDS[cc][2], market["ticker"], threshold,
+                    forecast, prob, market["yes_price"], market["no_price"],
+                    obs_high, best_side=best,
+                    taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
+                )
+            except Exception as _e:
+                print(f"[bias_logger] {_e}")
         return {
             "market":      market,
             "forecast":    forecast,
@@ -1211,7 +1245,7 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.17")
+    print("🌡️  Kalshi Weather Bot v3.18")
     print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
     print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
     print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
