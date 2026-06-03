@@ -1,4 +1,4 @@
-\"""
+"""
 Kalshi Weather Temperature Bot — v3.10
 
 Changes from v3.10:
