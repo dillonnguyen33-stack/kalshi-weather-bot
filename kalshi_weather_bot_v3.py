@@ -1,80 +1,22 @@
 """
-Kalshi Weather Temperature Bot — v3.10
+Kalshi Weather Temperature Bot — v3.19
 
-Changes from v3.10:
-  v3.12 — Fix broken Open-Meteo model strings:
-           HRRR: "hrrr" → "ncep_hrrr_conus" (API renamed model)
-           NBM:  "nbm"  → "ncep_nbm_conus"  (API renamed model)
-           RAP:  removed entirely — no longer available in Open-Meteo API
-           These three models were silently returning None on every city,
-           causing the model to run on only ECMWF + ICON + Tomorrow.io,
-           flooring spread at 1.5°F, and producing fake 90%+ EV signals.
-           With HRRR and NBM restored the model now has 5-6 deterministic
-           sources and a realistic spread estimate.
-  v3.10 — Two fixes for same-day market coverage:
-           1. Date filter fix: changed ticker_date filter from > today to >= today.
-              Previously ALL same-day markets were discarded before scanning.
-              Kalshi's status=open filter already excludes settled markets so
-              the date filter was redundant and wrong. Now same-day open markets
-              are scanned and can generate alerts throughout the day.
-           2. Next-day ASOS zero-weight: if a market settles tomorrow (not today),
-              ASOS weight is forced to 0.0 regardless of time of day. Today's
-              observed high is irrelevant to tomorrow's forecast and was causing
-              inflated confidence on next-day markets. Same-day markets continue
-              to use the time-weighted ASOS schedule as before.
-
-Changes from v3.12:
-  v3.18 — Four critical fixes based on calibration data:
-           1. Block ALL YES bets — data shows YES bets win 0-5% vs NO bets 67-85%
-              The model has directional edge (NO) but not precision edge (YES)
-              YES bets require exact 1F bucket prediction; model spread is 2-3F
-           2. Move logging AFTER fire/watch check — previously logging every
-              scanned market inflated calibration counts to 50-80/day when only
-              10-20 alerts actually fired. Now only logs bets that actually post.
-           3. Afternoon re-alert window — dedup key resets after 2pm local time
-              so ASOS-confirmed afternoon alerts can fire even if same ticker
-              already fired at midnight. This is where the real edge lives.
-           4. Minimum gap rule for B-type NO bets — bucket lo must be at least
-              2x spread above ensemble mean to avoid borderline coin-flip bets
-  v3.17 — Remove Twitter scanner (pay-per-use API burning $25/2wks with zero value)
-           Add AIFS (ECMWF AI model) as deterministic source
-           Add ICON ensemble (40 members) for better spread calculation
-           Total ensemble members: GFS(31) + ECMWF(51) + ICON(40) = 122 members
-  v3.16 — Eight calibration fixes:
-           1. T-type <X° YES blocked ANY time when ensemble mean >= threshold
-           2. Spread floor raised from 1.5 to 2.5 when <10 ensemble members
-           3. Fire threshold raised to 35% same-day, 40% next-day
-           4. Next-day T-type YES bets blocked entirely
-           5. T-type NO bets blocked when threshold too close to mean (<spread gap)
-           6. Kalshi price floor: skip if best side price <= 5 cents
-           7. Model agreement check: widen spread when models disagree >4F
-           8. Dynamic spread floor based on model agreement level
-  v3.15 — ASOS weight zeroed before noon local time:
-           Before noon the ASOS reading is the morning warming phase and
-           adds noise rather than signal. Models are more reliable than
-           observed temps for predicting the afternoon high before noon.
-           After noon ASOS becomes increasingly reliable. Schedule:
-           before 12: 0.0, 12-14: 0.40, 14-16: 0.60, 16-18: 0.85, 18+: 0.95
-           This eliminates overnight/early morning ASOS contamination.
-  v3.14 — Stronger T-type fix: instead of dampening prob, now returns None
-           (skips alert entirely) when ASOS is within 3°F of threshold after
-           noon on <X° YES bets. The v3.13 dampening wasn't enough because
-           Kalshi pricing at 1¢ still showed massive EV even at 55% prob.
-           Also blocks >X° NO bets when ASOS already exceeded threshold.
-  v3.13 — Fix T-type <X° market losses (soft dampening — replaced by v3.14):
-           When ASOS is already within 3°F BELOW the threshold at 2pm+,
-           the model was confidently betting YES on <X° markets even though
-           afternoon heating would push the high past the threshold.
-           Fix: if ASOS is within 3°F of threshold on a <X° YES bet and
-           the local time is past noon, cap the ASOS prob at 0.50 instead
-           of 0.98. This prevents the model from betting YES on <X° when
-           temps are already dangerously close to the threshold.
-           Also adds a hard block: if ASOS >= threshold, never bet YES on
-           <X° markets regardless of model probability.
-  v3.12 — Fix TODAY/TOMORROW label bug: server runs in UTC so date.today()
-           returns UTC date.
-
-Install: pip install aiohttp requests psycopg2-binary
+Changes from v3.18:
+  v3.19 — Three fixes:
+           1. Fix market_date logging bug: was storing date.today() (the date
+              the alert fired) instead of target_date (the settlement date).
+              This caused the scorer to query the wrong date and never find
+              the predictions. Now stores the ticker's actual settlement date.
+           2. Loosen B-type NO minimum gap rule: was 2x spread (too aggressive,
+              blocked almost everything). Now 1x spread — still blocks borderline
+              coin-flips but lets real edges through.
+           3. Re-enable YES bets with ASOS confirmation only:
+              - Only fires after 2pm and before 5pm local time
+              - ASOS observed high must be within 1F below bucket lo or inside bucket
+              - Spread must be ≤2F (tighter than NO — need precision for YES)
+              - EV threshold: 20% (lower than NO since ASOS is doing the work)
+              - Same-day only — next-day YES still blocked entirely
+              - Overnight and morning YES still blocked (before 2pm)
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -115,10 +57,12 @@ DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
 SCAN_INTERVAL_SECS  = 300
 ASOS_POLL_SECS      = 600
 AFD_POLL_SECS       = 3600
-FIRE_EV_THRESHOLD   = 0.35  # v3.16: raised from 0.25
-WATCH_EV_THRESHOLD  = 0.20  # v3.16: raised from 0.15
+FIRE_EV_THRESHOLD   = 0.35
+WATCH_EV_THRESHOLD  = 0.20
+YES_EV_THRESHOLD    = 0.20  # v3.19: lower threshold since ASOS does the work
 MAX_SPREAD_FIRE     = 3.0
 MAX_SPREAD_WATCH    = 5.0
+MAX_SPREAD_YES      = 2.0   # v3.19: tighter spread for YES — need precision
 MAX_CONCURRENT      = 8
 BUCKET_GAP_F        = 3.0
 
@@ -126,7 +70,7 @@ ET_TZ  = ZoneInfo("America/New_York")
 PT_TZ  = ZoneInfo("America/Los_Angeles")
 CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.18 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.19 dillonnguyen33@gmail.com"
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -240,9 +184,8 @@ def get_city_tz(city_code: str) -> ZoneInfo:
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
 asos_observed: dict[str, float]  = {}
-seen_tweet_ids: set              = set()
-seen_afd_ids: set                = set()
 afd_flagged_cities: set          = set()
+seen_afd_ids: set                = set()
 posted_alert_keys: set           = set()
 last_reset_date                  = None
 _lock = threading.Lock()
@@ -258,8 +201,6 @@ def maybe_reset_daily():
         print("[reset] New day — clearing posted alert keys")
         posted_alert_keys.clear()
         last_reset_date = today
-
-# Twitter scanner removed in v3.17 — was burning API credits with zero signal value
 
 CITY_KEYWORD_MAP = {
     "new york":"NY","nyc":"NY","central park":"NY","manhattan":"NY",
@@ -460,7 +401,6 @@ async def fetch_ecmwf(session, lat, lon, ds) -> float | None:
     except: return None
 
 async def fetch_aifs(session, lat, lon, ds) -> float | None:
-    """ECMWF AI model — reportedly outperforms traditional models for 1-2 day temp forecasts."""
     try:
         data = await _get_json(session, f"{OPEN_METEO_BASE}/ecmwf", {
             "latitude":lat,"longitude":lon,"hourly":"temperature_2m",
@@ -480,7 +420,6 @@ async def fetch_hrrr(session, lat, lon, ds) -> float | None:
     except: return None
 
 async def fetch_rap(session, lat, lon, ds) -> float | None:
-    """RAP model removed from Open-Meteo API — always returns None."""
     return None
 
 async def fetch_gfs_ensemble(session, lat, lon, ds) -> list[float]:
@@ -548,7 +487,6 @@ async def fetch_ecmwf_ensemble(session, lat, lon, ds) -> list[float]:
     except: return []
 
 async def fetch_icon_ensemble(session, lat, lon, ds) -> list[float]:
-    """ICON EPS ensemble — 40 members from German weather service."""
     try:
         members = ",".join([f"temperature_2m_member{i:02d}" for i in range(0,40)])
         data = await _get_json(session, f"{OPEN_METEO_ENS_BASE}/ensemble", {
@@ -629,7 +567,7 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     if nbm:      blend += [nbm] * 5
     if nbm_prob: blend += nbm_prob * 3
     if ecmwf:    blend += [ecmwf, ecmwf]
-    if aifs:     blend += [aifs, aifs]   # v3.17: ECMWF AI model weighted 2x
+    if aifs:     blend += [aifs, aifs]
     if hrrr:     blend += [hrrr, hrrr]
     if rap:      blend += [rap, rap]
     if icon:     blend.append(icon)
@@ -648,52 +586,46 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     bias           = get_bias(city_code)
     corrected_mean = mean + bias
 
-    # v3.16 Fix 7: Widen spread when deterministic models disagree significantly
     det_vals = [v for v in [ecmwf, aifs, hrrr, nbm, icon, tomorrow] if v is not None]
     if len(det_vals) >= 2:
         det_range = max(det_vals) - min(det_vals)
         if det_range > 4.0:
             spread = max(spread, det_range / 2)
-            print(f"[v3.16] {city_code} spread widened: det_range={det_range:.1f}F")
+            print(f"[spread] {city_code} widened: det_range={det_range:.1f}F")
 
-    # v3.16 Fix 8: Dynamic spread floor based on model agreement
-    # Fix 2: Raise minimum floor from 1.5 to 2.5 when few ensemble members
     if len(det_vals) >= 4:
         det_range = max(det_vals) - min(det_vals)
-        if det_range <= 2.0:
-            dynamic_floor = 1.5   # models tightly agree — earned confidence
-        elif det_range <= 4.0:
-            dynamic_floor = 2.0   # moderate disagreement
-        else:
-            dynamic_floor = det_range / 2  # high disagreement
+        if det_range <= 2.0:   dynamic_floor = 1.5
+        elif det_range <= 4.0: dynamic_floor = 2.0
+        else:                  dynamic_floor = det_range / 2
     elif len(det_vals) >= 2:
-        dynamic_floor = 2.5   # fewer models — less confidence
+        dynamic_floor = 2.5
     else:
-        dynamic_floor = 3.5   # only 1 model — very uncertain
+        dynamic_floor = 3.5
 
     if len(all_members) < 10:
         spread = max(spread, dynamic_floor)
 
     conf = "high" if spread < 2.0 else ("medium" if spread < 4.0 else "low")
     return {
-        "ensemble_mean":  round(mean, 1),
-        "corrected_mean": round(corrected_mean, 1),
-        "bias_applied":   round(bias, 2),
-        "spread":         round(spread, 2),
-        "ecmwf_high":     round(ecmwf, 1)    if ecmwf    else None,
-        "hrrr_high":      round(hrrr, 1)     if hrrr     else None,
-        "nbm_high":       round(nbm, 1)      if nbm      else None,
-        "rap_high":       round(rap, 1)      if rap      else None,
-        "icon_high":      round(icon, 1)     if icon     else None,
-        "tomorrow_high":  round(tomorrow, 1) if tomorrow else None,
-        "aifs_high":      round(aifs, 1)     if aifs     else None,
-        "gfs_members":    len(gfs),
-        "ecmwf_members":  len(ecmwf_ens),
+        "ensemble_mean":    round(mean, 1),
+        "corrected_mean":   round(corrected_mean, 1),
+        "bias_applied":     round(bias, 2),
+        "spread":           round(spread, 2),
+        "ecmwf_high":       round(ecmwf, 1)    if ecmwf    else None,
+        "hrrr_high":        round(hrrr, 1)     if hrrr     else None,
+        "nbm_high":         round(nbm, 1)      if nbm      else None,
+        "rap_high":         round(rap, 1)      if rap      else None,
+        "icon_high":        round(icon, 1)     if icon     else None,
+        "tomorrow_high":    round(tomorrow, 1) if tomorrow else None,
+        "aifs_high":        round(aifs, 1)     if aifs     else None,
+        "gfs_members":      len(gfs),
+        "ecmwf_members":    len(ecmwf_ens),
         "icon_ens_members": len(icon_ens),
-        "nbm_pct_points": len(nbm_prob),
-        "total_members":  len(all_members),
-        "confidence":     conf,
-        "nbm_weight":     5,
+        "nbm_pct_points":   len(nbm_prob),
+        "total_members":    len(all_members),
+        "confidence":       conf,
+        "nbm_weight":       5,
     }
 
 # ── PROBABILITY MODEL ─────────────────────────────────────────────────────────
@@ -718,8 +650,6 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
     asos_weight = 0.0
     asos_prob   = 0.5
 
-    # v3.10: zero out ASOS weight for next-day markets — today's observed
-    # high is irrelevant to tomorrow's forecast
     if obs_high is not None and not is_next_day:
         city_tz   = get_city_tz(city_code)
         now_local = datetime.now(city_tz)
@@ -728,7 +658,7 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
         elif hour >= 16: asos_weight = 0.85
         elif hour >= 14: asos_weight = 0.60
         elif hour >= 12: asos_weight = 0.40
-        else:            asos_weight = 0.0  # v3.15: before noon trust models not ASOS
+        else:            asos_weight = 0.0
 
     if kind == "B" and lo is not None and hi is not None:
         ensemble_prob = _normal_cdf(hi, mean, spread) - _normal_cdf(lo, mean, spread)
@@ -738,12 +668,6 @@ def model_probability(forecast: dict, threshold: float, city_code: str,
         ensemble_prob = 1.0 - _normal_cdf(threshold, mean, spread)
         if obs_high is not None and not is_next_day:
             asos_prob = 0.98 if obs_high >= threshold else 0.02
-            # v3.13: for <X° markets (kind="T", prob = P(high > threshold)),
-            # if ASOS is already near threshold, don't let ASOS anchor to 0.02
-            # The market title says <X° so YES wins if high < threshold.
-            # But if ASOS is already close, high could still exceed threshold.
-            # We detect this via the caller passing kind="T" and checking
-            # if obs_high is within 3°F below threshold after noon.
 
     if obs_high is not None and not is_next_day:
         prob = asos_weight * asos_prob + (1 - asos_weight) * ensemble_prob
@@ -757,6 +681,26 @@ def longshot_probability_adjustment(implied_p: float) -> float:
     if implied_p > 0.90: return +0.03
     return 0.0
 
+# ── ASOS YES CHECK ────────────────────────────────────────────────────────────
+def asos_confirms_yes(city_code: str, kind: str, lo: float, hi: float,
+                      threshold: float, forecast: dict) -> bool:
+    """
+    v3.19: Returns True if ASOS observed high confirms a YES bet is valid.
+    Only called between 2pm-5pm local time for same-day B-type markets.
+    Requires ASOS to be within 1F below bucket lo or already inside bucket.
+    Spread must be <= MAX_SPREAD_YES (2.0F).
+    """
+    if forecast["spread"] > MAX_SPREAD_YES:
+        return False
+    with _lock:
+        obs_high = asos_observed.get(city_code)
+    if obs_high is None:
+        return False
+    # ASOS must be within 1F below lo, or inside the bucket
+    if kind == "B":
+        return obs_high >= (lo - 1.0)
+    return False  # T-type YES not re-enabled
+
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 def post_discord(webhook, content, embeds=None):
     if not webhook: return
@@ -765,17 +709,15 @@ def post_discord(webhook, content, embeds=None):
     except Exception as e:
         print(f"[discord] {e}")
 
-def recommend_units(ev_pct, confidence, tweet_hit, afd_hit, is_fire, is_next_day) -> float:
-    # v3.10: next-day markets get lower unit sizing — less certainty
-    signal_boost = tweet_hit and afd_hit
+def recommend_units(ev_pct, confidence, afd_hit, is_fire, is_next_day, is_yes=False) -> float:
+    if is_yes:
+        return 1.0 if ev_pct >= 30 else 0.5
     if is_next_day:
-        if ev_pct >= 35:
-            return 1.0 if confidence == "high" else 0.5
-        elif ev_pct >= 25:
-            return 0.5 if confidence == "high" else 0.0
+        if ev_pct >= 35:   return 1.0 if confidence == "high" else 0.5
+        elif ev_pct >= 25: return 0.5 if confidence == "high" else 0.0
         return 0.0
     if ev_pct >= 25:
-        if confidence == "high":     return 2.0 if signal_boost else 1.5
+        if confidence == "high":     return 2.0
         elif confidence == "medium": return 1.0
         else:                        return 0.5
     elif ev_pct >= 15:
@@ -788,8 +730,8 @@ def format_units(units: float) -> str:
     if units == 0: return "0u — flag only"
     return f"{int(units)}u" if units == int(units) else f"{units}u"
 
-def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit,
-                units=0, is_next_day=False) -> dict:
+def build_embed(market, forecast, ev_data, obs_high, afd_hit,
+                units=0, is_next_day=False, asos_yes=False) -> dict:
     city_code = market["city_code"]
     best      = ev_data["best_side"]
     side_data = ev_data[best]
@@ -797,11 +739,12 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit,
     t_ev      = side_data["taker_ev"]
     m_ev      = side_data["maker_ev"]
     color     = 0x1a6b3a if t_ev >= FIRE_EV_THRESHOLD*100 else 0x854f0b
+    if asos_yes: color = 0x0099ff  # blue for ASOS-confirmed YES
 
     fields = [
-        {"name":"Side",  "value":best,               "inline":True},
-        {"name":"EV%",   "value":f"+{t_ev}%",        "inline":True},
-        {"name":"Units", "value":format_units(units),"inline":True},
+        {"name":"Side",  "value":f"{'🌡️ ASOS ' if asos_yes else ''}{best}", "inline":True},
+        {"name":"EV%",   "value":f"+{t_ev}%",         "inline":True},
+        {"name":"Units", "value":format_units(units),  "inline":True},
     ]
     fields += [
         {"name":"Model prob",     "value":f"{side_data['prob']}%",           "inline":True},
@@ -812,23 +755,21 @@ def build_embed(market, forecast, ev_data, obs_high, tweet_hit, afd_hit,
         {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",       "inline":True},
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
-    # v3.10: show ASOS only for same-day, flag next-day clearly
     if obs_high is not None and not is_next_day:
         city_tz  = get_city_tz(city_code)
         local_hr = datetime.now(city_tz).strftime("%H:%M")
         fields.append({"name":"ASOS high","value":f"{obs_high}°F @ {local_hr} local","inline":True})
     if is_next_day:
         fields.append({"name":"Market type","value":"📅 Next-day forecast","inline":True})
+    if asos_yes:
+        fields.append({"name":"Signal","value":"🌡️ ASOS-confirmed YES","inline":True})
 
     sources = []
-    for key, label in [("ecmwf_high","ECMWF"),("aifs_high","AIFS"),("hrrr_high","HRRR"),("nbm_high","NBM"),
-                        ("rap_high","RAP"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
+    for key, label in [("ecmwf_high","ECMWF"),("aifs_high","AIFS"),("hrrr_high","HRRR"),
+                        ("nbm_high","NBM"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
         if forecast.get(key):
             sources.append(f"{label} {forecast[key]}°F")
-    if forecast.get("nbm_pct_points"):
-        sources.append(f"NBM_pct {forecast['nbm_pct_points']}pts")
-    if tweet_hit: sources.append("tweet signal")
-    if afd_hit:   sources.append("AFD signal")
+    if afd_hit: sources.append("AFD signal")
     if sources:
         fields.append({"name":"\u200b","value":" | ".join(sources),"inline":False})
 
@@ -937,123 +878,135 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     cc = market["city_code"]
     if cc not in CITY_COORDS: return None
 
-    # v3.18 Fix 3: Afternoon re-alert window
-    # After 2pm local time, use a different key so ASOS-confirmed alerts can fire
-    # even if the same ticker already fired at midnight with pure forecast data
-    city_tz_check = get_city_tz(cc)
+    settle_date = ticker_date(market["ticker"])
+    is_next_day = settle_date > today
+    target_date = settle_date
+
+    city_tz_check   = get_city_tz(cc)
     now_local_check = datetime.now(city_tz_check)
-    if not (ticker_date(market["ticker"]) > datetime.now(ET_TZ).date()) and now_local_check.hour >= 14:
+
+    # Alert key — afternoon window gets separate key for re-alerts
+    if not is_next_day and now_local_check.hour >= 14:
         alert_key = f"{market['ticker']}_{today}_afternoon"
     else:
         alert_key = f"{market['ticker']}_{today}"
+
     with _lock:
         if alert_key in posted_alert_keys:
             return None
-
-    # v3.10: determine if this is a next-day market
-    settle_date  = ticker_date(market["ticker"])
-    is_next_day  = settle_date > today
-    target_date  = settle_date  # fetch forecast for the correct settlement date
 
     forecast = await get_forecast(session, semaphore, cc, target_date)
     if not forecast: return None
 
     threshold = market["threshold_f"]
     kind      = market["threshold_kind"]
+    lo        = threshold - 0.5 if kind == "B" else None
+    hi        = threshold + 0.5 if kind == "B" else None
 
-    if kind == "B":
-        lo   = threshold - 0.5
-        hi   = threshold + 0.5
-        prob = model_probability(forecast, threshold, cc, kind="B", lo=lo, hi=hi,
-                                 is_next_day=is_next_day)
-        # v3.18 Fix 4: Minimum gap rule for B-type NO bets
-        # Bucket lo must be at least 2x spread above ensemble mean
-        # Prevents borderline coin-flip bets like mean=95.1F vs bucket 95-96F
-        if prob < 0.5:  # NO bet
-            gap = lo - forecast["corrected_mean"]
-            min_gap = forecast["spread"] * 2.0
-            if gap < min_gap:
-                print(f"[v3.18] {cc} B-type NO blocked: gap={gap:.1f}F < min={min_gap:.1f}F")
+    # ── ASOS-CONFIRMED YES (v3.19) ────────────────────────────────────────────
+    # Only fires 2pm-5pm local, same-day B-type, ASOS within 1F of bucket
+    asos_yes = False
+    if (kind == "B" and not is_next_day and
+            14 <= now_local_check.hour < 17 and
+            asos_confirms_yes(cc, kind, lo, hi, threshold, forecast)):
+        # Check EV on YES side
+        prob_yes = model_probability(forecast, threshold, cc, kind="B",
+                                     lo=lo, hi=hi, is_next_day=False)
+        ev_yes = compute_ev_kelly(prob_yes, market["yes_price"], market["no_price"])
+        if (ev_yes["best_side"] == "YES" and
+                ev_yes["YES"]["taker_ev"] >= YES_EV_THRESHOLD * 100):
+            asos_yes = True
+            prob     = prob_yes
+            ev_data  = ev_yes
+            best     = "YES"
+            print(f"[v3.19] {cc} ASOS YES fired: EV={ev_yes['YES']['taker_ev']}%")
+
+    if not asos_yes:
+        # ── STANDARD NO PATH ─────────────────────────────────────────────────
+        if kind == "B":
+            prob = model_probability(forecast, threshold, cc, kind="B",
+                                     lo=lo, hi=hi, is_next_day=is_next_day)
+            # v3.19: loosened gap rule from 2x to 1x spread
+            if prob < 0.5:  # NO bet
+                gap     = lo - forecast["corrected_mean"]
+                min_gap = forecast["spread"] * 1.0
+                if gap < min_gap:
+                    print(f"[v3.19] {cc} B-type NO blocked: gap={gap:.1f}F < min={min_gap:.1f}F")
+                    return None
+        else:
+            prob = model_probability(forecast, threshold, cc, kind="T",
+                                     is_next_day=is_next_day)
+
+        # Block T-type YES when mean >= threshold
+        if kind == "T" and prob > 0.5 and forecast["corrected_mean"] >= threshold:
+            print(f"[v3.16] {cc} T-type YES blocked: mean={forecast['corrected_mean']}°F >= thresh={threshold}°F")
+            return None
+
+        # Block next-day T-type YES
+        if kind == "T" and is_next_day and prob > 0.5:
+            return None
+
+        # Block T-type NO when threshold too close to mean
+        if kind == "T" and prob < 0.5:
+            gap = threshold - forecast["corrected_mean"]
+            if gap < forecast["spread"]:
+                print(f"[v3.16] {cc} T-type NO blocked: gap={gap:.1f}F < spread={forecast['spread']}F")
                 return None
-    else:
-        lo, hi = None, None
-        prob   = model_probability(forecast, threshold, cc, kind="T",
-                                   is_next_day=is_next_day)
 
-    # v3.16 Fix 1: Block T-type <X° YES when ensemble mean already >= threshold
-    # If models say mean=92F and we're betting <89F YES, that's a guaranteed loss
-    if kind == "T" and prob > 0.5 and forecast["corrected_mean"] >= threshold:
-        print(f"[v3.16] {cc} T-type BLOCKED: mean={forecast['corrected_mean']}°F >= thresh={threshold}°F")
-        return None
+        # Block T-type YES when ASOS near threshold after noon
+        with _lock:
+            obs_now = asos_observed.get(cc)
+        if obs_now is not None and not is_next_day and kind == "T":
+            if prob > 0.5 and now_local_check.hour >= 12 and obs_now >= threshold - 3.0:
+                print(f"[v3.16] {cc} T-type YES blocked: ASOS={obs_now}°F near thresh={threshold}°F")
+                return None
 
-    # v3.16 Fix 4: Block next-day T-type YES bets entirely — no informational edge
-    if kind == "T" and is_next_day and prob > 0.5:
-        print(f"[v3.16] {cc} next-day T-type YES blocked")
-        return None
+        implied_p = market["yes_price"] / 100
+        adj       = longshot_probability_adjustment(implied_p)
+        prob      = max(0.01, min(0.99, prob + adj))
 
-    # v3.16 Fix 5: Block T-type NO bets when threshold too close to mean
-    if kind == "T" and prob < 0.5:
-        gap = threshold - forecast["corrected_mean"]
-        if gap < forecast["spread"]:
-            print(f"[v3.16] {cc} T-type NO blocked: gap={gap:.1f}F < spread={forecast['spread']}F")
+        ev_data = compute_ev_kelly(prob, market["yes_price"], market["no_price"])
+        best    = ev_data["best_side"]
+        if not best: return None
+
+        # Block all non-ASOS YES bets
+        if best == "YES":
             return None
 
-    # v3.14: hard block when ASOS near threshold after noon
-    with _lock:
-        obs_now = asos_observed.get(cc)
-    if obs_now is not None and not is_next_day and kind == "T":
-        city_tz   = get_city_tz(cc)
-        now_local = datetime.now(city_tz)
-        if prob > 0.5 and now_local.hour >= 12 and obs_now >= threshold - 3.0:
-            print(f"[v3.16] {cc} T-type BLOCKED: ASOS={obs_now}°F near thresh={threshold}°F")
+        # Block NO priced at 5 cents or less
+        if best == "NO" and market["no_price"] <= 5:
             return None
-
-    implied_p = market["yes_price"] / 100
-    adj       = longshot_probability_adjustment(implied_p)
-    prob      = max(0.01, min(0.99, prob + adj))
-
-    ev_data = compute_ev_kelly(prob, market["yes_price"], market["no_price"])
-    best    = ev_data["best_side"]
-    if not best: return None
-
-    # v3.18 Fix 1: Block ALL YES bets — data shows 0-5% win rate vs 67-85% for NO
-    # YES bets require precision (exact 1F bucket) that model spread of 2-3F cannot provide
-    # NO bets only require direction which the model does well
-    if best == "YES":
-        return None
-
-    # v3.16 Fix 6: Skip markets priced at 5 cents or less — model is likely wrong
-    if best == "NO" and market["no_price"] <= 5:
-        return None
 
     side_data = ev_data[best]
     t_ev      = side_data["taker_ev"]
     spread    = forecast["spread"]
 
-    # v3.10: next-day markets need higher EV to fire (35% fire, 25% watch)
-    fire_thresh  = 0.40 if is_next_day else FIRE_EV_THRESHOLD  # v3.16: next-day 40%
-    watch_thresh = 0.30 if is_next_day else WATCH_EV_THRESHOLD  # v3.16: next-day 30%
+    fire_thresh  = 0.40 if is_next_day else FIRE_EV_THRESHOLD
+    watch_thresh = 0.30 if is_next_day else WATCH_EV_THRESHOLD
+
+    if asos_yes:
+        fire  = t_ev >= YES_EV_THRESHOLD * 100
+        watch = fire
+    else:
+        fire  = t_ev >= fire_thresh * 100 and spread <= MAX_SPREAD_FIRE
+        watch = t_ev >= watch_thresh * 100 and spread <= MAX_SPREAD_WATCH
 
     with _lock:
         obs_high = asos_observed.get(cc)
-    tweet_hit = False  # v3.17: Twitter removed
-    afd_hit   = bool(afd_cities and cc in afd_cities)
+    afd_hit  = bool(afd_cities and cc in afd_cities)
 
-    fire  = t_ev >= fire_thresh*100  and spread <= MAX_SPREAD_FIRE
-    watch = t_ev >= watch_thresh*100 and spread <= MAX_SPREAD_WATCH
-    city  = CITY_COORDS[cc][2]
+    city    = CITY_COORDS[cc][2]
     day_tag = "tmrw" if is_next_day else "today"
-    tag   = "🔥" if fire else ("⚠️" if watch else ("🐦" if tweet_hit or afd_hit else "—"))
-    print(f"[scan] {city} [{kind}/{day_tag}]: model={side_data['prob']}% "
+    tag     = "🔥" if fire else ("⚠️" if watch else "—")
+    print(f"[scan] {city} [{kind}/{day_tag}/{best}]: model={side_data['prob']}% "
           f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
 
-    if fire or watch or ((tweet_hit or afd_hit) and t_ev > 0):
-        # v3.18 Fix 2: Only log predictions that actually fire alerts
-        # Previously logged every scanned market inflating calibration counts
+    if fire or watch or afd_hit:
         if BIAS_LOGGING:
             try:
                 _log_prediction(
-                    today, cc, CITY_COORDS[cc][2], market["ticker"], threshold,
+                    target_date,  # v3.19 fix: was 'today', now settlement date
+                    cc, CITY_COORDS[cc][2], market["ticker"], threshold,
                     forecast, prob, market["yes_price"], market["no_price"],
                     obs_high, best_side=best,
                     taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
@@ -1065,7 +1018,6 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
             "forecast":    forecast,
             "ev_data":     ev_data,
             "obs_high":    obs_high,
-            "tweet":       tweet_hit,
             "afd":         afd_hit,
             "fire":        fire,
             "taker_ev":    t_ev,
@@ -1073,6 +1025,7 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
             "kind":        kind,
             "alert_key":   alert_key,
             "is_next_day": is_next_day,
+            "asos_yes":    asos_yes,
         }
     return None
 
@@ -1088,7 +1041,7 @@ def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
         alerts.sort(key=lambda x: -x["taker_ev"])
         selected_thresholds = []
         for alert in alerts:
-            thresh = alert["threshold"]
+            thresh    = alert["threshold"]
             too_close = any(abs(thresh - s) < BUCKET_GAP_F for s in selected_thresholds)
             if not too_close:
                 selected_thresholds.append(thresh)
@@ -1110,18 +1063,13 @@ async def run_scan_async(force_codes=None):
     if force_codes:
         markets = [m for m in markets if m["city_code"] in force_codes]
 
-    today = datetime.now(ET_TZ).date()  # v3.12: use ET timezone not UTC
-
-    # v3.10: keep all open markets (same-day AND next-day)
-    # Kalshi status=open already excludes settled markets — no date filter needed
-    # markets list is used as-is
-
+    today     = datetime.now(ET_TZ).date()
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT+4)
     timeout   = aiohttp.ClientTimeout(total=30)
 
     with _lock:
-        afd_cities   = set(afd_flagged_cities)
+        afd_cities = set(afd_flagged_cities)
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         raw_results = await asyncio.gather(
@@ -1134,8 +1082,9 @@ async def run_scan_async(force_codes=None):
 
     same_day_count = sum(1 for r in filtered if not r["is_next_day"])
     next_day_count = sum(1 for r in filtered if r["is_next_day"])
+    yes_count      = sum(1 for r in filtered if r.get("asos_yes"))
     print(f"[dedup] {len(valid_results)} raw → {len(filtered)} after dedup "
-          f"({same_day_count} same-day, {next_day_count} next-day)")
+          f"({same_day_count} same-day, {next_day_count} next-day, {yes_count} ASOS YES)")
 
     alerts = 0
     for res in filtered:
@@ -1143,16 +1092,18 @@ async def run_scan_async(force_codes=None):
         forecast    = res["forecast"]
         ev_data     = res["ev_data"]
         is_next_day = res["is_next_day"]
+        asos_yes    = res.get("asos_yes", False)
         city        = CITY_COORDS.get(market["city_code"],(None,None,market["city_code"]))[2]
         best        = ev_data["best_side"]
         t_ev_res    = ev_data[best]["taker_ev"]
         fire        = res["fire"]
         emoji       = "🔥" if fire else "⚠️"
+        if asos_yes: emoji = "🌡️"
         day_label   = "📅 TOMORROW" if is_next_day else "📍 TODAY"
         units       = recommend_units(t_ev_res, forecast["confidence"],
-                                      res["tweet"], res["afd"], fire, is_next_day)
+                                      res["afd"], fire, is_next_day, asos_yes)
         embed       = build_embed(market, forecast, ev_data, res["obs_high"],
-                                  res["tweet"], res["afd"], units, is_next_day)
+                                  res["afd"], units, is_next_day, asos_yes)
         post_discord(DISCORD_WEBHOOK_URL,
                      f"{emoji} **{city} — {market['subtitle']}** {day_label}", [embed])
         with _lock:
@@ -1161,14 +1112,13 @@ async def run_scan_async(force_codes=None):
 
     msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
            f"{len(valid_results)} raw | {alerts} posted "
-           f"({same_day_count} today / {next_day_count} tmrw)")
+           f"({same_day_count} today / {next_day_count} tmrw / {yes_count} ASOS YES)")
     if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
     post_discord(DISCORD_LOG_WEBHOOK, msg)
-    print(f"[scan] Done — {alerts} posted ({same_day_count} today / {next_day_count} tmrw)")
+    print(f"[scan] Done — {alerts} posted")
 
 def run_scan(force_codes=None):
     asyncio.run(run_scan_async(force_codes))
-
 
 # ── PRICE WATCHER ─────────────────────────────────────────────────────────────
 PRICE_POLL_SECS    = 120
@@ -1245,23 +1195,18 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.18")
-    print(f"   v3.10: Same-day markets now scanned (date filter > → removed)")
-    print(f"          Next-day ASOS weight zeroed out (today's obs ≠ tomorrow's forecast)")
-    print(f"          Next-day EV thresholds raised (35% fire / 25% watch)")
-    print(f"          Discord alerts labeled 📍 TODAY vs 📅 TOMORROW")
-    print(f"   v3.12: HRRR->ncep_hrrr_conus | NBM->ncep_nbm_conus | RAP removed")
-    print(f"   v3.9: NBM probabilistic percentiles | Forecast debug logging")
-    print(f"   v3.8: City-local ASOS timezone | T/B dedup separated")
+    print("🌡️  Kalshi Weather Bot v3.19")
+    print(f"   v3.19: market_date fix (today→target_date)")
+    print(f"          B-type NO gap rule loosened (2x→1x spread)")
+    print(f"          ASOS-confirmed YES re-enabled (2pm-5pm local, B-type only)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
     if not DISCORD_WEBHOOK_URL: print("[warn] DISCORD_WEBHOOK_URL not set")
     if not ANTHROPIC_API_KEY:   print("[warn] ANTHROPIC_API_KEY not set")
 
-    threading.Thread(target=asos_poll_loop,    daemon=True).start()
-    threading.Thread(target=afd_scanner_loop,  daemon=True).start()
-
+    threading.Thread(target=asos_poll_loop,     daemon=True).start()
+    threading.Thread(target=afd_scanner_loop,   daemon=True).start()
     threading.Thread(target=price_watcher_loop, daemon=True).start()
     threading.Thread(target=signal_rescan_loop, daemon=True).start()
 
