@@ -1,22 +1,14 @@
 """
-Kalshi Weather Temperature Bot — v3.19
+Kalshi Weather Temperature Bot — v3.21
 
-Changes from v3.18:
-  v3.19 — Three fixes:
-           1. Fix market_date logging bug: was storing date.today() (the date
-              the alert fired) instead of target_date (the settlement date).
-              This caused the scorer to query the wrong date and never find
-              the predictions. Now stores the ticker's actual settlement date.
-           2. Loosen B-type NO minimum gap rule: was 2x spread (too aggressive,
-              blocked almost everything). Now 1x spread — still blocks borderline
-              coin-flips but lets real edges through.
-           3. Re-enable YES bets with ASOS confirmation only:
-              - Only fires after 2pm and before 5pm local time
-              - ASOS observed high must be within 1F below bucket lo or inside bucket
-              - Spread must be ≤2F (tighter than NO — need precision for YES)
-              - EV threshold: 20% (lower than NO since ASOS is doing the work)
-              - Same-day only — next-day YES still blocked entirely
-              - Overnight and morning YES still blocked (before 2pm)
+Changes from v3.20:
+  v3.21 — Restart-proof deduplication:
+           Previously dedup lived only in memory (posted_alert_keys set).
+           Any bot restart (deploy, crash, Railway redeploy) wiped the set
+           and caused every ticker to re-fire. Now checks PostgreSQL before
+           firing — if the ticker already exists in predictions table for
+           the settlement date, skip it. Memory dedup still works as a fast
+           first check, DB check is the reliable fallback.
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -559,6 +551,11 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs NBM_pct={len(nbm_prob)}pts"
     )
 
+    # v3.20: require at least 3 deterministic models
+    if len(available) < 3:
+        print(f"[v3.20] {city_code} skipped: only {len(available)} models available (need 3)")
+        return None
+
     all_members = list(gfs) + list(ecmwf_ens) + list(icon_ens)
     if not all_members and ecmwf is None and hrrr is None and nbm is None:
         return None
@@ -895,6 +892,33 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
         if alert_key in posted_alert_keys:
             return None
 
+    # v3.21: DB dedup — check if ticker already logged for this settlement date
+    # This survives restarts unlike the in-memory set
+    if BIAS_LOGGING:
+        try:
+            import psycopg2
+            conn = psycopg2.connect(os.environ.get("DATABASE_URL", ""))
+            cur  = conn.cursor()
+            # For afternoon re-alerts, check if afternoon entry exists
+            if "afternoon" in alert_key:
+                cur.execute(
+                    "SELECT 1 FROM predictions WHERE ticker = %s AND logged_at > %s LIMIT 1",
+                    (market["ticker"], f"{today}T14:00:00")
+                )
+            else:
+                cur.execute(
+                    "SELECT 1 FROM predictions WHERE ticker = %s AND market_date = %s LIMIT 1",
+                    (market["ticker"], str(target_date))
+                )
+            already_logged = cur.fetchone() is not None
+            conn.close()
+            if already_logged:
+                with _lock:
+                    posted_alert_keys.add(alert_key)  # sync memory with DB
+                return None
+        except Exception as e:
+            print(f"[v3.21] DB dedup check failed: {e} — using memory only")
+
     forecast = await get_forecast(session, semaphore, cc, target_date)
     if not forecast: return None
 
@@ -997,7 +1021,7 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
 
     city    = CITY_COORDS[cc][2]
     day_tag = "tmrw" if is_next_day else "today"
-    tag     = "🔥" if fire else ("⚠️" if watch else "—")
+    tag     = "🔥"  # v3.20: all alerts use fire emoji
     print(f"[scan] {city} [{kind}/{day_tag}/{best}]: model={side_data['prob']}% "
           f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
 
@@ -1097,8 +1121,7 @@ async def run_scan_async(force_codes=None):
         best        = ev_data["best_side"]
         t_ev_res    = ev_data[best]["taker_ev"]
         fire        = res["fire"]
-        emoji       = "🔥" if fire else "⚠️"
-        if asos_yes: emoji = "🌡️"
+        emoji       = "🌡️" if asos_yes else "🔥"  # v3.20: all alerts use fire emoji
         day_label   = "📅 TOMORROW" if is_next_day else "📍 TODAY"
         units       = recommend_units(t_ev_res, forecast["confidence"],
                                       res["afd"], fire, is_next_day, asos_yes)
@@ -1195,10 +1218,9 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.19")
-    print(f"   v3.19: market_date fix (today→target_date)")
-    print(f"          B-type NO gap rule loosened (2x→1x spread)")
-    print(f"          ASOS-confirmed YES re-enabled (2pm-5pm local, B-type only)")
+    print("🌡️  Kalshi Weather Bot v3.21")
+    print(f"   v3.21: Restart-proof dedup — checks PostgreSQL before firing")
+    print(f"          Prevents re-fires after Railway restarts/deploys")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
