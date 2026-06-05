@@ -1,5 +1,5 @@
 """
-One-time script to display June 3 results.
+One-time script to display June 3 results — shows all bets across multiple embeds.
 June 3 bets are stored as market_date = 2026-06-02 (old bug).
 """
 import os, psycopg2, requests
@@ -9,6 +9,14 @@ DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
 
 def get_conn():
     return psycopg2.connect(DATABASE_URL)
+
+def post_discord(embeds, content=""):
+    if not DISCORD_LOG_WEBHOOK:
+        print("[discord] No webhook set")
+        return
+    requests.post(DISCORD_LOG_WEBHOOK,
+                  json={"content": content, "embeds": embeds},
+                  timeout=10)
 
 def run():
     conn = get_conn()
@@ -51,28 +59,35 @@ def run():
     acc   = f"{wins}/{total} = {wins/total*100:.1f}%" if total else "n/a"
     print(f"\nJune 3 Final: {acc} | {pending} pending")
 
-    if DISCORD_LOG_WEBHOOK:
-        embeds = [
-            {
-                "title": "📊 June 3 Scoreboard",
-                "color": 0x57F287 if wins > losses else 0xED4245,
-                "fields": [
-                    {"name": "Wins",     "value": str(wins),    "inline": True},
-                    {"name": "Losses",   "value": str(losses),  "inline": True},
-                    {"name": "Pending",  "value": str(pending), "inline": True},
-                    {"name": "Accuracy", "value": acc,          "inline": False},
-                ]
-            },
-            {
-                "title": "📋 Bet by Bet",
-                "color": 0x5865F2,
-                "description": "\n".join(bet_lines[:25]) if bet_lines else "No results",
-            }
+    if not DISCORD_LOG_WEBHOOK:
+        return
+
+    # Summary embed
+    summary_embed = {
+        "title": "📊 June 3 Scoreboard",
+        "color": 0x57F287 if wins > losses else 0xED4245,
+        "fields": [
+            {"name": "Wins",     "value": str(wins),    "inline": True},
+            {"name": "Losses",   "value": str(losses),  "inline": True},
+            {"name": "Pending",  "value": str(pending), "inline": True},
+            {"name": "Accuracy", "value": acc,          "inline": False},
         ]
-        requests.post(DISCORD_LOG_WEBHOOK,
-                      json={"content": f"**June 3 Results — {acc}**", "embeds": embeds},
-                      timeout=10)
-        print("[discord] Posted to Discord")
+    }
+    post_discord([summary_embed], content=f"**June 3 Results — {acc}**")
+
+    # Split bet_lines into chunks of 25 and post separately
+    chunk_size = 25
+    for i in range(0, len(bet_lines), chunk_size):
+        chunk = bet_lines[i:i+chunk_size]
+        part  = i // chunk_size + 1
+        embed = {
+            "title": f"📋 Bet by Bet (part {part})",
+            "color": 0x5865F2,
+            "description": "\n".join(chunk),
+        }
+        post_discord([embed])
+
+    print("[discord] Posted to Discord")
 
 if __name__ == "__main__":
     run()
