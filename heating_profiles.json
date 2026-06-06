@@ -1,0 +1,146 @@
+{
+  "NY": {
+    "city_code": "NY", "city_name": "New York City", "icao": "KNYC",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 1.8, "avg_rise_after_3pm": 1.2, "avg_rise_after_4pm": 0.6, "pct_rising_after_2pm": 70, "pct_rising_after_3pm": 55, "pct_rising_after_4pm": 35},
+      "7": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 1.6, "avg_rise_after_3pm": 1.0, "avg_rise_after_4pm": 0.5, "pct_rising_after_2pm": 68, "pct_rising_after_3pm": 52, "pct_rising_after_4pm": 32},
+      "8": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.5, "avg_rise_after_3pm": 0.9, "avg_rise_after_4pm": 0.4, "pct_rising_after_2pm": 65, "pct_rising_after_3pm": 50, "pct_rising_after_4pm": 30}
+    }
+  },
+  "AUS": {
+    "city_code": "AUS", "city_name": "Austin", "icao": "KAUS",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 3.2, "avg_rise_after_3pm": 2.4, "avg_rise_after_4pm": 1.4, "pct_rising_after_2pm": 82, "pct_rising_after_3pm": 72, "pct_rising_after_4pm": 55},
+      "7": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 2.8, "avg_rise_after_3pm": 2.0, "avg_rise_after_4pm": 1.1, "pct_rising_after_2pm": 78, "pct_rising_after_3pm": 68, "pct_rising_after_4pm": 50},
+      "8": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.5, "avg_rise_after_3pm": 1.8, "avg_rise_after_4pm": 0.9, "pct_rising_after_2pm": 75, "pct_rising_after_3pm": 65, "pct_rising_after_4pm": 45}
+    }
+  },
+  "LAX": {
+    "city_code": "LAX", "city_name": "Los Angeles", "icao": "KLAX",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.8, "avg_rise_after_3pm": 0.3, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 40, "pct_rising_after_3pm": 20, "pct_rising_after_4pm": 10},
+      "7": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.9, "avg_rise_after_3pm": 0.4, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 42, "pct_rising_after_3pm": 22, "pct_rising_after_4pm": 12},
+      "8": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 1.0, "avg_rise_after_3pm": 0.4, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 44, "pct_rising_after_3pm": 24, "pct_rising_after_4pm": 12}
+    }
+  },
+  "CHI": {
+    "city_code": "CHI", "city_name": "Chicago", "icao": "KMDW",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.0, "avg_rise_after_3pm": 1.3, "avg_rise_after_4pm": 0.6, "pct_rising_after_2pm": 72, "pct_rising_after_3pm": 58, "pct_rising_after_4pm": 35},
+      "7": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 1.8, "avg_rise_after_3pm": 1.1, "avg_rise_after_4pm": 0.5, "pct_rising_after_2pm": 70, "pct_rising_after_3pm": 55, "pct_rising_after_4pm": 32},
+      "8": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.6, "avg_rise_after_3pm": 1.0, "avg_rise_after_4pm": 0.4, "pct_rising_after_2pm": 67, "pct_rising_after_3pm": 52, "pct_rising_after_4pm": 30}
+    }
+  },
+  "MIA": {
+    "city_code": "MIA", "city_name": "Miami", "icao": "KMIA",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 14.0, "avg_rise_after_2pm": 0.5, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 30, "pct_rising_after_3pm": 15, "pct_rising_after_4pm": 8},
+      "7": {"avg_peak_hour": 14.0, "avg_rise_after_2pm": 0.4, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 28, "pct_rising_after_3pm": 14, "pct_rising_after_4pm": 7},
+      "8": {"avg_peak_hour": 14.0, "avg_rise_after_2pm": 0.4, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 28, "pct_rising_after_3pm": 14, "pct_rising_after_4pm": 7}
+    }
+  },
+  "DAL": {
+    "city_code": "DAL", "city_name": "Dallas", "icao": "KDFW",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 3.5, "avg_rise_after_3pm": 2.6, "avg_rise_after_4pm": 1.5, "pct_rising_after_2pm": 85, "pct_rising_after_3pm": 75, "pct_rising_after_4pm": 58},
+      "7": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 3.2, "avg_rise_after_3pm": 2.3, "avg_rise_after_4pm": 1.3, "pct_rising_after_2pm": 82, "pct_rising_after_3pm": 72, "pct_rising_after_4pm": 54},
+      "8": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.8, "avg_rise_after_3pm": 2.0, "avg_rise_after_4pm": 1.1, "pct_rising_after_2pm": 78, "pct_rising_after_3pm": 68, "pct_rising_after_4pm": 50}
+    }
+  },
+  "DC": {
+    "city_code": "DC", "city_name": "Washington DC", "icao": "KDCA",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.2, "avg_rise_after_3pm": 1.5, "avg_rise_after_4pm": 0.7, "pct_rising_after_2pm": 73, "pct_rising_after_3pm": 60, "pct_rising_after_4pm": 38},
+      "7": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.0, "avg_rise_after_3pm": 1.3, "avg_rise_after_4pm": 0.6, "pct_rising_after_2pm": 70, "pct_rising_after_3pm": 57, "pct_rising_after_4pm": 35},
+      "8": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.8, "avg_rise_after_3pm": 1.1, "avg_rise_after_4pm": 0.5, "pct_rising_after_2pm": 67, "pct_rising_after_3pm": 54, "pct_rising_after_4pm": 32}
+    }
+  },
+  "SEA": {
+    "city_code": "SEA", "city_name": "Seattle", "icao": "KSEA",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.6, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 35, "pct_rising_after_3pm": 18, "pct_rising_after_4pm": 8},
+      "7": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.7, "avg_rise_after_3pm": 0.3, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 38, "pct_rising_after_3pm": 20, "pct_rising_after_4pm": 9},
+      "8": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.7, "avg_rise_after_3pm": 0.3, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 38, "pct_rising_after_3pm": 20, "pct_rising_after_4pm": 9}
+    }
+  },
+  "PHX": {
+    "city_code": "PHX", "city_name": "Phoenix", "icao": "KPHX",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 4.2, "avg_rise_after_3pm": 3.1, "avg_rise_after_4pm": 1.8, "pct_rising_after_2pm": 88, "pct_rising_after_3pm": 80, "pct_rising_after_4pm": 65},
+      "7": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 3.5, "avg_rise_after_3pm": 2.5, "avg_rise_after_4pm": 1.3, "pct_rising_after_2pm": 82, "pct_rising_after_3pm": 72, "pct_rising_after_4pm": 55},
+      "8": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 3.2, "avg_rise_after_3pm": 2.2, "avg_rise_after_4pm": 1.1, "pct_rising_after_2pm": 78, "pct_rising_after_3pm": 68, "pct_rising_after_4pm": 50}
+    }
+  },
+  "BOS": {
+    "city_code": "BOS", "city_name": "Boston", "icao": "KBOS",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.5, "avg_rise_after_3pm": 0.9, "avg_rise_after_4pm": 0.4, "pct_rising_after_2pm": 65, "pct_rising_after_3pm": 50, "pct_rising_after_4pm": 28},
+      "7": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.4, "avg_rise_after_3pm": 0.8, "avg_rise_after_4pm": 0.3, "pct_rising_after_2pm": 63, "pct_rising_after_3pm": 48, "pct_rising_after_4pm": 26},
+      "8": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.3, "avg_rise_after_3pm": 0.7, "avg_rise_after_4pm": 0.3, "pct_rising_after_2pm": 60, "pct_rising_after_3pm": 45, "pct_rising_after_4pm": 24}
+    }
+  },
+  "HOU": {
+    "city_code": "HOU", "city_name": "Houston", "icao": "KIAH",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 3.0, "avg_rise_after_3pm": 2.2, "avg_rise_after_4pm": 1.2, "pct_rising_after_2pm": 80, "pct_rising_after_3pm": 70, "pct_rising_after_4pm": 52},
+      "7": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.7, "avg_rise_after_3pm": 1.9, "avg_rise_after_4pm": 1.0, "pct_rising_after_2pm": 76, "pct_rising_after_3pm": 66, "pct_rising_after_4pm": 48},
+      "8": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.5, "avg_rise_after_3pm": 1.7, "avg_rise_after_4pm": 0.9, "pct_rising_after_2pm": 73, "pct_rising_after_3pm": 63, "pct_rising_after_4pm": 44}
+    }
+  },
+  "ATL": {
+    "city_code": "ATL", "city_name": "Atlanta", "icao": "KATL",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.5, "avg_rise_after_3pm": 1.8, "avg_rise_after_4pm": 0.9, "pct_rising_after_2pm": 75, "pct_rising_after_3pm": 63, "pct_rising_after_4pm": 42},
+      "7": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.2, "avg_rise_after_3pm": 1.5, "avg_rise_after_4pm": 0.7, "pct_rising_after_2pm": 72, "pct_rising_after_3pm": 60, "pct_rising_after_4pm": 38},
+      "8": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.0, "avg_rise_after_3pm": 1.3, "avg_rise_after_4pm": 0.6, "pct_rising_after_2pm": 68, "pct_rising_after_3pm": 56, "pct_rising_after_4pm": 34}
+    }
+  },
+  "LV": {
+    "city_code": "LV", "city_name": "Las Vegas", "icao": "KLAS",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 4.0, "avg_rise_after_3pm": 3.0, "avg_rise_after_4pm": 1.7, "pct_rising_after_2pm": 87, "pct_rising_after_3pm": 78, "pct_rising_after_4pm": 62},
+      "7": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 3.5, "avg_rise_after_3pm": 2.5, "avg_rise_after_4pm": 1.3, "pct_rising_after_2pm": 82, "pct_rising_after_3pm": 72, "pct_rising_after_4pm": 55},
+      "8": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 3.2, "avg_rise_after_3pm": 2.2, "avg_rise_after_4pm": 1.1, "pct_rising_after_2pm": 78, "pct_rising_after_3pm": 68, "pct_rising_after_4pm": 50}
+    }
+  },
+  "SFO": {
+    "city_code": "SFO", "city_name": "San Francisco", "icao": "KSFO",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.5, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 28, "pct_rising_after_3pm": 14, "pct_rising_after_4pm": 6},
+      "7": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.5, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 28, "pct_rising_after_3pm": 14, "pct_rising_after_4pm": 6},
+      "8": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.6, "avg_rise_after_3pm": 0.2, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 30, "pct_rising_after_3pm": 15, "pct_rising_after_4pm": 7}
+    }
+  },
+  "DEN": {
+    "city_code": "DEN", "city_name": "Denver", "icao": "KDEN",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.5, "avg_rise_after_3pm": 1.7, "avg_rise_after_4pm": 0.8, "pct_rising_after_2pm": 72, "pct_rising_after_3pm": 60, "pct_rising_after_4pm": 38},
+      "7": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 2.0, "avg_rise_after_3pm": 1.3, "avg_rise_after_4pm": 0.6, "pct_rising_after_2pm": 65, "pct_rising_after_3pm": 52, "pct_rising_after_4pm": 32},
+      "8": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.8, "avg_rise_after_3pm": 1.1, "avg_rise_after_4pm": 0.5, "pct_rising_after_2pm": 62, "pct_rising_after_3pm": 49, "pct_rising_after_4pm": 28}
+    }
+  },
+  "SA": {
+    "city_code": "SA", "city_name": "San Antonio", "icao": "KSAT",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 3.3, "avg_rise_after_3pm": 2.5, "avg_rise_after_4pm": 1.4, "pct_rising_after_2pm": 83, "pct_rising_after_3pm": 73, "pct_rising_after_4pm": 56},
+      "7": {"avg_peak_hour": 16.5, "avg_rise_after_2pm": 3.0, "avg_rise_after_3pm": 2.2, "avg_rise_after_4pm": 1.2, "pct_rising_after_2pm": 80, "pct_rising_after_3pm": 70, "pct_rising_after_4pm": 52},
+      "8": {"avg_peak_hour": 16.0, "avg_rise_after_2pm": 2.7, "avg_rise_after_3pm": 1.9, "avg_rise_after_4pm": 1.0, "pct_rising_after_2pm": 76, "pct_rising_after_3pm": 66, "pct_rising_after_4pm": 47}
+    }
+  },
+  "MN": {
+    "city_code": "MN", "city_name": "Minneapolis", "icao": "KMSP",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.2, "avg_rise_after_3pm": 1.5, "avg_rise_after_4pm": 0.7, "pct_rising_after_2pm": 72, "pct_rising_after_3pm": 58, "pct_rising_after_4pm": 36},
+      "7": {"avg_peak_hour": 15.5, "avg_rise_after_2pm": 2.0, "avg_rise_after_3pm": 1.3, "avg_rise_after_4pm": 0.6, "pct_rising_after_2pm": 70, "pct_rising_after_3pm": 55, "pct_rising_after_4pm": 33},
+      "8": {"avg_peak_hour": 15.0, "avg_rise_after_2pm": 1.8, "avg_rise_after_3pm": 1.1, "avg_rise_after_4pm": 0.5, "pct_rising_after_2pm": 66, "pct_rising_after_3pm": 52, "pct_rising_after_4pm": 30}
+    }
+  },
+  "SD": {
+    "city_code": "SD", "city_name": "San Diego", "icao": "KSAN",
+    "monthly_profiles": {
+      "6": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.7, "avg_rise_after_3pm": 0.3, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 35, "pct_rising_after_3pm": 18, "pct_rising_after_4pm": 8},
+      "7": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.8, "avg_rise_after_3pm": 0.3, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 37, "pct_rising_after_3pm": 19, "pct_rising_after_4pm": 9},
+      "8": {"avg_peak_hour": 14.5, "avg_rise_after_2pm": 0.8, "avg_rise_after_3pm": 0.3, "avg_rise_after_4pm": 0.1, "pct_rising_after_2pm": 37, "pct_rising_after_3pm": 19, "pct_rising_after_4pm": 9}
+    }
+  }
+}
