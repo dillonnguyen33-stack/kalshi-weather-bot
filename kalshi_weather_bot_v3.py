@@ -1,14 +1,18 @@
 """
-Kalshi Weather Temperature Bot — v3.21
+Kalshi Weather Temperature Bot — v3.22
 
-Changes from v3.20:
-  v3.21 — Restart-proof deduplication:
-           Previously dedup lived only in memory (posted_alert_keys set).
-           Any bot restart (deploy, crash, Railway redeploy) wiped the set
-           and caused every ticker to re-fire. Now checks PostgreSQL before
-           firing — if the ticker already exists in predictions table for
-           the settlement date, skip it. Memory dedup still works as a fast
-           first check, DB check is the reliable fallback.
+Changes from v3.21:
+  v3.22 — Smart ASOS YES using heating profiles:
+           Previously ASOS YES fired if ASOS was within 1F of bucket lo,
+           ignoring that hot inland cities (PHX, DAL, AUS, HOU, LV) still
+           rise 1.5-2.5F after 4pm while coastal cities (SEA, SFO, LAX, SD)
+           are done by 2-3pm.
+           Now loads heating_profiles.json and projects the peak:
+             projected_peak = asos_high + avg_rise_after_current_hour
+           Only fires YES if projected_peak lands inside the bucket.
+           This fixes the PHX/AUS/HOU losses where ASOS read 106F at 4pm
+           but the high climbed to 108F — the profile now predicts +1.8F
+           and correctly skips or targets the higher bucket.
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -62,7 +66,36 @@ ET_TZ  = ZoneInfo("America/New_York")
 PT_TZ  = ZoneInfo("America/Los_Angeles")
 CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
-NWS_UA = "KalshiWeatherBot/3.19 dillonnguyen33@gmail.com"
+NWS_UA = "KalshiWeatherBot/3.22 dillonnguyen33@gmail.com"
+
+# ── HEATING PROFILES ──────────────────────────────────────────────────────────
+def load_heating_profiles() -> dict:
+    try:
+        with open("heating_profiles.json") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[heating] Could not load heating_profiles.json: {e}")
+        return {}
+
+HEATING_PROFILES = load_heating_profiles()
+print(f"[heating] Loaded profiles for {len(HEATING_PROFILES)} cities")
+
+def get_projected_rise(city_code: str, local_hour: int) -> float:
+    """Returns expected additional temp rise from current hour to peak."""
+    month = datetime.now().month
+    profile = HEATING_PROFILES.get(city_code, {})
+    mp = profile.get("monthly_profiles", {}).get(str(month), {})
+    if not mp:
+        # fallback: assume 1F rise if no profile
+        return 1.0
+    if local_hour <= 14:
+        return mp.get("avg_rise_after_2pm", 1.0)
+    elif local_hour <= 15:
+        return mp.get("avg_rise_after_3pm", 0.5)
+    elif local_hour <= 16:
+        return mp.get("avg_rise_after_4pm", 0.3)
+    else:
+        return 0.1  # after 5pm, very little rise expected
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -680,12 +713,10 @@ def longshot_probability_adjustment(implied_p: float) -> float:
 
 # ── ASOS YES CHECK ────────────────────────────────────────────────────────────
 def asos_confirms_yes(city_code: str, kind: str, lo: float, hi: float,
-                      threshold: float, forecast: dict) -> bool:
+                      threshold: float, forecast: dict, local_hour: int) -> bool:
     """
-    v3.19: Returns True if ASOS observed high confirms a YES bet is valid.
-    Only called between 2pm-5pm local time for same-day B-type markets.
-    Requires ASOS to be within 1F below bucket lo or already inside bucket.
-    Spread must be <= MAX_SPREAD_YES (2.0F).
+    v3.22: Uses heating profiles to project where the temp will peak.
+    Only fires YES if projected peak lands inside the bucket.
     """
     if forecast["spread"] > MAX_SPREAD_YES:
         return False
@@ -693,10 +724,20 @@ def asos_confirms_yes(city_code: str, kind: str, lo: float, hi: float,
         obs_high = asos_observed.get(city_code)
     if obs_high is None:
         return False
-    # ASOS must be within 1F below lo, or inside the bucket
-    if kind == "B":
-        return obs_high >= (lo - 1.0)
-    return False  # T-type YES not re-enabled
+    if kind != "B":
+        return False
+
+    # Project peak using heating profile
+    projected_rise = get_projected_rise(city_code, local_hour)
+    projected_peak = obs_high + projected_rise
+
+    # YES wins if projected peak lands inside bucket (lo to hi)
+    if lo <= projected_peak < hi:
+        print(f"[v3.22] {city_code} ASOS YES: obs={obs_high}°F + rise={projected_rise:.1f}°F → projected={projected_peak:.1f}°F in bucket {lo}-{hi}")
+        return True
+
+    print(f"[v3.22] {city_code} ASOS YES blocked: obs={obs_high}°F + rise={projected_rise:.1f}°F → projected={projected_peak:.1f}°F NOT in bucket {lo}-{hi}")
+    return False
 
 # ── DISCORD ───────────────────────────────────────────────────────────────────
 def post_discord(webhook, content, embeds=None):
@@ -932,7 +973,7 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     asos_yes = False
     if (kind == "B" and not is_next_day and
             14 <= now_local_check.hour < 17 and
-            asos_confirms_yes(cc, kind, lo, hi, threshold, forecast)):
+            asos_confirms_yes(cc, kind, lo, hi, threshold, forecast, now_local_check.hour)):
         # Check EV on YES side
         prob_yes = model_probability(forecast, threshold, cc, kind="B",
                                      lo=lo, hi=hi, is_next_day=False)
@@ -1218,9 +1259,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.21")
-    print(f"   v3.21: Restart-proof dedup — checks PostgreSQL before firing")
-    print(f"          Prevents re-fires after Railway restarts/deploys")
+    print("🌡️  Kalshi Weather Bot v3.22")
+    print(f"   v3.22: Smart ASOS YES using heating profiles")
+    print(f"          Projects peak = ASOS + avg_rise_after_hour from heating_profiles.json")
+    print(f"          Hot cities (PHX/DAL/AUS) correctly skip or target higher buckets")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
