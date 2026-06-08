@@ -1,20 +1,17 @@
 """
-Kalshi Weather Temperature Bot — v3.24
+Kalshi Weather Temperature Bot — v3.25
 
-Changes from v3.22:
-  v3.24 — Extend ASOS YES window from 5pm to 6pm local time
-           Previously cut off at 17:00 causing YES logic to miss alerts
-           that fired at 17:02+ and fall through to wrong NO bets instead based on first week of data:
-           1. Houston ASOS station: KIAH → KHOU (Houston Hobby)
-              Kalshi settles Houston using Hobby airport, not Intercontinental.
-              KIAH read 85°F on June 6 while KHOU/official NWS read 89°F.
-              This was causing wrong ASOS readings and bad gap calculations.
-           2. Miami summer bias: 0.0°F → +2.5°F (June/July/August)
-              Miami consistently ran 3-4°F hotter than model predictions
-              all week. Models underpredict Miami due to local convective
-              heating and sea breeze effects. With +2.5°F correction the
-              gap rule would have blocked all losing Miami bets this week.
-              Bias will be monitored weekly and adjusted as data accumulates.
+Changes from v3.24:
+  v3.25 — Replace ASOS source with Wethr.net API:
+           Previously used Aviation Weather METAR which could be off by
+           1-2F due to rounding and missing OMO data. Now uses Wethr.net
+           Observations API with mode=wethr_high&logic=nws which matches
+           exactly what Kalshi uses to settle markets.
+           Also adds Push API listener for real-time new_high events —
+           when a city hits a new high, bot immediately rescans that city
+           instead of waiting up to 10 minutes for the next poll cycle.
+           WETHR_API_KEY environment variable required.
+           Falls back to Aviation Weather METAR if Wethr API unavailable.
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -51,6 +48,7 @@ ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 TOMORROW_IO_KEY     = os.environ.get("TOMORROW_IO_KEY", "")
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
+WETHR_API_KEY       = os.environ.get("WETHR_API_KEY", "")
 
 SCAN_INTERVAL_SECS  = 300
 ASOS_POLL_SECS      = 600
@@ -284,8 +282,47 @@ def compute_ev_kelly(model_prob: float, yes_price: int, no_price: int) -> dict:
         best = None
     return {"best_side": best, "YES": results["YES"], "NO": results["NO"]}
 
-# ── ASOS ──────────────────────────────────────────────────────────────────────
-def fetch_asos_high(city_code: str) -> float | None:
+# ── WETHR.NET OBSERVATIONS ────────────────────────────────────────────────────
+WETHR_OBS_BASE = "https://wethr.net/api/v2/observations.php"
+WETHR_PUSH_URL = "https://wethr.net:3443/api/v2/stream"
+
+# Map city codes to Wethr station codes
+WETHR_STATIONS = {
+    "NY":  "KNYC", "AUS": "KAUS", "LAX": "KLAX", "CHI": "KMDW",
+    "MIA": "KMIA", "DAL": "KDFW", "DC":  "KDCA", "SEA": "KSEA",
+    "PHX": "KPHX", "BOS": "KBOS", "HOU": "KHOU", "ATL": "KATL",
+    "OKC": "KOKC", "LV":  "KLAS", "SFO": "KSFO", "DEN": "KDEN",
+    "SA":  "KSAT", "MN":  "KMSP", "SD":  "KSEA", "NO":  "KMSY",
+}
+
+# Reverse map: Wethr station → city code (for Push API)
+WETHR_STATION_TO_CITY = {v: k for k, v in WETHR_STATIONS.items()}
+
+def fetch_wethr_high(city_code: str) -> float | None:
+    """Fetch today's confirmed high from Wethr.net using NWS logic (matches Kalshi settlement)."""
+    if not WETHR_API_KEY:
+        return None
+    station = WETHR_STATIONS.get(city_code)
+    if not station:
+        return None
+    try:
+        r = requests.get(WETHR_OBS_BASE, params={
+            "station_code": station,
+            "mode": "wethr_high",
+            "logic": "nws",
+        }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        high = data.get("wethr_high")
+        if high is not None:
+            return float(high)
+        return None
+    except Exception as e:
+        print(f"[wethr] {city_code}/{station}: {e}")
+        return None
+
+def fetch_asos_high_fallback(city_code: str) -> float | None:
+    """Fallback to Aviation Weather METAR if Wethr unavailable."""
     info = CITY_COORDS.get(city_code)
     if not info: return None
     icao = info[3]
@@ -300,11 +337,19 @@ def fetch_asos_high(city_code: str) -> float | None:
         if not temps: return None
         return round(max(temps) * 9 / 5 + 32, 1)
     except Exception as e:
-        print(f"[asos] {city_code}/{icao}: {e}")
+        print(f"[asos_fallback] {city_code}/{icao}: {e}")
         return None
+
+def fetch_asos_high(city_code: str) -> float | None:
+    """Fetch observed high — prefer Wethr.net, fall back to Aviation Weather."""
+    high = fetch_wethr_high(city_code)
+    if high is not None:
+        return high
+    return fetch_asos_high_fallback(city_code)
 
 def asos_poll_loop():
     print(f"[asos] Starting observation poll for {len(CITY_COORDS)} cities")
+    print(f"[asos] Using {'Wethr.net API' if WETHR_API_KEY else 'Aviation Weather fallback'}")
     while True:
         for code in CITY_COORDS:
             high = fetch_asos_high(code)
@@ -312,6 +357,63 @@ def asos_poll_loop():
                 with _lock:
                     asos_observed[code] = high
         time.sleep(ASOS_POLL_SECS)
+
+def wethr_push_loop():
+    """Listen to Wethr.net Push API for real-time new_high events.
+    When a city hits a new confirmed high, immediately rescan that city."""
+    if not WETHR_API_KEY:
+        print("[push] No WETHR_API_KEY — Push API disabled")
+        return
+
+    # Only subscribe to cities we have in Wethr
+    stations = ",".join(set(WETHR_STATIONS.values()))
+    url = f"{WETHR_PUSH_URL}?stations={stations}&api_key={WETHR_API_KEY}"
+
+    print(f"[push] Connecting to Wethr Push API for {len(set(WETHR_STATIONS.values()))} stations")
+
+    while True:
+        try:
+            r = requests.get(url, stream=True, timeout=300,
+                           headers={"Accept": "text/event-stream"})
+            r.raise_for_status()
+
+            event_type = None
+            for line in r.iter_lines():
+                if not line:
+                    event_type = None
+                    continue
+                line = line.decode("utf-8") if isinstance(line, bytes) else line
+
+                if line.startswith("event:"):
+                    event_type = line[6:].strip()
+                elif line.startswith("data:") and event_type in ("new_high", "observation"):
+                    try:
+                        data = json.loads(line[5:].strip())
+                        station = data.get("station_code", "")
+                        city_code = WETHR_STATION_TO_CITY.get(station)
+
+                        if event_type == "new_high" and city_code:
+                            new_val = data.get("value_f")
+                            if new_val:
+                                with _lock:
+                                    asos_observed[city_code] = float(new_val)
+                                print(f"[push] 🔥 NEW HIGH {city_code}/{station}: {new_val}°F — rescanning")
+                                run_scan(force_codes={city_code})
+
+                        elif event_type == "observation" and city_code:
+                            # Update current observed high from wethr_high in observation
+                            wethr_high = data.get("wethr_high", {}).get("nws", {}).get("value_f")
+                            if wethr_high:
+                                with _lock:
+                                    old = asos_observed.get(city_code, 0)
+                                    if float(wethr_high) > old:
+                                        asos_observed[city_code] = float(wethr_high)
+                    except Exception as e:
+                        print(f"[push] Parse error: {e}")
+
+        except Exception as e:
+            print(f"[push] Connection error: {e} — reconnecting in 30s")
+            time.sleep(30)
 
 # ── NWS AFD PARSER ────────────────────────────────────────────────────────────
 def fetch_afd_text(wfo: str) -> str | None:
@@ -1261,19 +1363,22 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.24")
-    print(f"   v3.24: ASOS YES window extended to 6pm local (was 5pm)")
-    print(f"                 Prevents YES logic cutoff causing wrong NO bets at 5pm+")
+    print("🌡️  Kalshi Weather Bot v3.25")
+    print(f"   v3.25: Wethr.net API for observations (matches Kalshi settlement)")
+    print(f"          Push API for real-time new_high alerts")
+    print(f"          Falls back to Aviation Weather if Wethr unavailable")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
     if not DISCORD_WEBHOOK_URL: print("[warn] DISCORD_WEBHOOK_URL not set")
     if not ANTHROPIC_API_KEY:   print("[warn] ANTHROPIC_API_KEY not set")
+    if not WETHR_API_KEY:       print("[warn] WETHR_API_KEY not set — using Aviation Weather fallback")
 
     threading.Thread(target=asos_poll_loop,     daemon=True).start()
     threading.Thread(target=afd_scanner_loop,   daemon=True).start()
     threading.Thread(target=price_watcher_loop, daemon=True).start()
     threading.Thread(target=signal_rescan_loop, daemon=True).start()
+    threading.Thread(target=wethr_push_loop,    daemon=True).start()
 
     print("[main] Waiting 100s for price watcher to populate market cache...")
     time.sleep(100)
