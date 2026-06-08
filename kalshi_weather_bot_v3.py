@@ -1,8 +1,10 @@
 """
-Kalshi Weather Temperature Bot — v3.23
+Kalshi Weather Temperature Bot — v3.24
 
 Changes from v3.22:
-  v3.23 — Two calibration fixes based on first week of data:
+  v3.24 — Extend ASOS YES window from 5pm to 6pm local time
+           Previously cut off at 17:00 causing YES logic to miss alerts
+           that fired at 17:02+ and fall through to wrong NO bets instead based on first week of data:
            1. Houston ASOS station: KIAH → KHOU (Houston Hobby)
               Kalshi settles Houston using Hobby airport, not Intercontinental.
               KIAH read 85°F on June 6 while KHOU/official NWS read 89°F.
@@ -972,7 +974,7 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     # Only fires 2pm-5pm local, same-day B-type, ASOS within 1F of bucket
     asos_yes = False
     if (kind == "B" and not is_next_day and
-            14 <= now_local_check.hour < 17 and
+            14 <= now_local_check.hour < 18 and
             asos_confirms_yes(cc, kind, lo, hi, threshold, forecast, now_local_check.hour)):
         # Check EV on YES side
         prob_yes = model_probability(forecast, threshold, cc, kind="B",
@@ -1259,9 +1261,9 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.23")
-    print(f"   v3.23: Houston ASOS: KIAH → KHOU (Hobby airport)")
-    print(f"          Miami summer bias: 0.0 → +2.5°F (Jun/Jul/Aug)")
+    print("🌡️  Kalshi Weather Bot v3.24")
+    print(f"   v3.24: ASOS YES window extended to 6pm local (was 5pm)")
+    print(f"                 Prevents YES logic cutoff causing wrong NO bets at 5pm+")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
