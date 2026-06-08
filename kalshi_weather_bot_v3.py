@@ -1,18 +1,18 @@
 """
-Kalshi Weather Temperature Bot — v3.22
+Kalshi Weather Temperature Bot — v3.23
 
-Changes from v3.21:
-  v3.22 — Smart ASOS YES using heating profiles:
-           Previously ASOS YES fired if ASOS was within 1F of bucket lo,
-           ignoring that hot inland cities (PHX, DAL, AUS, HOU, LV) still
-           rise 1.5-2.5F after 4pm while coastal cities (SEA, SFO, LAX, SD)
-           are done by 2-3pm.
-           Now loads heating_profiles.json and projects the peak:
-             projected_peak = asos_high + avg_rise_after_current_hour
-           Only fires YES if projected_peak lands inside the bucket.
-           This fixes the PHX/AUS/HOU losses where ASOS read 106F at 4pm
-           but the high climbed to 108F — the profile now predicts +1.8F
-           and correctly skips or targets the higher bucket.
+Changes from v3.22:
+  v3.23 — Two calibration fixes based on first week of data:
+           1. Houston ASOS station: KIAH → KHOU (Houston Hobby)
+              Kalshi settles Houston using Hobby airport, not Intercontinental.
+              KIAH read 85°F on June 6 while KHOU/official NWS read 89°F.
+              This was causing wrong ASOS readings and bad gap calculations.
+           2. Miami summer bias: 0.0°F → +2.5°F (June/July/August)
+              Miami consistently ran 3-4°F hotter than model predictions
+              all week. Models underpredict Miami due to local convective
+              heating and sea breeze effects. With +2.5°F correction the
+              gap rule would have blocked all losing Miami bets this week.
+              Bias will be monitored weekly and adjusted as data accumulates.
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -146,7 +146,7 @@ CITY_COORDS = {
     "SEA": (47.6062, -122.3321, "Seattle",          "KSEA", "SEW", PT_TZ),
     "PHX": (33.4484, -112.0740, "Phoenix",          "KPHX", "PSR", MT_TZ),
     "BOS": (42.3601,  -71.0589, "Boston",           "KBOS", "BOX", ET_TZ),
-    "HOU": (29.7604,  -95.3698, "Houston",          "KIAH", "HGX", CT_TZ),
+    "HOU": (29.7604,  -95.3698, "Houston",          "KHOU", "HGX", CT_TZ),
     "ATL": (33.7490,  -84.3880, "Atlanta",          "KATL", "FFC", ET_TZ),
     "OKC": (35.4676,  -97.5164, "Oklahoma City",    "KOKC", "OUN", CT_TZ),
     "LV":  (36.1699, -115.1398, "Las Vegas",        "KLAS", "VEF", PT_TZ),
@@ -182,7 +182,7 @@ CITY_BIAS_F = {
     "NY":  [ 0.8,  0.7,  0.5,  0.3,  0.2,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.7],
     "CHI": [ 1.2,  1.0,  0.8,  0.4,  0.2,  0.0, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
     "LAX": [-0.5, -0.4, -0.3, -0.2, -0.2, -0.3, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
-    "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  0.0, -0.2, -0.2,  0.0,  0.1,  0.2,  0.3],
+    "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  2.5,  2.5,  2.5,  0.0,  0.1,  0.2,  0.3],
     "PH":  [ 0.7,  0.6,  0.5,  0.3,  0.1,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.6],
     "AT":  [ 0.5,  0.4,  0.3,  0.2,  0.1,  0.0, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
     "MN":  [ 1.5,  1.3,  1.0,  0.5,  0.2,  0.0, -0.5, -0.4,  0.0,  0.6,  1.0,  1.4],
@@ -1259,10 +1259,9 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.22")
-    print(f"   v3.22: Smart ASOS YES using heating profiles")
-    print(f"          Projects peak = ASOS + avg_rise_after_hour from heating_profiles.json")
-    print(f"          Hot cities (PHX/DAL/AUS) correctly skip or target higher buckets")
+    print("🌡️  Kalshi Weather Bot v3.23")
+    print(f"   v3.23: Houston ASOS: KIAH → KHOU (Hobby airport)")
+    print(f"          Miami summer bias: 0.0 → +2.5°F (Jun/Jul/Aug)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
