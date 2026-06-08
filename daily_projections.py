@@ -241,14 +241,14 @@ async def run():
     # Build embed lines
     lines = []
     for r in valid:
-        model_str = " | ".join(r["models"]) if r["models"] else "no models"
+        model_str = " | ".join(r["models"][:4]) if r["models"] else "no models"
         lines.append(
             f"{r['conf']} **{r['city_name']}** — `{r['mean']}°F` ±{r['spread']}°F\n"
             f"  {model_str} | {r['ens_members']} ens members"
         )
 
     # Split into chunks of 8 cities per embed
-    chunk_size = 8
+    chunk_size = 12
     embeds = []
     for i in range(0, len(lines), chunk_size):
         chunk = lines[i:i + chunk_size]
