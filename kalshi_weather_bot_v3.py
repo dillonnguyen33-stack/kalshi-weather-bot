@@ -1,17 +1,24 @@
 """
-Kalshi Weather Temperature Bot — v3.25
+Kalshi Weather Temperature Bot — v3.26
 
-Changes from v3.24:
-  v3.25 — Replace ASOS source with Wethr.net API:
-           Previously used Aviation Weather METAR which could be off by
-           1-2F due to rounding and missing OMO data. Now uses Wethr.net
-           Observations API with mode=wethr_high&logic=nws which matches
-           exactly what Kalshi uses to settle markets.
-           Also adds Push API listener for real-time new_high events —
-           when a city hits a new high, bot immediately rescans that city
-           instead of waiting up to 10 minutes for the next poll cycle.
-           WETHR_API_KEY environment variable required.
-           Falls back to Aviation Weather METAR if Wethr API unavailable.
+Changes from v3.25:
+  v3.26 — Three major upgrades:
+           1. Heating profiles from PostgreSQL (real 5-year data)
+              Replaces estimated heating_profiles.json with actual
+              historical temperature curves per city per month.
+              Queried live from heating_profiles_db table.
+           2. Wethr Forecasts API replaces Open-Meteo deterministic models
+              Pulls HRRR, NBM, RAP, NAM4KM, NWS hourly, GEFS directly
+              from Wethr using run=latest for freshest model runs.
+              These are station-aligned and match Kalshi settlement.
+              Open-Meteo kept for ensemble spread (GFS/ECMWF/ICON members).
+           3. Model pacing calculation
+              For same-day markets, calculates how each Wethr model is
+              tracking against the current Wethr High observation.
+              pace = wethr_high - model_forecast_high_for_today
+              Negative pace = model running hot (overestimating)
+              Positive pace = model running cold (underestimating)
+              Pacing adjusts the ensemble mean in real-time.
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -68,25 +75,88 @@ CT_TZ  = ZoneInfo("America/Chicago")
 MT_TZ  = ZoneInfo("America/Denver")
 NWS_UA = "KalshiWeatherBot/3.22 dillonnguyen33@gmail.com"
 
-# ── HEATING PROFILES ──────────────────────────────────────────────────────────
-def load_heating_profiles() -> dict:
+# ── HEATING PROFILES (from PostgreSQL) ───────────────────────────────────────
+_heating_profiles_cache: dict = {}
+_heating_profiles_loaded = False
+
+def load_heating_profiles_from_db() -> dict:
+    """Load heating profiles from PostgreSQL historical data."""
+    global _heating_profiles_cache, _heating_profiles_loaded
+    if _heating_profiles_loaded:
+        return _heating_profiles_cache
+
+    DATABASE_URL = os.environ.get("DATABASE_URL", "")
+    if not DATABASE_URL:
+        print("[heating] No DATABASE_URL — falling back to JSON")
+        return _load_heating_profiles_json()
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        cur.execute("""
+            SELECT station_code, month,
+                   avg_peak_hour, avg_rise_2pm, avg_rise_3pm,
+                   avg_rise_4pm, avg_rise_5pm,
+                   pct_rising_2pm, pct_rising_3pm,
+                   pct_rising_4pm, pct_rising_5pm,
+                   days_analyzed
+            FROM heating_profiles_db
+            ORDER BY station_code, month
+        """)
+        rows = cur.fetchall()
+        conn.close()
+
+        profiles = {}
+        for row in rows:
+            (station, month, avg_peak, rise_2, rise_3, rise_4, rise_5,
+             pct_2, pct_3, pct_4, pct_5, days) = row
+
+            # Map station code to city code
+            city_code = WETHR_STATION_TO_CITY.get(station, station)
+            if city_code not in profiles:
+                profiles[city_code] = {"monthly_profiles": {}}
+
+            profiles[city_code]["monthly_profiles"][month] = {
+                "avg_peak_hour":        avg_peak,
+                "avg_rise_after_2pm":   rise_2,
+                "avg_rise_after_3pm":   rise_3,
+                "avg_rise_after_4pm":   rise_4,
+                "avg_rise_after_5pm":   rise_5,
+                "pct_rising_after_2pm": pct_2,
+                "pct_rising_after_3pm": pct_3,
+                "pct_rising_after_4pm": pct_4,
+                "pct_rising_after_5pm": pct_5,
+                "days_analyzed":        days,
+            }
+
+        _heating_profiles_cache  = profiles
+        _heating_profiles_loaded = True
+        print(f"[heating] Loaded real profiles for {len(profiles)} cities from PostgreSQL")
+        return profiles
+
+    except Exception as e:
+        print(f"[heating] DB load failed: {e} — falling back to JSON")
+        return _load_heating_profiles_json()
+
+def _load_heating_profiles_json() -> dict:
+    """Fallback to JSON file if DB unavailable."""
     try:
         with open("heating_profiles.json") as f:
-            return json.load(f)
+            data = json.load(f)
+            print(f"[heating] Loaded fallback profiles for {len(data)} cities from JSON")
+            return data
     except Exception as e:
         print(f"[heating] Could not load heating_profiles.json: {e}")
         return {}
 
-HEATING_PROFILES = load_heating_profiles()
-print(f"[heating] Loaded profiles for {len(HEATING_PROFILES)} cities")
-
 def get_projected_rise(city_code: str, local_hour: int) -> float:
     """Returns expected additional temp rise from current hour to peak."""
-    month = datetime.now().month
-    profile = HEATING_PROFILES.get(city_code, {})
-    mp = profile.get("monthly_profiles", {}).get(str(month), {})
+    profiles = load_heating_profiles_from_db()
+    month    = datetime.now().month
+    profile  = profiles.get(city_code, {})
+    mp       = profile.get("monthly_profiles", {}).get(month, {})
     if not mp:
-        # fallback: assume 1F rise if no profile
         return 1.0
     if local_hour <= 14:
         return mp.get("avg_rise_after_2pm", 1.0)
@@ -94,8 +164,10 @@ def get_projected_rise(city_code: str, local_hour: int) -> float:
         return mp.get("avg_rise_after_3pm", 0.5)
     elif local_hour <= 16:
         return mp.get("avg_rise_after_4pm", 0.3)
+    elif local_hour <= 17:
+        return mp.get("avg_rise_after_5pm", 0.1)
     else:
-        return 0.1  # after 5pm, very little rise expected
+        return 0.05
 
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
@@ -297,6 +369,98 @@ WETHR_STATIONS = {
 
 # Reverse map: Wethr station → city code (for Push API)
 WETHR_STATION_TO_CITY = {v: k for k, v in WETHR_STATIONS.items()}
+
+WETHR_FORECAST_BASE = "https://wethr.net/api/v2/forecasts.php"
+WETHR_NWS_BASE      = "https://wethr.net/api/v2/nws_forecasts.php"
+WETHR_MODELS        = ["HRRR", "NBM", "RAP", "NAM4KM", "GFS", "ECMWF-IFS"]
+
+def fetch_wethr_forecast_high(station: str, model: str, target_date: str) -> float | None:
+    """Fetch forecast high from Wethr using latest model run."""
+    if not WETHR_API_KEY:
+        return None
+    try:
+        r = requests.get(WETHR_FORECAST_BASE, params={
+            "location_name": station,
+            "model":         model,
+            "run":           "latest",
+        }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
+        r.raise_for_status()
+        rows = r.json()
+        if not rows:
+            return None
+        highs = []
+        for row in rows:
+            if row.get("valid_time", "")[:10] == target_date:
+                temp_f = row.get("temperature_f")
+                if temp_f is not None:
+                    highs.append(float(temp_f))
+        return max(highs) if highs else None
+    except Exception as e:
+        print(f"[wethr_fcst] {station}/{model}: {e}")
+        return None
+
+def fetch_wethr_nws_forecast(station: str, target_date: str) -> float | None:
+    """Fetch NWS hourly forecast high from Wethr."""
+    if not WETHR_API_KEY:
+        return None
+    try:
+        r = requests.get(WETHR_NWS_BASE, params={
+            "station_code": station,
+            "date":         target_date,
+            "mode":         "latest",
+        }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        high = data.get("high")
+        return float(high) if high is not None else None
+    except Exception as e:
+        print(f"[wethr_nws] {station}: {e}")
+        return None
+
+def fetch_wethr_all_models(station: str, target_date: str) -> dict:
+    """Fetch all Wethr model forecasts for a station and date."""
+    if not WETHR_API_KEY or not station:
+        return {}
+    results = {}
+    for model in WETHR_MODELS:
+        high = fetch_wethr_forecast_high(station, model, target_date)
+        if high is not None:
+            results[model] = high
+        time.sleep(0.1)
+    nws = fetch_wethr_nws_forecast(station, target_date)
+    if nws is not None:
+        results["NWS"] = nws
+    return results
+
+def calculate_model_pacing(wethr_models: dict, current_wethr_high: float | None) -> dict:
+    """Calculate how each model is pacing vs live Wethr High."""
+    if current_wethr_high is None:
+        return {}
+    return {model: round(current_wethr_high - fcast, 1)
+            for model, fcast in wethr_models.items() if fcast is not None}
+
+def apply_pacing_correction(mean: float, pacing: dict, local_hour: int) -> float:
+    """Apply model pacing to adjust ensemble mean after noon."""
+    if not pacing or local_hour < 12:
+        return mean
+    if local_hour >= 18:   pace_weight = 0.7
+    elif local_hour >= 16: pace_weight = 0.5
+    elif local_hour >= 14: pace_weight = 0.3
+    else:                  pace_weight = 0.15
+    pace_vals = list(pacing.values())
+    if not pace_vals:
+        return mean
+    avg_pace = sum(pace_vals) / len(pace_vals)
+    if len(pace_vals) >= 3:
+        std = (sum((p - avg_pace)**2 for p in pace_vals) / len(pace_vals)) ** 0.5
+        pace_vals = [p for p in pace_vals if abs(p - avg_pace) <= 2 * std]
+        avg_pace  = sum(pace_vals) / len(pace_vals) if pace_vals else avg_pace
+    correction = avg_pace * pace_weight
+    corrected  = round(mean + correction, 2)
+    if abs(correction) > 0.1:
+        print(f"[pacing] {mean}°F + {correction:+.1f}°F → {corrected}°F "
+              f"(weight={pace_weight}, pace={avg_pace:+.1f}°F)")
+    return corrected
 
 def fetch_wethr_high(city_code: str) -> float | None:
     """Fetch today's confirmed high from Wethr.net using NWS logic (matches Kalshi settlement)."""
@@ -645,70 +809,95 @@ async def fetch_tomorrow_io(session, lat, lon, ds) -> float | None:
 async def get_forecast(session, semaphore, city_code, target_date) -> dict | None:
     info = CITY_COORDS.get(city_code)
     if not info: return None
-    lat, lon = info[0], info[1]
-    ds = target_date.isoformat()
+    lat, lon    = info[0], info[1]
+    ds          = target_date.isoformat()
+    station     = WETHR_STATIONS.get(city_code, "")
+    city_tz     = get_city_tz(city_code)
+    local_hour  = datetime.now(city_tz).hour
+    is_same_day = target_date == datetime.now(ET_TZ).date()
+
+    # ── WETHR DETERMINISTIC MODELS ────────────────────────────────────────────
+    wethr_models = {}
+    if WETHR_API_KEY and station:
+        wethr_models = await asyncio.get_event_loop().run_in_executor(
+            None, fetch_wethr_all_models, station, ds)
+
+    # ── OPEN-METEO ENSEMBLE (for spread calculation) ──────────────────────────
     async with semaphore:
-        (ecmwf, aifs, hrrr, rap, gfs, nbm, nbm_prob,
-         icon, ecmwf_ens, icon_ens, tomorrow) = await asyncio.gather(
-            fetch_ecmwf(session, lat, lon, ds),
-            fetch_aifs(session, lat, lon, ds),
-            fetch_hrrr(session, lat, lon, ds),
-            fetch_rap(session, lat, lon, ds),
+        (gfs, ecmwf_ens, icon_ens, nbm_prob, tomorrow) = await asyncio.gather(
             fetch_gfs_ensemble(session, lat, lon, ds),
-            fetch_nbm(session, lat, lon, ds),
-            fetch_nbm_probabilistic(session, lat, lon, ds),
-            fetch_icon(session, lat, lon, ds),
             fetch_ecmwf_ensemble(session, lat, lon, ds),
             fetch_icon_ensemble(session, lat, lon, ds),
+            fetch_nbm_probabilistic(session, lat, lon, ds),
             fetch_tomorrow_io(session, lat, lon, ds),
             return_exceptions=True,
         )
-    if isinstance(ecmwf, Exception):     ecmwf     = None
-    if isinstance(aifs, Exception):      aifs      = None
-    if isinstance(hrrr, Exception):      hrrr      = None
-    if isinstance(rap, Exception):       rap       = None
     if isinstance(gfs, Exception):       gfs       = []
-    if isinstance(nbm, Exception):       nbm       = None
-    if isinstance(nbm_prob, Exception):  nbm_prob  = []
-    if isinstance(icon, Exception):      icon      = None
     if isinstance(ecmwf_ens, Exception): ecmwf_ens = []
     if isinstance(icon_ens, Exception):  icon_ens  = []
+    if isinstance(nbm_prob, Exception):  nbm_prob  = []
     if isinstance(tomorrow, Exception):  tomorrow  = None
 
-    det_models = {
-        "ECMWF":ecmwf,"AIFS":aifs,"HRRR":hrrr,"RAP":rap,
-        "NBM":nbm,"ICON":icon,"Tomorrow":tomorrow
-    }
-    available = [k for k,v in det_models.items() if v is not None]
-    missing   = [k for k,v in det_models.items() if v is None]
+    # Fallback to Open-Meteo deterministic if Wethr unavailable
+    wethr_hrrr  = wethr_models.get("HRRR")
+    wethr_nbm   = wethr_models.get("NBM")
+    wethr_ecmwf = wethr_models.get("ECMWF-IFS")
+    wethr_rap   = wethr_models.get("RAP")
+    wethr_nam   = wethr_models.get("NAM4KM")
+    wethr_gfs   = wethr_models.get("GFS")
+    wethr_nws   = wethr_models.get("NWS")
+
+    if not wethr_models:
+        # Fall back to Open-Meteo deterministic
+        async with semaphore:
+            (ecmwf, hrrr, nbm, icon) = await asyncio.gather(
+                fetch_ecmwf(session, lat, lon, ds),
+                fetch_hrrr(session, lat, lon, ds),
+                fetch_nbm(session, lat, lon, ds),
+                fetch_icon(session, lat, lon, ds),
+                return_exceptions=True,
+            )
+        if isinstance(ecmwf, Exception): ecmwf = None
+        if isinstance(hrrr,  Exception): hrrr  = None
+        if isinstance(nbm,   Exception): nbm   = None
+        if isinstance(icon,  Exception): icon  = None
+        wethr_ecmwf = ecmwf
+        wethr_hrrr  = hrrr
+        wethr_nbm   = nbm
+
+    # Build available model list
+    det_vals_wethr = {k: v for k, v in wethr_models.items() if v is not None}
+    if tomorrow: det_vals_wethr["Tomorrow"] = tomorrow
+
+    available = list(det_vals_wethr.keys())
     print(
-        f"[forecast] {city_code} | det={len(available)}/6 "
-        f"({', '.join(available) or 'none'}) | "
-        f"missing=({', '.join(missing) or 'none'}) | "
-        f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs NBM_pct={len(nbm_prob)}pts"
+        f"[forecast] {city_code} | wethr={len(wethr_models)} "
+        f"({', '.join(wethr_models.keys()) or 'none'}) | "
+        f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs"
     )
 
-    # v3.20: require at least 3 deterministic models
     if len(available) < 3:
-        print(f"[v3.20] {city_code} skipped: only {len(available)} models available (need 3)")
+        print(f"[v3.26] {city_code} skipped: only {len(available)} models available (need 3)")
         return None
 
+    # ── BUILD BLEND ───────────────────────────────────────────────────────────
     all_members = list(gfs) + list(ecmwf_ens) + list(icon_ens)
-    if not all_members and ecmwf is None and hrrr is None and nbm is None:
-        return None
 
     blend = list(all_members)
-    if nbm:      blend += [nbm] * 5
-    if nbm_prob: blend += nbm_prob * 3
-    if ecmwf:    blend += [ecmwf, ecmwf]
-    if aifs:     blend += [aifs, aifs]
-    if hrrr:     blend += [hrrr, hrrr]
-    if rap:      blend += [rap, rap]
-    if icon:     blend.append(icon)
-    if tomorrow: blend.append(tomorrow)
-    if not blend: return None
+    if wethr_nbm:   blend += [wethr_nbm] * 5
+    if nbm_prob:    blend += nbm_prob * 3
+    if wethr_nws:   blend += [wethr_nws] * 3   # NWS gets extra weight
+    if wethr_ecmwf: blend += [wethr_ecmwf, wethr_ecmwf]
+    if wethr_hrrr:  blend += [wethr_hrrr, wethr_hrrr]
+    if wethr_rap:   blend += [wethr_rap, wethr_rap]
+    if wethr_nam:   blend.append(wethr_nam)
+    if wethr_gfs:   blend.append(wethr_gfs)
+    if tomorrow:    blend.append(tomorrow)
+    if not blend:   return None
 
     mean = sum(blend) / len(blend)
+
+    # ── SPREAD CALCULATION ────────────────────────────────────────────────────
     if len(all_members) >= 2:
         am     = sum(all_members) / len(all_members)
         spread = math.sqrt(sum((x-am)**2 for x in all_members) / len(all_members))
@@ -717,22 +906,17 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     else:
         spread = 2.5
 
-    bias           = get_bias(city_code)
-    corrected_mean = mean + bias
-
-    det_vals = [v for v in [ecmwf, aifs, hrrr, nbm, icon, tomorrow] if v is not None]
-    if len(det_vals) >= 2:
-        det_range = max(det_vals) - min(det_vals)
+    det_list = [v for v in det_vals_wethr.values() if v is not None]
+    if len(det_list) >= 2:
+        det_range = max(det_list) - min(det_list)
         if det_range > 4.0:
             spread = max(spread, det_range / 2)
             print(f"[spread] {city_code} widened: det_range={det_range:.1f}F")
 
-    if len(det_vals) >= 4:
-        det_range = max(det_vals) - min(det_vals)
-        if det_range <= 2.0:   dynamic_floor = 1.5
-        elif det_range <= 4.0: dynamic_floor = 2.0
-        else:                  dynamic_floor = det_range / 2
-    elif len(det_vals) >= 2:
+    if len(det_list) >= 4:
+        det_range     = max(det_list) - min(det_list)
+        dynamic_floor = 1.5 if det_range <= 2.0 else (2.0 if det_range <= 4.0 else det_range/2)
+    elif len(det_list) >= 2:
         dynamic_floor = 2.5
     else:
         dynamic_floor = 3.5
@@ -740,19 +924,35 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     if len(all_members) < 10:
         spread = max(spread, dynamic_floor)
 
+    # ── PACING CORRECTION (same-day only, after noon) ─────────────────────────
+    pacing = {}
+    if is_same_day and local_hour >= 12:
+        with _lock:
+            current_obs = asos_observed.get(city_code)
+        if current_obs is not None:
+            pacing = calculate_model_pacing(wethr_models, current_obs)
+            mean   = apply_pacing_correction(mean, pacing, local_hour)
+
+    # ── BIAS + FINAL ──────────────────────────────────────────────────────────
+    bias           = get_bias(city_code)
+    corrected_mean = mean + bias
+
     conf = "high" if spread < 2.0 else ("medium" if spread < 4.0 else "low")
     return {
         "ensemble_mean":    round(mean, 1),
         "corrected_mean":   round(corrected_mean, 1),
         "bias_applied":     round(bias, 2),
         "spread":           round(spread, 2),
-        "ecmwf_high":       round(ecmwf, 1)    if ecmwf    else None,
-        "hrrr_high":        round(hrrr, 1)     if hrrr     else None,
-        "nbm_high":         round(nbm, 1)      if nbm      else None,
-        "rap_high":         round(rap, 1)      if rap      else None,
-        "icon_high":        round(icon, 1)     if icon     else None,
-        "tomorrow_high":    round(tomorrow, 1) if tomorrow else None,
-        "aifs_high":        round(aifs, 1)     if aifs     else None,
+        "ecmwf_high":       round(wethr_ecmwf, 1) if wethr_ecmwf else None,
+        "hrrr_high":        round(wethr_hrrr, 1)  if wethr_hrrr  else None,
+        "nbm_high":         round(wethr_nbm, 1)   if wethr_nbm   else None,
+        "rap_high":         round(wethr_rap, 1)   if wethr_rap   else None,
+        "icon_high":        None,
+        "tomorrow_high":    round(tomorrow, 1)    if tomorrow    else None,
+        "aifs_high":        None,
+        "nws_high":         round(wethr_nws, 1)   if wethr_nws   else None,
+        "nam4km_high":      round(wethr_nam, 1)   if wethr_nam   else None,
+        "pacing":           pacing,
         "gfs_members":      len(gfs),
         "ecmwf_members":    len(ecmwf_ens),
         "icon_ens_members": len(icon_ens),
@@ -907,8 +1107,10 @@ def build_embed(market, forecast, ev_data, obs_high, afd_hit,
         fields.append({"name":"Signal","value":"🌡️ ASOS-confirmed YES","inline":True})
 
     sources = []
-    for key, label in [("ecmwf_high","ECMWF"),("aifs_high","AIFS"),("hrrr_high","HRRR"),
-                        ("nbm_high","NBM"),("icon_high","ICON"),("tomorrow_high","Tomorrow")]:
+    for key, label in [("ecmwf_high","ECMWF"),("hrrr_high","HRRR"),
+                        ("nbm_high","NBM"),("rap_high","RAP"),
+                        ("nam4km_high","NAM4KM"),("nws_high","NWS"),
+                        ("tomorrow_high","Tomorrow")]:
         if forecast.get(key):
             sources.append(f"{label} {forecast[key]}°F")
     if afd_hit: sources.append("AFD signal")
@@ -1363,10 +1565,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.25")
-    print(f"   v3.25: Wethr.net API for observations (matches Kalshi settlement)")
-    print(f"          Push API for real-time new_high alerts")
-    print(f"          Falls back to Aviation Weather if Wethr unavailable")
+    print("🌡️  Kalshi Weather Bot v3.26")
+    print(f"   v3.26: Wethr Forecasts API (HRRR, NBM, RAP, NAM4KM, NWS, GFS, ECMWF-IFS)")
+    print(f"          Model pacing correction (same-day, after noon)")
+    print(f"          Heating profiles from PostgreSQL (real 5-year data)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
