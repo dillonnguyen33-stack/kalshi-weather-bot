@@ -1219,15 +1219,19 @@ def get_active_kalshi_markets() -> list[dict]:
             r = requests.get(f"{KALSHI_BASE}/markets",
                 params={"status":"open","series_ticker":series,"limit":25}, timeout=10)
             if r.status_code == 429:
-                print(f"[kalshi] Rate limited, waiting 30s...")
-                time.sleep(30)
+                print(f"[kalshi] Rate limited, waiting 60s...")
+                time.sleep(60)
                 r = requests.get(f"{KALSHI_BASE}/markets",
                     params={"status":"open","series_ticker":series,"limit":25}, timeout=10)
+                if r.status_code == 429:
+                    print(f"[kalshi] Still rate limited, waiting 120s...")
+                    time.sleep(120)
+                    continue
             r.raise_for_status()
             markets_raw.extend(r.json().get("markets", []))
         except Exception as e:
             print(f"[kalshi] {series}: {e}")
-        time.sleep(0.5)
+        time.sleep(1.0)  # increased from 0.5 to 1.0 to avoid rate limits
     markets = [m for m in (parse_market(r) for r in markets_raw) if m]
     print(f"[kalshi] {len(markets)} active temperature markets")
     return markets
@@ -1532,9 +1536,11 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             r = requests.get(f"{KALSHI_BASE}/markets",
                 params={"status":"open","series_ticker":series,"limit":25}, timeout=8)
             if r.status_code == 429:
-                time.sleep(30)
+                time.sleep(60)
                 r = requests.get(f"{KALSHI_BASE}/markets",
                     params={"status":"open","series_ticker":series,"limit":25}, timeout=8)
+                if r.status_code == 429:
+                    continue
             r.raise_for_status()
             data = r.json()
         except Exception as e:
@@ -1548,7 +1554,7 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             if ticker:
                 prices[ticker] = (yes_price, no_price, city_code)
                 markets_raw.append(m)
-        time.sleep(0.5)
+        time.sleep(1.0)  # increased to avoid rate limits
     with _lock:
         _market_cache    = markets_raw
         _market_cache_ts = time.time()
