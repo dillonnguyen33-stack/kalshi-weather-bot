@@ -11,6 +11,9 @@ Three jobs:
   2. score_settlements()  — run by cron nightly, fetches Kalshi results
   3. calibration_report() — prints accuracy + CLV table
 
+v3.27: Added bet_category (overnight/morning/pacing) and actual_high_f storage
+       so the scoreboard can break down results by bet type and show final temps.
+
 Usage:
   python3 bias_logger.py score           # score yesterday's markets
   python3 bias_logger.py score 2026-05-25  # score a specific date
@@ -58,6 +61,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     nbm_high        REAL,
     hrrr_high       REAL,
     icon_high       REAL,
+    bet_category    TEXT DEFAULT 'morning',
     settled         INTEGER DEFAULT 0,
     actual_high_f   REAL,
     yes_result      INTEGER,
@@ -70,11 +74,22 @@ CREATE INDEX IF NOT EXISTS idx_city        ON predictions(city_code);
 CREATE INDEX IF NOT EXISTS idx_settled     ON predictions(settled);
 """
 
+# Columns added after initial deploy — added defensively via ALTER
+MIGRATIONS = [
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS bet_category TEXT DEFAULT 'morning';",
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS actual_high_f REAL;",
+]
+
 def ensure_schema():
     conn = get_conn()
     try:
         cur = conn.cursor()
         cur.execute(SCHEMA)
+        for migration in MIGRATIONS:
+            try:
+                cur.execute(migration)
+            except Exception as e:
+                print(f"[schema] migration skipped: {e}")
         conn.commit()
     finally:
         conn.close()
@@ -84,6 +99,7 @@ def log_prediction(
     market_date, city_code, city_name, ticker, threshold_f,
     forecast, model_prob, yes_price, no_price, asos_obs_high,
     best_side=None, taker_ev=None, threshold_kind="T",
+    bet_category="morning",
 ):
     ensure_schema()
     conn = get_conn()
@@ -94,8 +110,9 @@ def log_prediction(
                 logged_at, market_date, city_code, city_name, ticker,
                 threshold_f, threshold_kind, model_prob, yes_price, no_price,
                 best_side, taker_ev, ensemble_mean, spread, confidence,
-                bias_applied, asos_obs_high, ecmwf_high, nbm_high, hrrr_high, icon_high
-            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                bias_applied, asos_obs_high, ecmwf_high, nbm_high, hrrr_high,
+                icon_high, bet_category
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (ticker) DO NOTHING
         """, (
             datetime.now(ET_TZ).isoformat(),
@@ -107,6 +124,7 @@ def log_prediction(
             asos_obs_high,
             forecast.get("ecmwf_high"),   forecast.get("nbm_high"),
             forecast.get("hrrr_high"),    forecast.get("icon_high"),
+            bet_category,
         ))
         conn.commit()
     except Exception as e:
@@ -121,16 +139,21 @@ def fetch_kalshi_result(ticker):
         r.raise_for_status()
         m = r.json().get("market", {})
 
-        # Debug: print all price/result fields so we can verify what Kalshi returns
-        price_fields = {k: v for k, v in m.items() if "price" in k.lower() or "result" in k.lower()}
-        print(f"[debug] {ticker} fields: {price_fields}")
-
         if m.get("status") not in ("settled", "finalized"):
             return None
         result = m.get("result", "")
         yes_result = 1 if result == "yes" else (0 if result == "no" else None)
         if yes_result is None:
             return None
+
+        # Actual high temp from expiration_value
+        actual_high = None
+        exp_val = m.get("expiration_value")
+        if exp_val not in (None, ""):
+            try:
+                actual_high = float(exp_val)
+            except (ValueError, TypeError):
+                actual_high = None
 
         # Try close_price first, then yes_bid, then last_price as fallback
         closing = (
@@ -140,7 +163,11 @@ def fetch_kalshi_result(ticker):
         )
         closing_cents = round(float(closing) * 100) if closing else None
 
-        return {"yes_result": yes_result, "closing_yes_price": closing_cents}
+        return {
+            "yes_result":        yes_result,
+            "closing_yes_price": closing_cents,
+            "actual_high_f":     actual_high,
+        }
     except Exception as e:
         print(f"[bias_logger] fetch result {ticker}: {e}")
         return None
@@ -178,6 +205,7 @@ def score_settlements(target_date=None):
 
         yes_result    = result["yes_result"]
         closing_price = result["closing_yes_price"]
+        actual_high   = result["actual_high_f"]
 
         if best_side == "YES":
             model_correct = 1 if yes_result == 1 else 0
@@ -202,16 +230,17 @@ def score_settlements(target_date=None):
             cur.execute("""
                 UPDATE predictions
                 SET settled=1, yes_result=%s, model_correct=%s,
-                    closing_yes_price=%s, clv=%s
+                    closing_yes_price=%s, clv=%s, actual_high_f=%s
                 WHERE id=%s
-            """, (yes_result, model_correct, closing_price, clv, rid))
+            """, (yes_result, model_correct, closing_price, clv, actual_high, rid))
             conn.commit()
         finally:
             conn.close()
 
         status = "✓" if model_correct else "✗"
-        clv_str = f"CLV {clv:+.0f}¢" if clv is not None else "no CLV (closing price unavailable)"
-        print(f"  {status} {ticker}: {'YES' if yes_result else 'NO'} won | {clv_str}")
+        clv_str = f"CLV {clv:+.0f}¢" if clv is not None else "no CLV"
+        temp_str = f"{actual_high:.0f}°F" if actual_high is not None else "?°F"
+        print(f"  {status} {ticker}: {'YES' if yes_result else 'NO'} won @ {temp_str} | {clv_str}")
         scored += 1
 
     print(f"[scorer] Scored {scored}/{len(rows)} predictions")
@@ -295,13 +324,29 @@ def calibration_report(city_filter=None, days=90):
         flag = "  ← recalibrate" if gap < -0.08 else ""
         print(f"{code:<20} {n:>4} {acc:>5.1f}% {avg_ev:>7.1f}% {clv_s:>8}{flag}")
 
-    print(f"\n{'─'*60}")
-    print("Recent predictions (last 10):")
-    for r in list(rows)[-10:]:
-        status = "✓" if r[5] else "✗"
-        clv_s  = f"CLV {r[6]:+.0f}¢" if r[6] is not None else ""
-        print(f"  {status} {r[9]} {r[0]:<6} model={r[2]*100:.0f}% "
-              f"side={r[3] or '?'} ev={r[4] or 0:.1f}%  {clv_s}")
+    # ── BY CATEGORY ───────────────────────────────────────────────────────────
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT bet_category, COUNT(*),
+                   SUM(CASE WHEN model_correct=1 THEN 1 ELSE 0 END)
+            FROM predictions
+            WHERE settled=1 AND market_date >= %s
+            GROUP BY bet_category
+        """, (cutoff,))
+        cat_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if cat_rows:
+        print(f"\n{'─'*60}")
+        print(f"{'Category':<15} {'N':>4} {'Acc%':>6}")
+        print(f"{'─'*60}")
+        for cat, n, c in cat_rows:
+            acc = (c or 0) / n * 100 if n else 0
+            print(f"{cat or 'none':<15} {n:>4} {acc:>5.1f}%")
+
     print(f"{'='*60}\n")
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
