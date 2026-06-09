@@ -460,19 +460,39 @@ def fetch_wethr_nws_forecast(station: str, target_date: str) -> float | None:
         print(f"[wethr_nws] {station}: {e}")
         return None
 
-def fetch_wethr_all_models(station: str, target_date: str) -> dict:
-    """Fetch all Wethr model forecasts for a station and date."""
+def fetch_wethr_all_models(station: str, target_date: str, cache_only: bool = False) -> dict:
+    """Fetch all Wethr model forecasts for a station and date.
+    If cache_only=True, only returns cached values (no API calls)."""
     if not WETHR_API_KEY or not station:
         return {}
     results = {}
+    now = time.time()
     for model in WETHR_MODELS:
+        cache_key = f"{station}_{model}_{target_date}"
+        if cache_only:
+            # Only read from cache, never call API
+            if cache_key in _wethr_fcst_cache and \
+               now - _wethr_fcst_ts.get(cache_key, 0) < WETHR_FCST_TTL:
+                val = _wethr_fcst_cache[cache_key]
+                if val is not None:
+                    results[model] = val
+            continue
         high = fetch_wethr_forecast_high(station, model, target_date)
         if high is not None:
             results[model] = high
         time.sleep(1.5)
-    nws = fetch_wethr_nws_forecast(station, target_date)
-    if nws is not None:
-        results["NWS"] = nws
+
+    # NWS forecast
+    nws_key = f"{station}_{target_date}"
+    if cache_only:
+        if nws_key in _nws_cache and now - _nws_cache_ts.get(nws_key, 0) < NWS_CACHE_TTL:
+            val = _nws_cache[nws_key]
+            if val is not None:
+                results["NWS"] = val
+    else:
+        nws = fetch_wethr_nws_forecast(station, target_date)
+        if nws is not None:
+            results["NWS"] = nws
     return results
 
 def calculate_model_pacing(wethr_models: dict, current_wethr_high: float | None) -> dict:
@@ -858,11 +878,10 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     local_hour  = datetime.now(city_tz).hour
     is_same_day = target_date == datetime.now(ET_TZ).date()
 
-    # ── WETHR DETERMINISTIC MODELS ────────────────────────────────────────────
+    # ── WETHR DETERMINISTIC MODELS (cache-only — prefetched in run_scan_async) ─
     wethr_models = {}
     if WETHR_API_KEY and station:
-        wethr_models = await asyncio.get_event_loop().run_in_executor(
-            None, fetch_wethr_all_models, station, ds)
+        wethr_models = fetch_wethr_all_models(station, ds, cache_only=True)
 
     # ── OPEN-METEO ENSEMBLE (for spread calculation) ──────────────────────────
     async with semaphore:
@@ -1487,6 +1506,42 @@ async def run_scan_async(force_codes=None):
 
     with _lock:
         afd_cities = set(afd_flagged_cities)
+
+    # ── PRE-FETCH WETHR FORECASTS (sequential, into cache) ────────────────────
+    # This prevents 40 concurrent scan tasks from each hammering the Wethr API.
+    # By loading everything into the cache first (sequentially, rate-limited),
+    # the concurrent scan tasks below just read from cache = zero Wethr calls.
+    if WETHR_API_KEY:
+        cities_to_fetch = set()
+        for m in markets:
+            cc = m["city_code"]
+            if cc in WETHR_STATIONS:
+                cities_to_fetch.add(cc)
+
+        # Determine which dates we need (today + any next-day markets)
+        dates_needed = set()
+        for m in markets:
+            dates_needed.add(ticker_date(m["ticker"]).isoformat())
+
+        prefetch_count = 0
+        for cc in cities_to_fetch:
+            station = WETHR_STATIONS.get(cc)
+            if not station:
+                continue
+            for ds in dates_needed:
+                # Check if already cached and fresh
+                sample_key = f"{station}_HRRR_{ds}"
+                now = time.time()
+                if sample_key in _wethr_fcst_cache and \
+                   now - _wethr_fcst_ts.get(sample_key, 0) < WETHR_FCST_TTL:
+                    continue  # already cached, skip
+                # Fetch all models for this city/date into cache (blocking)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, fetch_wethr_all_models, station, ds)
+                prefetch_count += 1
+
+        if prefetch_count > 0:
+            print(f"[prefetch] Loaded Wethr forecasts for {prefetch_count} city/date combos into cache")
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         raw_results = await asyncio.gather(
