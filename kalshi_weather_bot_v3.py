@@ -1142,22 +1142,32 @@ def post_discord(webhook, content, embeds=None):
     except Exception as e:
         print(f"[discord] {e}")
 
-def recommend_units(ev_pct, confidence, afd_hit, is_fire, is_next_day, is_yes=False) -> float:
+def recommend_units(ev_pct, confidence, afd_hit, is_fire, is_next_day,
+                    is_yes=False, pace_confirmed=False) -> float:
     if is_yes:
-        return 1.0 if ev_pct >= 30 else 0.5
+        base = 1.0 if ev_pct >= 30 else 0.5
+        return max(base, 1.0) if pace_confirmed else base
     if is_next_day:
-        if ev_pct >= 35:   return 1.0 if confidence == "high" else 0.5
-        elif ev_pct >= 25: return 0.5 if confidence == "high" else 0.0
-        return 0.0
+        if ev_pct >= 35:   base = 1.0 if confidence == "high" else 0.5
+        elif ev_pct >= 25: base = 0.5 if confidence == "high" else 0.0
+        else:              base = 0.0
+        return base  # next-day can't be pace-confirmed (no live obs)
     if ev_pct >= 25:
-        if confidence == "high":     return 2.0
-        elif confidence == "medium": return 1.0
-        else:                        return 0.5
+        if confidence == "high":     base = 2.0
+        elif confidence == "medium": base = 1.0
+        else:                        base = 0.5
     elif ev_pct >= 15:
-        if confidence == "high":     return 1.0
-        elif confidence == "medium": return 0.5
-        else:                        return 0.0
-    return 0.0
+        if confidence == "high":     base = 1.0
+        elif confidence == "medium": base = 0.5
+        else:                        base = 0.0
+    else:
+        base = 0.0
+    # Pace-confirmed bets are high-confidence by observation — floor at 1.5u
+    # because the temperature physically can't reach the bucket, regardless
+    # of what the EV says. Confidence, not just EV, should drive sizing here.
+    if pace_confirmed:
+        return max(base, 1.5)
+    return base
 
 def format_units(units: float) -> str:
     if units == 0: return "0u — flag only"
@@ -1651,7 +1661,8 @@ async def run_scan_async(force_codes=None):
 
         day_label = "📅 TOMORROW" if is_next_day else "📍 TODAY"
         units     = recommend_units(t_ev_res, forecast["confidence"],
-                                    res["afd"], fire, is_next_day, asos_yes)
+                                    res["afd"], fire, is_next_day, asos_yes,
+                                    pace_confirmed)
         embed     = build_embed(market, forecast, ev_data, res["obs_high"],
                                 res["afd"], units, is_next_day, asos_yes,
                                 category, pace_confirmed)
