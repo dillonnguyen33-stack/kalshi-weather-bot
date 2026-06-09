@@ -385,7 +385,7 @@ NWS_CACHE_TTL = 7200  # 2 hours
 
 _wethr_fcst_cache: dict = {}
 _wethr_fcst_ts: dict   = {}
-WETHR_FCST_TTL = 3600  # 1 hour cache for forecast models
+WETHR_FCST_TTL = 5400  # 90 min cache — models only update every 1-6 hours
 
 def fetch_wethr_forecast_high(station: str, model: str, target_date: str) -> float | None:
     """Fetch forecast high from Wethr using latest model run — cached."""
@@ -401,6 +401,13 @@ def fetch_wethr_forecast_high(station: str, model: str, target_date: str) -> flo
             "model":         model,
             "run":           "latest",
         }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
+        if r.status_code == 429:
+            time.sleep(10)
+            r = requests.get(WETHR_FORECAST_BASE, params={
+                "location_name": station,
+                "model":         model,
+                "run":           "latest",
+            }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
         r.raise_for_status()
         rows = r.json()
         if not rows:
@@ -435,6 +442,13 @@ def fetch_wethr_nws_forecast(station: str, target_date: str) -> float | None:
             "date":         target_date,
             "mode":         "latest",
         }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
+        if r.status_code == 429:
+            time.sleep(10)
+            r = requests.get(WETHR_NWS_BASE, params={
+                "station_code": station,
+                "date":         target_date,
+                "mode":         "latest",
+            }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
         r.raise_for_status()
         data = r.json()
         high = data.get("high")
@@ -455,7 +469,7 @@ def fetch_wethr_all_models(station: str, target_date: str) -> dict:
         high = fetch_wethr_forecast_high(station, model, target_date)
         if high is not None:
             results[model] = high
-        time.sleep(0.5)  # rate limit — 60 req/min = 1 req/sec max
+        time.sleep(1.5)
     nws = fetch_wethr_nws_forecast(station, target_date)
     if nws is not None:
         results["NWS"] = nws
@@ -904,8 +918,8 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         f"GFS={len(gfs)}mbrs ECMWF_ens={len(ecmwf_ens)}mbrs"
     )
 
-    if len(available) < 3:
-        print(f"[v3.26] {city_code} skipped: only {len(available)} models available (need 3)")
+    if len(available) < 2:
+        print(f"[v3.26] {city_code} skipped: only {len(available)} models available (need 2)")
         return None
 
     # ── BUILD BLEND ───────────────────────────────────────────────────────────
