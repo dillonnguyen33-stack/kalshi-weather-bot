@@ -223,12 +223,12 @@ def build_projection(city_code, wethr_models, ens, target_date):
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def run():
-    tomorrow = date.today() + timedelta(days=1)
-    ds       = tomorrow.isoformat()
-    now_et   = datetime.now(ET_TZ)
-    ts       = now_et.strftime("%I:%M %p ET")
+    target_day = date.today()
+    ds         = target_day.isoformat()
+    now_et     = datetime.now(ET_TZ)
+    ts         = now_et.strftime("%I:%M %p ET")
 
-    print(f"Running projections for {tomorrow} at {ts}")
+    print(f"Running projections for {target_day} at {ts}")
 
     # 1) Fetch Wethr models sequentially (blocking, rate-limited)
     wethr_by_city = {}
@@ -285,7 +285,7 @@ async def run():
         part  = i // chunk_size + 1
         total = math.ceil(len(lines) / chunk_size)
         embeds.append({
-            "title": f"🌡️ Tomorrow's Projections — {tomorrow} (part {part}/{total})",
+            "title": f"🌡️ Today's Projections — {target_day} (part {part}/{total})",
             "color": 0x5865F2,
             "description": "\n".join(chunk),
             "footer": {"text": f"Generated {ts} | 🟢 ±<2°F | 🟡 ±2-4°F | 🔴 ±4°F+ | Wethr models"}
