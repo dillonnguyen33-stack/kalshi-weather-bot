@@ -1,24 +1,22 @@
 """
-Kalshi Weather Temperature Bot — v3.26
+Kalshi Weather Temperature Bot — v3.27
 
-Changes from v3.25:
-  v3.26 — Three major upgrades:
-           1. Heating profiles from PostgreSQL (real 5-year data)
-              Replaces estimated heating_profiles.json with actual
-              historical temperature curves per city per month.
-              Queried live from heating_profiles_db table.
-           2. Wethr Forecasts API replaces Open-Meteo deterministic models
-              Pulls HRRR, NBM, RAP, NAM4KM, NWS hourly, GEFS directly
-              from Wethr using run=latest for freshest model runs.
-              These are station-aligned and match Kalshi settlement.
-              Open-Meteo kept for ensemble spread (GFS/ECMWF/ICON members).
-           3. Model pacing calculation
-              For same-day markets, calculates how each Wethr model is
-              tracking against the current Wethr High observation.
-              pace = wethr_high - model_forecast_high_for_today
-              Negative pace = model running hot (overestimating)
-              Positive pace = model running cold (underestimating)
-              Pacing adjusts the ensemble mean in real-time.
+Changes from v3.26:
+  v3.27 — Bet categorization + pace-confirmed bets:
+           1. Every bet tagged by city-local time of firing:
+              overnight (8pm-6am), morning (6am-12pm), pacing (12pm-8pm)
+           2. Color-coded Discord alerts:
+              overnight=indigo 🌙, morning=green 🌅, pacing=orange 📈
+           3. Pace-confirmed NO bets — a new high-confidence subtype.
+              For same-day afternoon B-type NO bets, projects the peak
+              from current obs + remaining heating-profile rise. If the
+              projected peak lands >=1.5F below the bucket, the bet is
+              flagged PACE-CONFIRMED (the observed trajectory confirms it,
+              not just the morning forecast).
+           4. Detailed scoreboard (in bias_logger/morning_report) showing
+              each bet, final settled temp, and bet category.
+           Requires bias_logger.py to accept bet_category param (gracefully
+           falls back if not yet updated).
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -278,6 +276,38 @@ def get_city_tz(city_code: str) -> ZoneInfo:
     if info and len(info) >= 6:
         return info[5]
     return ET_TZ
+
+def get_bet_category(city_code: str, is_next_day: bool, pace_confirmed: bool = False) -> str:
+    """
+    Categorize a bet by city local time of day.
+      overnight = 8pm-6am
+      morning   = 6am-12pm
+      pacing    = 12pm-8pm
+    Next-day bets are always tagged by the time they fire.
+    pace_confirmed bets get the 'pacing' tag regardless.
+    """
+    if pace_confirmed:
+        return "pacing"
+    hour = datetime.now(get_city_tz(city_code)).hour
+    if 6 <= hour < 12:
+        return "morning"
+    elif 12 <= hour < 20:
+        return "pacing"
+    else:
+        return "overnight"
+
+# Discord embed colors by category
+CATEGORY_COLORS = {
+    "overnight": 0x5865F2,  # indigo
+    "morning":   0x1a6b3a,  # green
+    "pacing":    0xe67e22,  # orange
+}
+CATEGORY_EMOJI = {
+    "overnight": "🌙",
+    "morning":   "🌅",
+    "pacing":    "📈",
+}
+
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
 asos_observed: dict[str, float]  = {}
@@ -1134,17 +1164,24 @@ def format_units(units: float) -> str:
     return f"{int(units)}u" if units == int(units) else f"{units}u"
 
 def build_embed(market, forecast, ev_data, obs_high, afd_hit,
-                units=0, is_next_day=False, asos_yes=False) -> dict:
+                units=0, is_next_day=False, asos_yes=False,
+                category="morning", pace_confirmed=False) -> dict:
     city_code = market["city_code"]
     best      = ev_data["best_side"]
     side_data = ev_data[best]
     conf      = forecast["confidence"]
     t_ev      = side_data["taker_ev"]
     m_ev      = side_data["maker_ev"]
-    color     = 0x1a6b3a if t_ev >= FIRE_EV_THRESHOLD*100 else 0x854f0b
+    # Color by category
+    color = CATEGORY_COLORS.get(category, 0x854f0b)
     if asos_yes: color = 0x0099ff  # blue for ASOS-confirmed YES
 
+    cat_label = f"{CATEGORY_EMOJI.get(category,'')} {category.upper()}"
+    if pace_confirmed:
+        cat_label += " ✓PACE-CONFIRMED"
+
     fields = [
+        {"name":"Type",  "value":cat_label, "inline":True},
         {"name":"Side",  "value":f"{'🌡️ ASOS ' if asos_yes else ''}{best}", "inline":True},
         {"name":"EV%",   "value":f"+{t_ev}%",         "inline":True},
         {"name":"Units", "value":format_units(units),  "inline":True},
@@ -1431,11 +1468,28 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
         obs_high = asos_observed.get(cc)
     afd_hit  = bool(afd_cities and cc in afd_cities)
 
+    # ── PACE-CONFIRMED detection (v3.27) ──────────────────────────────────────
+    # A bet is "pace-confirmed" when it's a same-day afternoon NO bet and the
+    # observed trajectory makes the outcome high-confidence. We project the peak
+    # from current obs + remaining rise and check it lands well below the bucket.
+    pace_confirmed = False
+    if (not asos_yes and best == "NO" and kind == "B" and not is_next_day
+            and 12 <= now_local_check.hour < 20 and obs_high is not None):
+        projected_rise = get_projected_rise(cc, now_local_check.hour)
+        projected_peak = obs_high + projected_rise
+        # Confirmed if projected peak is comfortably below the bucket (>=1.5F margin)
+        margin = lo - projected_peak
+        if margin >= 1.5:
+            pace_confirmed = True
+            print(f"[v3.27] {cc} PACE-CONFIRMED NO: obs={obs_high}°F + rise={projected_rise:.1f}°F "
+                  f"→ proj={projected_peak:.1f}°F, bucket_lo={lo}°F, margin={margin:.1f}°F")
+
+    category = get_bet_category(cc, is_next_day, pace_confirmed)
+
     city    = CITY_COORDS[cc][2]
     day_tag = "tmrw" if is_next_day else "today"
-    tag     = "🔥"  # v3.20: all alerts use fire emoji
-    print(f"[scan] {city} [{kind}/{day_tag}/{best}]: model={side_data['prob']}% "
-          f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F {tag}")
+    print(f"[scan] {city} [{kind}/{day_tag}/{best}/{category}]: model={side_data['prob']}% "
+          f"implied={side_data['implied']}% EV={t_ev}% spread=±{spread}°F 🔥")
 
     if fire or watch or afd_hit:
         if BIAS_LOGGING:
@@ -1446,22 +1500,36 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
                     forecast, prob, market["yes_price"], market["no_price"],
                     obs_high, best_side=best,
                     taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
+                    bet_category=category,
                 )
+            except TypeError:
+                # bias_logger may not yet support bet_category param
+                try:
+                    _log_prediction(
+                        target_date, cc, CITY_COORDS[cc][2], market["ticker"], threshold,
+                        forecast, prob, market["yes_price"], market["no_price"],
+                        obs_high, best_side=best,
+                        taker_ev=ev_data[best]["taker_ev"], threshold_kind=kind,
+                    )
+                except Exception as _e:
+                    print(f"[bias_logger] {_e}")
             except Exception as _e:
                 print(f"[bias_logger] {_e}")
         return {
-            "market":      market,
-            "forecast":    forecast,
-            "ev_data":     ev_data,
-            "obs_high":    obs_high,
-            "afd":         afd_hit,
-            "fire":        fire,
-            "taker_ev":    t_ev,
-            "threshold":   threshold,
-            "kind":        kind,
-            "alert_key":   alert_key,
-            "is_next_day": is_next_day,
-            "asos_yes":    asos_yes,
+            "market":         market,
+            "forecast":       forecast,
+            "ev_data":        ev_data,
+            "obs_high":       obs_high,
+            "afd":            afd_hit,
+            "fire":           fire,
+            "taker_ev":       t_ev,
+            "threshold":      threshold,
+            "kind":           kind,
+            "alert_key":      alert_key,
+            "is_next_day":    is_next_day,
+            "asos_yes":       asos_yes,
+            "category":       category,
+            "pace_confirmed": pace_confirmed,
         }
     return None
 
@@ -1559,22 +1627,34 @@ async def run_scan_async(force_codes=None):
           f"({same_day_count} same-day, {next_day_count} next-day, {yes_count} ASOS YES)")
 
     alerts = 0
+    cat_counts = {"overnight": 0, "morning": 0, "pacing": 0}
     for res in filtered:
-        market      = res["market"]
-        forecast    = res["forecast"]
-        ev_data     = res["ev_data"]
-        is_next_day = res["is_next_day"]
-        asos_yes    = res.get("asos_yes", False)
-        city        = CITY_COORDS.get(market["city_code"],(None,None,market["city_code"]))[2]
-        best        = ev_data["best_side"]
-        t_ev_res    = ev_data[best]["taker_ev"]
-        fire        = res["fire"]
-        emoji       = "🌡️" if asos_yes else "🔥"  # v3.20: all alerts use fire emoji
-        day_label   = "📅 TOMORROW" if is_next_day else "📍 TODAY"
-        units       = recommend_units(t_ev_res, forecast["confidence"],
-                                      res["afd"], fire, is_next_day, asos_yes)
-        embed       = build_embed(market, forecast, ev_data, res["obs_high"],
-                                  res["afd"], units, is_next_day, asos_yes)
+        market         = res["market"]
+        forecast       = res["forecast"]
+        ev_data        = res["ev_data"]
+        is_next_day    = res["is_next_day"]
+        asos_yes       = res.get("asos_yes", False)
+        category       = res.get("category", "morning")
+        pace_confirmed = res.get("pace_confirmed", False)
+        city           = CITY_COORDS.get(market["city_code"],(None,None,market["city_code"]))[2]
+        best           = ev_data["best_side"]
+        t_ev_res       = ev_data[best]["taker_ev"]
+        fire           = res["fire"]
+
+        cat_counts[category] = cat_counts.get(category, 0) + 1
+
+        # Emoji by category (ASOS YES overrides)
+        if asos_yes:
+            emoji = "🌡️"
+        else:
+            emoji = CATEGORY_EMOJI.get(category, "🔥")
+
+        day_label = "📅 TOMORROW" if is_next_day else "📍 TODAY"
+        units     = recommend_units(t_ev_res, forecast["confidence"],
+                                    res["afd"], fire, is_next_day, asos_yes)
+        embed     = build_embed(market, forecast, ev_data, res["obs_high"],
+                                res["afd"], units, is_next_day, asos_yes,
+                                category, pace_confirmed)
         post_discord(DISCORD_WEBHOOK_URL,
                      f"{emoji} **{city} — {market['subtitle']}** {day_label}", [embed])
         with _lock:
@@ -1583,7 +1663,7 @@ async def run_scan_async(force_codes=None):
 
     msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
            f"{len(valid_results)} raw | {alerts} posted "
-           f"({same_day_count} today / {next_day_count} tmrw / {yes_count} ASOS YES)")
+           f"(🌙{cat_counts['overnight']} 🌅{cat_counts['morning']} 📈{cat_counts['pacing']})")
     if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
     post_discord(DISCORD_LOG_WEBHOOK, msg)
     print(f"[scan] Done — {alerts} posted")
@@ -1668,10 +1748,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.26")
-    print(f"   v3.26: Wethr Forecasts API (HRRR, NBM, RAP, NAM4KM, NWS, GFS, ECMWF-IFS)")
-    print(f"          Model pacing correction (same-day, after noon)")
-    print(f"          Heating profiles from PostgreSQL (real 5-year data)")
+    print("🌡️  Kalshi Weather Bot v3.27")
+    print(f"   v3.27: Bet categorization (overnight/morning/pacing) + color-coded alerts")
+    print(f"          Pace-confirmed NO bets — fire when observed trajectory confirms")
+    print(f"          Detailed scoreboard with final temps and bet types")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
