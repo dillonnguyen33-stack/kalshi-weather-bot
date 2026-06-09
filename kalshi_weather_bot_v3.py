@@ -359,13 +359,17 @@ WETHR_OBS_BASE = "https://wethr.net/api/v2/observations.php"
 WETHR_PUSH_URL = "https://wethr.net:3443/api/v2/stream"
 
 # Map city codes to Wethr station codes
+# Only stations supported by Wethr Professional tier
 WETHR_STATIONS = {
     "NY":  "KNYC", "AUS": "KAUS", "LAX": "KLAX", "CHI": "KMDW",
     "MIA": "KMIA", "DAL": "KDFW", "DC":  "KDCA", "SEA": "KSEA",
     "PHX": "KPHX", "BOS": "KBOS", "HOU": "KHOU", "ATL": "KATL",
     "OKC": "KOKC", "LV":  "KLAS", "SFO": "KSFO", "DEN": "KDEN",
-    "SA":  "KSAT", "MN":  "KMSP", "SD":  "KSEA", "NO":  "KMSY",
+    "SA":  "KSAT", "MN":  "KMSP", "NO":  "KMSY",
 }
+
+# Top 5 cities for Push API (Professional tier limit)
+WETHR_PUSH_STATIONS = ["KHOU", "KPHX", "KMIA", "KDFW", "KMDW"]
 
 # Reverse map: Wethr station → city code (for Push API)
 WETHR_STATION_TO_CITY = {v: k for k, v in WETHR_STATIONS.items()}
@@ -374,10 +378,23 @@ WETHR_FORECAST_BASE = "https://wethr.net/api/v2/forecasts.php"
 WETHR_NWS_BASE      = "https://wethr.net/api/v2/nws_forecasts.php"
 WETHR_MODELS        = ["HRRR", "NBM", "RAP", "NAM4KM", "GFS", "ECMWF-IFS"]
 
+# Cache NWS forecasts to avoid rate limiting (refresh every 2 hours)
+_nws_cache: dict = {}
+_nws_cache_ts: dict = {}
+NWS_CACHE_TTL = 7200  # 2 hours
+
+_wethr_fcst_cache: dict = {}
+_wethr_fcst_ts: dict   = {}
+WETHR_FCST_TTL = 3600  # 1 hour cache for forecast models
+
 def fetch_wethr_forecast_high(station: str, model: str, target_date: str) -> float | None:
-    """Fetch forecast high from Wethr using latest model run."""
+    """Fetch forecast high from Wethr using latest model run — cached."""
     if not WETHR_API_KEY:
         return None
+    cache_key = f"{station}_{model}_{target_date}"
+    now = time.time()
+    if cache_key in _wethr_fcst_cache and now - _wethr_fcst_ts.get(cache_key, 0) < WETHR_FCST_TTL:
+        return _wethr_fcst_cache[cache_key]
     try:
         r = requests.get(WETHR_FORECAST_BASE, params={
             "location_name": station,
@@ -387,6 +404,8 @@ def fetch_wethr_forecast_high(station: str, model: str, target_date: str) -> flo
         r.raise_for_status()
         rows = r.json()
         if not rows:
+            _wethr_fcst_cache[cache_key]  = None
+            _wethr_fcst_ts[cache_key]     = now
             return None
         highs = []
         for row in rows:
@@ -394,15 +413,22 @@ def fetch_wethr_forecast_high(station: str, model: str, target_date: str) -> flo
                 temp_f = row.get("temperature_f")
                 if temp_f is not None:
                     highs.append(float(temp_f))
-        return max(highs) if highs else None
+        result = max(highs) if highs else None
+        _wethr_fcst_cache[cache_key] = result
+        _wethr_fcst_ts[cache_key]    = now
+        return result
     except Exception as e:
         print(f"[wethr_fcst] {station}/{model}: {e}")
         return None
 
 def fetch_wethr_nws_forecast(station: str, target_date: str) -> float | None:
-    """Fetch NWS hourly forecast high from Wethr."""
+    """Fetch NWS hourly forecast high from Wethr — cached to avoid rate limits."""
     if not WETHR_API_KEY:
         return None
+    cache_key = f"{station}_{target_date}"
+    now = time.time()
+    if cache_key in _nws_cache and now - _nws_cache_ts.get(cache_key, 0) < NWS_CACHE_TTL:
+        return _nws_cache[cache_key]
     try:
         r = requests.get(WETHR_NWS_BASE, params={
             "station_code": station,
@@ -412,7 +438,10 @@ def fetch_wethr_nws_forecast(station: str, target_date: str) -> float | None:
         r.raise_for_status()
         data = r.json()
         high = data.get("high")
-        return float(high) if high is not None else None
+        result = float(high) if high is not None else None
+        _nws_cache[cache_key]    = result
+        _nws_cache_ts[cache_key] = now
+        return result
     except Exception as e:
         print(f"[wethr_nws] {station}: {e}")
         return None
@@ -426,7 +455,7 @@ def fetch_wethr_all_models(station: str, target_date: str) -> dict:
         high = fetch_wethr_forecast_high(station, model, target_date)
         if high is not None:
             results[model] = high
-        time.sleep(0.1)
+        time.sleep(0.5)  # rate limit — 60 req/min = 1 req/sec max
     nws = fetch_wethr_nws_forecast(station, target_date)
     if nws is not None:
         results["NWS"] = nws
@@ -529,11 +558,10 @@ def wethr_push_loop():
         print("[push] No WETHR_API_KEY — Push API disabled")
         return
 
-    # Only subscribe to cities we have in Wethr
-    stations = ",".join(set(WETHR_STATIONS.values()))
+    # Only subscribe to top 5 stations (Professional tier limit)
+    stations = ",".join(WETHR_PUSH_STATIONS)
     url = f"{WETHR_PUSH_URL}?stations={stations}&api_key={WETHR_API_KEY}"
-
-    print(f"[push] Connecting to Wethr Push API for {len(set(WETHR_STATIONS.values()))} stations")
+    print(f"[push] Connecting to Wethr Push API for {len(WETHR_PUSH_STATIONS)} stations: {stations}")
 
     while True:
         try:
