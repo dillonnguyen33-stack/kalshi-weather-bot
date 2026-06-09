@@ -4,6 +4,10 @@ morning_report.py — Daily calibration report posted to Discord
 Posts every afternoon at 3pm PT automatically.
 Run via Railway cron: 0 23 * * * (23:00 UTC = 3:00 PM PT)
 
+v3.27: Detailed scoreboard — lists each settled bet with the final
+       temperature, the bucket/threshold, win/loss, and bet category
+       (overnight/morning/pacing). Adds a category accuracy breakdown.
+
 Usage:
   python3 morning_report.py        # run manually
 """
@@ -15,6 +19,12 @@ from zoneinfo import ZoneInfo
 DATABASE_URL        = os.environ.get("DATABASE_URL", "")
 DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
 ET_TZ = ZoneInfo("America/New_York")
+
+CATEGORY_EMOJI = {
+    "overnight": "🌙",
+    "morning":   "🌅",
+    "pacing":    "📈",
+}
 
 def get_conn():
     import psycopg2
@@ -56,39 +66,50 @@ def run_daily_report(cur, yesterday):
     yes_acc_str = f"{yes_correct}/{yes_settled} = {yes_correct/yes_settled*100:.1f}%" if yes_settled else "n/a"
     all_acc_str = f"{correct}/{settled} = {correct/settled*100:.1f}%" if settled else "n/a"
 
-    # ── YESTERDAY B-TYPE vs T-TYPE (NO bets only) ─────────────────────────────
+    # ── DETAILED PER-BET BREAKDOWN ────────────────────────────────────────────
     cur.execute("""
-        SELECT threshold_kind, COUNT(*),
-               SUM(CASE WHEN model_correct = 1 THEN 1 ELSE 0 END)
+        SELECT city_code, ticker, threshold_f, threshold_kind, best_side,
+               actual_high_f, model_correct, bet_category, ensemble_mean
         FROM predictions
-        WHERE market_date = %s AND settled = 1 AND best_side = 'NO'
-        GROUP BY threshold_kind
+        WHERE market_date = %s AND settled = 1
+        ORDER BY bet_category, city_code
     """, (str(yesterday),))
-    type_rows = cur.fetchall()
+    bet_rows = cur.fetchall()
 
-    type_lines = []
-    for kind, n, correct_t in type_rows:
-        acc = correct_t / n * 100 if n else 0
-        label = "Bucket (B)" if kind == "B" else "Threshold (T)"
-        type_lines.append(f"`{label}` {n} bets → {correct_t}/{n} = {acc:.0f}% win rate")
+    bet_lines = []
+    for (code, ticker, thresh, kind, side, actual, correct_b,
+         category, mean) in bet_rows:
+        emoji  = CATEGORY_EMOJI.get(category, "")
+        result = "✅" if correct_b == 1 else "❌"
+        actual_s = f"{actual:.0f}°F" if actual is not None else "?"
 
-    # ── YESTERDAY CITY BREAKDOWN (NO bets only) ───────────────────────────────
+        # Describe the bucket/threshold
+        if kind == "B":
+            lo = thresh - 0.5
+            hi = thresh + 0.5
+            bucket_s = f"{lo:.0f}-{hi:.0f}°"
+        else:
+            bucket_s = f"≥{thresh:.0f}°" if side == "YES" else f"<{thresh:.0f}°"
+
+        bet_lines.append(
+            f"{result} {emoji} `{code:<4}` {side} {bucket_s} → settled {actual_s}"
+        )
+
+    # ── CATEGORY BREAKDOWN ────────────────────────────────────────────────────
     cur.execute("""
-        SELECT city_code, COUNT(*),
-               SUM(CASE WHEN model_correct = 1 THEN 1 ELSE 0 END),
-               AVG(taker_ev)
+        SELECT bet_category, COUNT(*),
+               SUM(CASE WHEN model_correct=1 THEN 1 ELSE 0 END)
         FROM predictions
-        WHERE market_date = %s AND settled = 1 AND best_side = 'NO'
-        GROUP BY city_code
-        ORDER BY COUNT(*) DESC
+        WHERE market_date = %s AND settled = 1
+        GROUP BY bet_category
     """, (str(yesterday),))
-    city_rows = cur.fetchall()
+    cat_rows = cur.fetchall()
 
-    city_lines = []
-    for code, n, correct_c, avg_ev in city_rows:
-        acc  = correct_c / n * 100 if n else 0
-        ev_s = f"{avg_ev:.1f}%" if avg_ev else "n/a"
-        city_lines.append(f"`{code:<6}` {n:>2} bets  {acc:>5.1f}% acc  EV {ev_s}")
+    cat_lines = []
+    for cat, n, c in cat_rows:
+        emoji = CATEGORY_EMOJI.get(cat, "")
+        acc = (c or 0) / n * 100 if n else 0
+        cat_lines.append(f"{emoji} `{(cat or 'none'):<10}` {c}/{n} = {acc:.0f}%")
 
     # ── BUILD EMBEDS ──────────────────────────────────────────────────────────
     embeds = []
@@ -106,19 +127,36 @@ def run_daily_report(cur, yesterday):
         ]
     })
 
-    if type_lines:
+    if cat_lines:
         embeds.append({
-            "title": "📊 B-Type vs T-Type (NO bets)",
-            "color": 0x57F287,
-            "description": "\n".join(type_lines),
+            "title": "🕐 By Category",
+            "color": 0xEB459E,
+            "description": "\n".join(cat_lines),
         })
 
-    if city_lines:
-        embeds.append({
-            "title": "🏙️ City Breakdown (NO bets)",
-            "color": 0xFEE75C,
-            "description": "\n".join(city_lines[:15]),
-        })
+    if bet_lines:
+        # Discord embed description limit ~4096 chars — chunk if needed
+        chunk = []
+        char_count = 0
+        for line in bet_lines:
+            if char_count + len(line) > 3900:
+                embeds.append({
+                    "title": "🧾 Every Bet (settled)",
+                    "color": 0x57F287,
+                    "description": "\n".join(chunk),
+                })
+                chunk = []
+                char_count = 0
+            chunk.append(line)
+            char_count += len(line) + 1
+        if chunk:
+            embeds.append({
+                "title": "🧾 Every Bet (settled)" if not any(
+                    e.get("title") == "🧾 Every Bet (settled)" for e in embeds
+                ) else "🧾 Every Bet (cont.)",
+                "color": 0x57F287,
+                "description": "\n".join(chunk),
+            })
 
     if not settled:
         embeds.append({
@@ -176,6 +214,22 @@ def run_weekly_report(cur, today):
         ev_s = f"{avg_ev:.1f}%" if avg_ev else "n/a"
         city_lines.append(f"`{code:<6}` {n:>3} bets  {acc:>5.1f}% acc  EV {ev_s}")
 
+    # Category breakdown for the week
+    cur.execute("""
+        SELECT bet_category, COUNT(*),
+               SUM(CASE WHEN model_correct = 1 THEN 1 ELSE 0 END)
+        FROM predictions
+        WHERE market_date >= %s AND market_date < %s AND settled = 1
+        GROUP BY bet_category
+    """, (str(week_start), str(today)))
+    cat_rows = cur.fetchall()
+
+    cat_lines = []
+    for cat, n, c in cat_rows:
+        emoji = CATEGORY_EMOJI.get(cat, "")
+        acc = (c or 0) / n * 100 if n else 0
+        cat_lines.append(f"{emoji} `{(cat or 'none'):<10}` {c}/{n} = {acc:.0f}%")
+
     embeds = []
     embeds.append({
         "title": f"📈 Weekly Summary — {week_start} to {today - timedelta(days=1)}",
@@ -185,6 +239,13 @@ def run_weekly_report(cur, today):
             {"name": "Total NO Settled", "value": str(total_no_settled), "inline": True},
         ]
     })
+
+    if cat_lines:
+        embeds.append({
+            "title": "🕐 By Category (Week)",
+            "color": 0xEB459E,
+            "description": "\n".join(cat_lines),
+        })
 
     if day_lines:
         embeds.append({
