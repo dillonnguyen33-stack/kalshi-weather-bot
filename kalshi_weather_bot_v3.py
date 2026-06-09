@@ -1,22 +1,21 @@
 """
-Kalshi Weather Temperature Bot — v3.27
+Kalshi Weather Temperature Bot — v3.28
 
-Changes from v3.26:
-  v3.27 — Bet categorization + pace-confirmed bets:
-           1. Every bet tagged by city-local time of firing:
-              overnight (8pm-6am), morning (6am-12pm), pacing (12pm-8pm)
-           2. Color-coded Discord alerts:
-              overnight=indigo 🌙, morning=green 🌅, pacing=orange 📈
-           3. Pace-confirmed NO bets — a new high-confidence subtype.
-              For same-day afternoon B-type NO bets, projects the peak
-              from current obs + remaining heating-profile rise. If the
-              projected peak lands >=1.5F below the bucket, the bet is
-              flagged PACE-CONFIRMED (the observed trajectory confirms it,
-              not just the morning forecast).
-           4. Detailed scoreboard (in bias_logger/morning_report) showing
-              each bet, final settled temp, and bet category.
-           Requires bias_logger.py to accept bet_category param (gracefully
-           falls back if not yet updated).
+Changes from v3.27:
+  v3.28 — Adaptive pace-confirmation (fixes the "profile is an average" flaw):
+           The pace-confirm margin now adapts to today's actual conditions
+           instead of blindly trusting the historical heating profile.
+           1. Morning heating rate check — tracks intraday temps and compares
+              today's climb rate vs the city's typical rate. If today is
+              running hot, requires a larger margin before pace-confirming.
+           2. Dewpoint dryness flag — very dry air (large temp-dewpoint
+              spread) heats higher than the profile average, so dry days
+              require a larger margin too.
+           Required margin = 1.5F base + heat_flag + dry_flag.
+           This prevents over-confident pace-confirms on abnormal days.
+
+  (v3.27 — bet categorization, color-coded alerts, pace-confirmed bets,
+   detailed scoreboard, pace-confirmed unit sizing floor at 1.5u)
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -167,6 +166,109 @@ def get_projected_rise(city_code: str, local_hour: int) -> float:
     else:
         return 0.05
 
+def get_heating_rate_flag(city_code: str, current_hour: int, current_obs: float) -> float:
+    """
+    Compares today's morning heating against the historical profile to detect
+    if today is running HOT or COLD vs a normal day.
+
+    Returns an extra margin (in °F) to require for pace-confirmation:
+      0.0  = today is tracking normal, no extra margin needed
+      +1.0 = today is running hot, require more margin (be cautious)
+      -0.5 = today is running cool, can be slightly more aggressive
+
+    Logic: we know peak typically occurs around avg_peak_hour and the rise
+    amounts after 2/3/4pm. We back out the "expected temp at current hour" from
+    the profile, then compare to the actual obs. If actual is well above
+    expected, the day is running hot and will likely overshoot the profile.
+    """
+    profiles = load_heating_profiles_from_db()
+    month    = datetime.now().month
+    mp       = profiles.get(city_code, {}).get("monthly_profiles", {}).get(month, {})
+    if not mp:
+        return 0.0
+
+    with _lock:
+        curve = dict(asos_intraday.get(city_code, {}))
+
+    # Need at least a morning reading to compare slope
+    morning_temps = {h: t for h, t in curve.items() if 7 <= h <= 11}
+    if len(morning_temps) < 1:
+        return 0.0  # not enough morning data yet
+
+    # Estimate how much the temp has risen from morning to now
+    earliest_hr   = min(morning_temps.keys())
+    earliest_temp = morning_temps[earliest_hr]
+    observed_climb = current_obs - earliest_temp
+    hours_elapsed  = max(1, current_hour - earliest_hr)
+    climb_per_hour = observed_climb / hours_elapsed
+
+    # Typical climb per hour in this window: derive from profile.
+    # avg_rise_after_2pm is what's LEFT after 2pm, so total daytime climb is
+    # larger. We use a rough normal of ~2.0F/hr late morning as baseline,
+    # adjusted by how "steep" this city's profile is.
+    typical_climb_per_hour = 2.0
+    if mp.get("avg_rise_after_2pm", 0) > 3.0:
+        typical_climb_per_hour = 2.5  # steep-heating city (desert/inland)
+    elif mp.get("avg_rise_after_2pm", 0) < 1.0:
+        typical_climb_per_hour = 1.2  # flat-heating city (coastal)
+
+    divergence = climb_per_hour - typical_climb_per_hour
+
+    if divergence > 1.0:
+        return 1.0   # running notably hot — require +1F more margin
+    elif divergence > 0.5:
+        return 0.5
+    elif divergence < -0.8:
+        return -0.5  # running cool — can be slightly more aggressive
+    return 0.0
+
+def fetch_dewpoint_depression(city_code: str) -> float | None:
+    """
+    Fetch current temperature-dewpoint spread (dryness) from Open-Meteo.
+    A large spread = dry air = more heating potential than the profile average.
+    Returns the depression in °F, or None.
+    """
+    info = CITY_COORDS.get(city_code)
+    if not info:
+        return None
+    lat, lon = info[0], info[1]
+    try:
+        r = requests.get(f"{OPEN_METEO_BASE}/forecast", params={
+            "latitude": lat, "longitude": lon,
+            "current": "temperature_2m,dew_point_2m",
+            "temperature_unit": "fahrenheit",
+        }, timeout=8)
+        r.raise_for_status()
+        cur = r.json().get("current", {})
+        t  = cur.get("temperature_2m")
+        dp = cur.get("dew_point_2m")
+        if t is not None and dp is not None:
+            return round(float(t) - float(dp), 1)
+        return None
+    except Exception as e:
+        print(f"[dewpoint] {city_code}: {e}")
+        return None
+
+def get_dryness_flag(city_code: str) -> float:
+    """
+    Returns extra margin (°F) to require for pace-confirmation based on dryness.
+    Very dry air heats faster/higher than the profile average assumes.
+      0.0  = normal humidity
+      +0.5 to +1.0 = unusually dry, require more margin
+    """
+    depression = fetch_dewpoint_depression(city_code)
+    if depression is None:
+        return 0.0
+    # Dew point depression thresholds (°F):
+    #   <20F  = humid/normal
+    #   20-30F = moderately dry
+    #   >30F  = very dry (desert-like), strong extra heating potential
+    if depression > 35:
+        return 1.0
+    elif depression > 25:
+        return 0.5
+    return 0.0
+
 # ── AFD PRE-FILTER KEYWORDS ───────────────────────────────────────────────────
 AFD_ROUTINE_PHRASES = [
     "no significant", "no significant changes",
@@ -311,6 +413,8 @@ CATEGORY_EMOJI = {
 
 # ── RUNTIME STATE ─────────────────────────────────────────────────────────────
 asos_observed: dict[str, float]  = {}
+asos_intraday: dict              = {}   # {city: {hour: temp}} for morning heating rate
+city_dewpoint: dict[str, float]  = {}   # {city: dewpoint_depression_f}
 afd_flagged_cities: set          = set()
 seen_afd_ids: set                = set()
 posted_alert_keys: set           = set()
@@ -325,8 +429,10 @@ def maybe_reset_daily():
         last_reset_date = today
         return
     if today > last_reset_date:
-        print("[reset] New day — clearing posted alert keys")
+        print("[reset] New day — clearing posted alert keys + intraday tracking")
         posted_alert_keys.clear()
+        with _lock:
+            asos_intraday.clear()
         last_reset_date = today
 
 CITY_KEYWORD_MAP = {
@@ -613,6 +719,11 @@ def asos_poll_loop():
             if high is not None:
                 with _lock:
                     asos_observed[code] = high
+                    # Record intraday curve: store the obs high at each local hour
+                    local_hr = datetime.now(get_city_tz(code)).hour
+                    if code not in asos_intraday:
+                        asos_intraday[code] = {}
+                    asos_intraday[code][local_hr] = high
         time.sleep(ASOS_POLL_SECS)
 
 def wethr_push_loop():
@@ -1478,21 +1589,38 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
         obs_high = asos_observed.get(cc)
     afd_hit  = bool(afd_cities and cc in afd_cities)
 
-    # ── PACE-CONFIRMED detection (v3.27) ──────────────────────────────────────
+    # ── PACE-CONFIRMED detection (v3.27, refined v3.28) ───────────────────────
     # A bet is "pace-confirmed" when it's a same-day afternoon NO bet and the
     # observed trajectory makes the outcome high-confidence. We project the peak
     # from current obs + remaining rise and check it lands well below the bucket.
+    #
+    # The required margin ADAPTS to today's conditions:
+    #   - base margin = 1.5F
+    #   - +extra if today is heating faster than normal (morning rate check)
+    #   - +extra if the air is unusually dry (dewpoint depression)
+    # This prevents over-confirming on abnormal days where the profile average
+    # underestimates the peak.
     pace_confirmed = False
     if (not asos_yes and best == "NO" and kind == "B" and not is_next_day
             and 12 <= now_local_check.hour < 20 and obs_high is not None):
         projected_rise = get_projected_rise(cc, now_local_check.hour)
         projected_peak = obs_high + projected_rise
-        # Confirmed if projected peak is comfortably below the bucket (>=1.5F margin)
+
+        # Adaptive margin requirement
+        heat_flag    = get_heating_rate_flag(cc, now_local_check.hour, obs_high)
+        dry_flag     = get_dryness_flag(cc)
+        required_margin = 1.5 + heat_flag + dry_flag
+
         margin = lo - projected_peak
-        if margin >= 1.5:
+        if margin >= required_margin:
             pace_confirmed = True
-            print(f"[v3.27] {cc} PACE-CONFIRMED NO: obs={obs_high}°F + rise={projected_rise:.1f}°F "
-                  f"→ proj={projected_peak:.1f}°F, bucket_lo={lo}°F, margin={margin:.1f}°F")
+            print(f"[v3.28] {cc} PACE-CONFIRMED NO: obs={obs_high}°F + rise={projected_rise:.1f}°F "
+                  f"→ proj={projected_peak:.1f}°F, bucket_lo={lo}°F, margin={margin:.1f}°F "
+                  f"(req={required_margin:.1f}F: base 1.5 +heat {heat_flag:+.1f} +dry {dry_flag:+.1f})")
+        elif margin >= 1.5:
+            # Would have confirmed under old rule but today's conditions say be cautious
+            print(f"[v3.28] {cc} pace NOT confirmed: margin={margin:.1f}F < required={required_margin:.1f}F "
+                  f"(heat {heat_flag:+.1f}, dry {dry_flag:+.1f}) — abnormal day, staying cautious")
 
     category = get_bet_category(cc, is_next_day, pace_confirmed)
 
@@ -1759,10 +1887,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.27")
-    print(f"   v3.27: Bet categorization (overnight/morning/pacing) + color-coded alerts")
-    print(f"          Pace-confirmed NO bets — fire when observed trajectory confirms")
-    print(f"          Detailed scoreboard with final temps and bet types")
+    print("🌡️  Kalshi Weather Bot v3.28")
+    print(f"   v3.28: Adaptive pace-confirmation (morning heat rate + dryness checks)")
+    print(f"          Pace-confirm margin adapts when today runs hot or dry")
+    print(f"          (v3.27: categories, color alerts, pace-confirmed bets + sizing)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
