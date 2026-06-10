@@ -1,21 +1,17 @@
 """
-Kalshi Weather Temperature Bot — v3.28
+Kalshi Weather Temperature Bot — v3.30
 
-Changes from v3.27:
-  v3.28 — Adaptive pace-confirmation (fixes the "profile is an average" flaw):
-           The pace-confirm margin now adapts to today's actual conditions
-           instead of blindly trusting the historical heating profile.
-           1. Morning heating rate check — tracks intraday temps and compares
-              today's climb rate vs the city's typical rate. If today is
-              running hot, requires a larger margin before pace-confirming.
-           2. Dewpoint dryness flag — very dry air (large temp-dewpoint
-              spread) heats higher than the profile average, so dry days
-              require a larger margin too.
-           Required margin = 1.5F base + heat_flag + dry_flag.
-           This prevents over-confident pace-confirms on abnormal days.
+Changes from v3.29:
+  v3.30 — Live liquidity follow-up on every alert:
+           After each alert, posts a follow-up message with the live
+           Kalshi orderbook for that ticker on the side being bet:
+             • Best price (cents) you'd pay to take
+             • Liquidity available at that best price ($ / contracts)
+             • Total resting liquidity on that side
+           One extra orderbook API call per alert (fine given lower volume).
 
-  (v3.27 — bet categorization, color-coded alerts, pace-confirmed bets,
-   detailed scoreboard, pace-confirmed unit sizing floor at 1.5u)
+  (v3.29 — overnight spread widening, long-lead gap, per-city cap;
+   v3.28 — adaptive pace-confirm; v3.27 — categories + sizing)
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -1126,6 +1122,21 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
     if len(all_members) < 10:
         spread = max(spread, dynamic_floor)
 
+    # ── LONG-LEAD-TIME SPREAD WIDENING (v3.29) ────────────────────────────────
+    # A forecast made far from the peak is inherently less certain. Overnight
+    # (8pm-6am local) and next-day bets are 12-18+ hours from the high, so the
+    # normal same-day spread floor produces false confidence (e.g. 97% NO at
+    # 1am). Widen the spread floor for these to reflect real uncertainty.
+    is_overnight_window = (local_hour >= 20 or local_hour < 6)
+    if not is_same_day:
+        # Next-day forecast — widest uncertainty
+        spread = max(spread, 4.0)
+        print(f"[spread] {city_code} next-day floor → ±{spread:.1f}F")
+    elif is_overnight_window:
+        # Same calendar day but pre-dawn — still 10-15h from peak
+        spread = max(spread, 3.5)
+        print(f"[spread] {city_code} overnight floor → ±{spread:.1f}F")
+
     # ── PACING CORRECTION (same-day only, after noon) ─────────────────────────
     pacing = {}
     if is_same_day and local_hour >= 12:
@@ -1252,6 +1263,68 @@ def post_discord(webhook, content, embeds=None):
         requests.post(webhook, json={"content":content,"embeds":embeds or []}, timeout=10)
     except Exception as e:
         print(f"[discord] {e}")
+
+# ── ORDERBOOK / LIQUIDITY (v3.30) ─────────────────────────────────────────────
+def fetch_orderbook_liquidity(ticker: str, side: str) -> dict | None:
+    """
+    Fetch the Kalshi orderbook for a ticker and compute, for the given side
+    (YES or NO), the best price you'd pay to take, the liquidity resting at
+    that best price, and the total resting liquidity on that side.
+
+    Kalshi orderbook returns 'yes' and 'no' arrays of [price_cents, quantity]
+    resting bids. To TAKE the YES side you cross against resting NO bids
+    (your fill price = 100 - no_bid_price). To take NO you cross against
+    resting YES bids (fill price = 100 - yes_bid_price). We surface the best
+    available take price and the contract quantity (=$ at $1 notional).
+    """
+    try:
+        r = requests.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook",
+                         params={"depth": 100}, timeout=8)
+        r.raise_for_status()
+        ob = r.json().get("orderbook", {})
+
+        # The book lists resting bids on each side as [price, qty]
+        yes_bids = ob.get("yes") or []
+        no_bids  = ob.get("no")  or []
+
+        # To take YES, we lift the best NO bid → pay (100 - no_bid_price)
+        # To take NO,  we lift the best YES bid → pay (100 - yes_bid_price)
+        opposing = no_bids if side == "YES" else yes_bids
+        if not opposing:
+            return None
+
+        # Each entry is [price_cents, quantity]; best opposing bid = highest price
+        opposing_sorted = sorted(opposing, key=lambda x: -x[0])
+        best_opp_price, best_opp_qty = opposing_sorted[0][0], opposing_sorted[0][1]
+
+        take_price = 100 - best_opp_price  # cents you'd pay to take your side
+        liq_at_best = best_opp_qty         # contracts available at best price
+        total_liq   = sum(q for _, q in opposing_sorted)  # all resting on this side
+
+        return {
+            "best_price_cents": take_price,
+            "liq_at_best":      liq_at_best,
+            "total_liq":        total_liq,
+        }
+    except Exception as e:
+        print(f"[orderbook] {ticker}: {e}")
+        return None
+
+def format_liquidity_message(city: str, subtitle: str, side: str,
+                             liq: dict | None) -> str:
+    """Build the follow-up message text with price + liquidity."""
+    if liq is None:
+        return f"💧 **{city} — {subtitle}** | order book unavailable"
+    bp   = liq["best_price_cents"]
+    lab  = liq["liq_at_best"]
+    tot  = liq["total_liq"]
+    # At $1 notional per contract, quantity ≈ dollars
+    return (
+        f"💧 **{city} liquidity** ({side})\n"
+        f"• Best price: **{bp}¢**\n"
+        f"• Available at {bp}¢: **${lab:,.0f}** ({lab:,} contracts)\n"
+        f"• Total resting on {side} side: **${tot:,.0f}** ({tot:,} contracts)"
+    )
 
 def recommend_units(ev_pct, confidence, afd_hit, is_fire, is_next_day,
                     is_yes=False, pace_confirmed=False) -> float:
@@ -1517,15 +1590,22 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
 
     if not asos_yes:
         # ── STANDARD NO PATH ─────────────────────────────────────────────────
+        # Determine if this is a long-lead bet (overnight or next-day) which
+        # needs a bigger gap since there's no observation to confirm it.
+        _ov_hour = now_local_check.hour
+        is_long_lead = is_next_day or (_ov_hour >= 20 or _ov_hour < 6)
+        gap_multiplier = 1.5 if is_long_lead else 1.0
+
         if kind == "B":
             prob = model_probability(forecast, threshold, cc, kind="B",
                                      lo=lo, hi=hi, is_next_day=is_next_day)
-            # v3.19: loosened gap rule from 2x to 1x spread
+            # v3.19: 1x spread same-day; v3.29: 1.5x for overnight/next-day
             if prob < 0.5:  # NO bet
                 gap     = lo - forecast["corrected_mean"]
-                min_gap = forecast["spread"] * 1.0
+                min_gap = forecast["spread"] * gap_multiplier
                 if gap < min_gap:
-                    print(f"[v3.19] {cc} B-type NO blocked: gap={gap:.1f}F < min={min_gap:.1f}F")
+                    print(f"[v3.29] {cc} B-type NO blocked: gap={gap:.1f}F < min={min_gap:.1f}F "
+                          f"(x{gap_multiplier} {'long-lead' if is_long_lead else 'same-day'})")
                     return None
         else:
             prob = model_probability(forecast, threshold, cc, kind="T",
@@ -1672,6 +1752,8 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     return None
 
 # ── BUCKET DEDUPLICATION ──────────────────────────────────────────────────────
+MAX_BETS_PER_CITY = 2  # v3.29: cap total bets per city per settlement date
+
 def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
     groups: dict[tuple, list] = defaultdict(list)
     for res in raw_results:
@@ -1693,7 +1775,32 @@ def deduplicate_buckets(raw_results: list[dict]) -> list[dict]:
             else:
                 nearest = min(selected_thresholds, key=lambda s: abs(thresh - s))
                 print(f"[dedup] {cc}/{kind} dropping thresh={thresh}°F (near {nearest}°F)")
-    return kept
+
+    # ── PER-CITY CAP (v3.29) ──────────────────────────────────────────────────
+    # Limit total bets per city per settlement date to avoid over-concentration.
+    # Keep the highest-EV bets; pace-confirmed bets get priority (they're the
+    # highest-confidence). Prevents the "3 OKC NO bets all miss" scenario.
+    by_city_date: dict[tuple, list] = defaultdict(list)
+    for alert in kept:
+        ck = (alert["market"]["city_code"], alert["is_next_day"])
+        by_city_date[ck].append(alert)
+
+    final = []
+    for (cc, next_day), alerts in by_city_date.items():
+        if len(alerts) <= MAX_BETS_PER_CITY:
+            final.extend(alerts)
+        else:
+            # Sort: pace-confirmed first, then by EV
+            alerts.sort(key=lambda x: (not x.get("pace_confirmed", False),
+                                       -x["taker_ev"]))
+            keep = alerts[:MAX_BETS_PER_CITY]
+            drop = alerts[MAX_BETS_PER_CITY:]
+            final.extend(keep)
+            for d in drop:
+                print(f"[citycap] {cc}/{'tmrw' if next_day else 'today'} "
+                      f"dropping thresh={d['threshold']}°F EV={d['taker_ev']}% "
+                      f"(cap {MAX_BETS_PER_CITY}/city)")
+    return final
 
 async def run_scan_async(force_codes=None):
     maybe_reset_daily()
@@ -1796,6 +1903,15 @@ async def run_scan_async(force_codes=None):
                                 category, pace_confirmed)
         post_discord(DISCORD_WEBHOOK_URL,
                      f"{emoji} **{city} — {market['subtitle']}** {day_label}", [embed])
+
+        # v3.30: follow-up message with live price + liquidity from orderbook
+        try:
+            liq = fetch_orderbook_liquidity(market["ticker"], best)
+            liq_msg = format_liquidity_message(city, market["subtitle"], best, liq)
+            post_discord(DISCORD_WEBHOOK_URL, liq_msg)
+        except Exception as _e:
+            print(f"[orderbook] follow-up failed for {market['ticker']}: {_e}")
+
         with _lock:
             posted_alert_keys.add(res["alert_key"])
         alerts += 1
@@ -1887,10 +2003,9 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.28")
-    print(f"   v3.28: Adaptive pace-confirmation (morning heat rate + dryness checks)")
-    print(f"          Pace-confirm margin adapts when today runs hot or dry")
-    print(f"          (v3.27: categories, color alerts, pace-confirmed bets + sizing)")
+    print("🌡️  Kalshi Weather Bot v3.30")
+    print(f"   v3.30: Live liquidity follow-up on every alert (price + depth)")
+    print(f"          (v3.29: overnight fixes + per-city cap; v3.28: adaptive pace)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
