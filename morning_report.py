@@ -21,10 +21,14 @@ DISCORD_LOG_WEBHOOK = os.environ.get("DISCORD_LOG_WEBHOOK", "")
 ET_TZ = ZoneInfo("America/New_York")
 
 CATEGORY_EMOJI = {
-    "overnight": "🌙",
-    "morning":   "🌅",
-    "pacing":    "📈",
+    "overnight":      "🌙",
+    "morning":        "🌅",
+    "pacing":         "📈",
+    "pace_confirmed": "✅",
 }
+
+# Display order for category breakdowns
+CATEGORY_ORDER = ["overnight", "morning", "pacing", "pace_confirmed"]
 
 def get_conn():
     import psycopg2
@@ -104,14 +108,22 @@ def run_daily_report(cur, yesterday):
         GROUP BY bet_category
     """, (str(yesterday),))
     cat_rows = cur.fetchall()
+    cat_map = {(cat or "none"): (n, c) for cat, n, c in cat_rows}
 
     cat_lines = []
-    for cat, n, c in cat_rows:
+    for cat in CATEGORY_ORDER:
+        if cat not in cat_map:
+            continue
+        n, c = cat_map[cat]
         emoji = CATEGORY_EMOJI.get(cat, "")
         acc = (c or 0) / n * 100 if n else 0
-        cat_lines.append(f"{emoji} `{(cat or 'none'):<10}` {c}/{n} = {acc:.0f}%")
-
-    # ── BUILD EMBEDS ──────────────────────────────────────────────────────────
+        label = cat.replace("_", "-")
+        cat_lines.append(f"{emoji} `{label:<14}` {c}/{n} = {acc:.0f}%")
+    # Any leftover categories not in the standard order
+    for cat, (n, c) in cat_map.items():
+        if cat not in CATEGORY_ORDER:
+            acc = (c or 0) / n * 100 if n else 0
+            cat_lines.append(f"❓ `{cat:<14}` {c}/{n} = {acc:.0f}%")
     embeds = []
 
     embeds.append({
@@ -223,12 +235,21 @@ def run_weekly_report(cur, today):
         GROUP BY bet_category
     """, (str(week_start), str(today)))
     cat_rows = cur.fetchall()
+    cat_map = {(cat or "none"): (n, c) for cat, n, c in cat_rows}
 
     cat_lines = []
-    for cat, n, c in cat_rows:
+    for cat in CATEGORY_ORDER:
+        if cat not in cat_map:
+            continue
+        n, c = cat_map[cat]
         emoji = CATEGORY_EMOJI.get(cat, "")
         acc = (c or 0) / n * 100 if n else 0
-        cat_lines.append(f"{emoji} `{(cat or 'none'):<10}` {c}/{n} = {acc:.0f}%")
+        label = cat.replace("_", "-")
+        cat_lines.append(f"{emoji} `{label:<14}` {c}/{n} = {acc:.0f}%")
+    for cat, (n, c) in cat_map.items():
+        if cat not in CATEGORY_ORDER:
+            acc = (c or 0) / n * 100 if n else 0
+            cat_lines.append(f"❓ `{cat:<14}` {c}/{n} = {acc:.0f}%")
 
     embeds = []
     embeds.append({
