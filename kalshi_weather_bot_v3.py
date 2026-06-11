@@ -1,25 +1,23 @@
 """
-Kalshi Weather Temperature Bot — v3.35
+Kalshi Weather Temperature Bot — v3.36
 
-Changes from v3.34:
-  v3.35 — CRITICAL blend fix — Wethr models now drive the mean:
-           BUG: the ensemble mean was being dragged away from the actual
-           model forecasts. Every Wethr model could read 104°F while the
-           displayed ensemble mean showed 100°F. Cause: the blend started
-           with ALL Open-Meteo ensemble members (100+), which numerically
-           drowned out the ~25 weighted Wethr model copies. The mean
-           reflected the Open-Meteo ensemble crowd, not the sharp,
-           station-aligned Wethr models.
-           FIX: the mean is now built from the Wethr deterministic models
-           (accuracy-weighted), and the Open-Meteo ensemble contributes a
-           single down-weighted summary point (its mean ×3) rather than
-           100+ raw members. The full ensemble is still used for the
-           SPREAD/uncertainty calculation. Added a sanity-check log when
-           the mean falls outside the Wethr model range.
-           Verified: Vegas case 100.0°F → 103.9°F (models were 103-106°F).
+Changes from v3.35:
+  v3.36 — Contrarian guard on pace bets (sharpness fix):
+           Observed pattern: afternoon pace bets where Kalshi implied was
+           HIGH (>60%) consistently cashed, while bets where implied was
+           LOW (~25-30%) consistently missed. When the market strongly
+           disagrees with the model (implied < 40% for our side), the
+           market is usually pricing something the model misses — e.g.
+           Phoenix's large afternoon heating potential on a hot day, which
+           the heating-profile average underestimates.
+           FIX: afternoon NO pace bets with implied < 40% now REQUIRE
+           pace-confirmation (observed trajectory must back them up). If
+           the market thinks the bucket is likely and the live obs don't
+           confirm our NO, the bet is blocked rather than fired on model
+           confidence alone. High-implied bets (market agrees) unaffected.
 
-  (v3.34 — cross-scan dup fix; v3.33 — overnight ASOS display;
-   v3.32 — Dev tier Push-all + Model Accuracy auto-weight)
+  (v3.35 — blend fix: Wethr drives mean; v3.34 — cross-scan dup fix;
+   v3.33 — overnight ASOS display; v3.32 — Dev tier features)
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -1856,6 +1854,23 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
 
     category = get_bet_category(cc, is_next_day, pace_confirmed)
 
+    # ── CONTRARIAN GUARD (v3.36) ──────────────────────────────────────────────
+    # When the market strongly disagrees with us — Kalshi implied < 40% for our
+    # side, meaning the market thinks the bucket is LIKELY to hit while our model
+    # says it won't — the market is usually pricing something the model misses
+    # (e.g. Phoenix's afternoon heating potential on a hot day). Today's data
+    # showed every low-implied pace bet missing while every >60% implied bet
+    # cashed. So for afternoon pace bets where implied < 40%, REQUIRE pace-
+    # confirmation: the observed trajectory must back us up, not just the model.
+    implied_pct = side_data["implied"]
+    is_afternoon = (not is_next_day and 12 <= now_local_check.hour < 20)
+    if (is_afternoon and best == "NO" and not asos_yes
+            and implied_pct < 40.0 and not pace_confirmed):
+        print(f"[v3.36] {cc} CONTRARIAN BLOCK: implied={implied_pct}% < 40% "
+              f"and not pace-confirmed — market disagrees, model likely wrong "
+              f"(model={side_data['prob']}%)")
+        return None
+
     city    = CITY_COORDS[cc][2]
     day_tag = "tmrw" if is_next_day else "today"
     print(f"[scan] {city} [{kind}/{day_tag}/{best}/{category}]: model={side_data['prob']}% "
@@ -2158,10 +2173,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.35")
-    print(f"   v3.35: CRITICAL blend fix — Wethr models drive the mean")
-    print(f"          (ensemble was dragging mean away from actual forecasts)")
-    print(f"          (v3.34: dup fix; v3.33: overnight ASOS; v3.32: Dev tier)")
+    print("🌡️  Kalshi Weather Bot v3.36")
+    print(f"   v3.36: Contrarian guard — low-implied (<40%) pace bets need pace-confirm")
+    print(f"          (market usually right when it strongly disagrees with model)")
+    print(f"          (v3.35: blend fix; v3.34: dup fix; v3.32: Dev tier)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
