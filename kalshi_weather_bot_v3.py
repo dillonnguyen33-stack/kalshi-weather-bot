@@ -1,16 +1,19 @@
 """
-Kalshi Weather Temperature Bot — v3.30
+Kalshi Weather Temperature Bot — v3.31
 
-Changes from v3.29:
-  v3.30 — Live liquidity follow-up on every alert:
-           After each alert, posts a follow-up message with the live
-           Kalshi orderbook for that ticker on the side being bet:
-             • Best price (cents) you'd pay to take
-             • Liquidity available at that best price ($ / contracts)
-             • Total resting liquidity on that side
-           One extra orderbook API call per alert (fine given lower volume).
+Changes from v3.30:
+  v3.31 — Liquidity bug fix + pace_confirmed as its own category:
+           1. Fixed the orderbook fetcher — Kalshi's format is orderbook_fp
+              with yes_dollars/no_dollars arrays of [price_dollars, count]
+              strings (e.g. ["0.4200","13.00"]), not orderbook.yes/no in
+              integer cents. This was why every alert said "order book
+              unavailable". Now shows real best price + $ liquidity.
+           2. pace_confirmed is now its own bet category (was lumped into
+              'pacing'). Scoreboard breaks down into 4 types: overnight,
+              morning, pacing, pace_confirmed — so the highest-confidence
+              bets are tracked separately from regular afternoon ones.
 
-  (v3.29 — overnight spread widening, long-lead gap, per-city cap;
+  (v3.30 — liquidity follow-up; v3.29 — overnight fixes + per-city cap;
    v3.28 — adaptive pace-confirm; v3.27 — categories + sizing)
 """
 
@@ -378,14 +381,15 @@ def get_city_tz(city_code: str) -> ZoneInfo:
 def get_bet_category(city_code: str, is_next_day: bool, pace_confirmed: bool = False) -> str:
     """
     Categorize a bet by city local time of day.
-      overnight = 8pm-6am
-      morning   = 6am-12pm
-      pacing    = 12pm-8pm
-    Next-day bets are always tagged by the time they fire.
-    pace_confirmed bets get the 'pacing' tag regardless.
+      overnight       = 8pm-6am
+      morning         = 6am-12pm
+      pacing          = 12pm-8pm (afternoon, not trajectory-confirmed)
+      pace_confirmed  = afternoon bet where observed trajectory confirms it
+    pace_confirmed is its own category so the scoreboard can separate the
+    highest-confidence bets from regular afternoon ones.
     """
     if pace_confirmed:
-        return "pacing"
+        return "pace_confirmed"
     hour = datetime.now(get_city_tz(city_code)).hour
     if 6 <= hour < 12:
         return "morning"
@@ -396,14 +400,16 @@ def get_bet_category(city_code: str, is_next_day: bool, pace_confirmed: bool = F
 
 # Discord embed colors by category
 CATEGORY_COLORS = {
-    "overnight": 0x5865F2,  # indigo
-    "morning":   0x1a6b3a,  # green
-    "pacing":    0xe67e22,  # orange
+    "overnight":      0x5865F2,  # indigo
+    "morning":        0x1a6b3a,  # green
+    "pacing":         0xe67e22,  # orange
+    "pace_confirmed": 0xf1c40f,  # gold
 }
 CATEGORY_EMOJI = {
-    "overnight": "🌙",
-    "morning":   "🌅",
-    "pacing":    "📈",
+    "overnight":      "🌙",
+    "morning":        "🌅",
+    "pacing":         "📈",
+    "pace_confirmed": "✅",
 }
 
 
@@ -1264,47 +1270,62 @@ def post_discord(webhook, content, embeds=None):
     except Exception as e:
         print(f"[discord] {e}")
 
-# ── ORDERBOOK / LIQUIDITY (v3.30) ─────────────────────────────────────────────
+# ── ORDERBOOK / LIQUIDITY (v3.30, fixed format v3.31) ─────────────────────────
 def fetch_orderbook_liquidity(ticker: str, side: str) -> dict | None:
     """
-    Fetch the Kalshi orderbook for a ticker and compute, for the given side
-    (YES or NO), the best price you'd pay to take, the liquidity resting at
-    that best price, and the total resting liquidity on that side.
+    Fetch the Kalshi orderbook and compute, for the given side (YES or NO),
+    the best take price, liquidity at that price, and total resting liquidity.
 
-    Kalshi orderbook returns 'yes' and 'no' arrays of [price_cents, quantity]
-    resting bids. To TAKE the YES side you cross against resting NO bids
-    (your fill price = 100 - no_bid_price). To take NO you cross against
-    resting YES bids (fill price = 100 - yes_bid_price). We surface the best
-    available take price and the contract quantity (=$ at $1 notional).
+    Kalshi response format (orderbook_fp):
+      { "orderbook_fp": {
+          "yes_dollars": [["0.4200","13.00"], ...],   # YES bids, price+count strings
+          "no_dollars":  [["0.5600","10.00"], ...] }}  # NO bids
+    Arrays are ordered worst→best, so the BEST bid is the LAST element.
+
+    To TAKE the YES side, you cross the best NO bid → pay (1.00 - best_no_bid).
+    To TAKE the NO side,  you cross the best YES bid → pay (1.00 - best_yes_bid).
     """
     try:
-        r = requests.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook",
-                         params={"depth": 100}, timeout=8)
+        r = requests.get(f"{KALSHI_BASE}/markets/{ticker}/orderbook", timeout=8)
         r.raise_for_status()
-        ob = r.json().get("orderbook", {})
+        ob = r.json().get("orderbook_fp", {})
 
-        # The book lists resting bids on each side as [price, qty]
-        yes_bids = ob.get("yes") or []
-        no_bids  = ob.get("no")  or []
+        yes_bids = ob.get("yes_dollars") or []
+        no_bids  = ob.get("no_dollars")  or []
 
-        # To take YES, we lift the best NO bid → pay (100 - no_bid_price)
-        # To take NO,  we lift the best YES bid → pay (100 - yes_bid_price)
+        # Opposing side we cross to take our position
         opposing = no_bids if side == "YES" else yes_bids
         if not opposing:
             return None
 
-        # Each entry is [price_cents, quantity]; best opposing bid = highest price
-        opposing_sorted = sorted(opposing, key=lambda x: -x[0])
-        best_opp_price, best_opp_qty = opposing_sorted[0][0], opposing_sorted[0][1]
+        # Parse to (price_dollars, count) floats; best bid = highest price
+        parsed = []
+        for entry in opposing:
+            try:
+                price = float(entry[0])
+                count = float(entry[1])
+                parsed.append((price, count))
+            except (ValueError, IndexError, TypeError):
+                continue
+        if not parsed:
+            return None
 
-        take_price = 100 - best_opp_price  # cents you'd pay to take your side
-        liq_at_best = best_opp_qty         # contracts available at best price
-        total_liq   = sum(q for _, q in opposing_sorted)  # all resting on this side
+        parsed.sort(key=lambda x: -x[0])  # best (highest) bid first
+        best_opp_price, best_opp_qty = parsed[0]
+
+        take_price_cents = round((1.0 - best_opp_price) * 100)
+        liq_at_best      = best_opp_qty
+        total_liq        = sum(c for _, c in parsed)
+        # Dollar value at best price = contracts × take_price
+        dollars_at_best  = liq_at_best * (take_price_cents / 100)
+        dollars_total    = total_liq   * (take_price_cents / 100)
 
         return {
-            "best_price_cents": take_price,
+            "best_price_cents": take_price_cents,
             "liq_at_best":      liq_at_best,
             "total_liq":        total_liq,
+            "dollars_at_best":  dollars_at_best,
+            "dollars_total":    dollars_total,
         }
     except Exception as e:
         print(f"[orderbook] {ticker}: {e}")
@@ -1314,16 +1335,17 @@ def format_liquidity_message(city: str, subtitle: str, side: str,
                              liq: dict | None) -> str:
     """Build the follow-up message text with price + liquidity."""
     if liq is None:
-        return f"💧 **{city} — {subtitle}** | order book unavailable"
-    bp   = liq["best_price_cents"]
-    lab  = liq["liq_at_best"]
-    tot  = liq["total_liq"]
-    # At $1 notional per contract, quantity ≈ dollars
+        return f"💧 **{city} — {subtitle}** | no resting {side} liquidity"
+    bp  = liq["best_price_cents"]
+    lab = liq["liq_at_best"]
+    tot = liq["total_liq"]
+    dab = liq["dollars_at_best"]
+    dt  = liq["dollars_total"]
     return (
         f"💧 **{city} liquidity** ({side})\n"
         f"• Best price: **{bp}¢**\n"
-        f"• Available at {bp}¢: **${lab:,.0f}** ({lab:,} contracts)\n"
-        f"• Total resting on {side} side: **${tot:,.0f}** ({tot:,} contracts)"
+        f"• At {bp}¢: **${dab:,.0f}** ({lab:,.0f} contracts)\n"
+        f"• Total {side} side: **${dt:,.0f}** ({tot:,.0f} contracts)"
     )
 
 def recommend_units(ev_pct, confidence, afd_hit, is_fire, is_next_day,
@@ -1370,9 +1392,10 @@ def build_embed(market, forecast, ev_data, obs_high, afd_hit,
     color = CATEGORY_COLORS.get(category, 0x854f0b)
     if asos_yes: color = 0x0099ff  # blue for ASOS-confirmed YES
 
-    cat_label = f"{CATEGORY_EMOJI.get(category,'')} {category.upper()}"
     if pace_confirmed:
-        cat_label += " ✓PACE-CONFIRMED"
+        cat_label = "✅ PACE-CONFIRMED"
+    else:
+        cat_label = f"{CATEGORY_EMOJI.get(category,'')} {category.upper()}"
 
     fields = [
         {"name":"Type",  "value":cat_label, "inline":True},
@@ -1872,7 +1895,7 @@ async def run_scan_async(force_codes=None):
           f"({same_day_count} same-day, {next_day_count} next-day, {yes_count} ASOS YES)")
 
     alerts = 0
-    cat_counts = {"overnight": 0, "morning": 0, "pacing": 0}
+    cat_counts = {"overnight": 0, "morning": 0, "pacing": 0, "pace_confirmed": 0}
     for res in filtered:
         market         = res["market"]
         forecast       = res["forecast"]
@@ -1918,7 +1941,7 @@ async def run_scan_async(force_codes=None):
 
     msg = (f"📊 **Scan done** {ts} | {len(markets)} markets | "
            f"{len(valid_results)} raw | {alerts} posted "
-           f"(🌙{cat_counts['overnight']} 🌅{cat_counts['morning']} 📈{cat_counts['pacing']})")
+           f"(🌙{cat_counts['overnight']} 🌅{cat_counts['morning']} 📈{cat_counts['pacing']} ✅{cat_counts['pace_confirmed']})")
     if force_codes: msg += f" | triggered: {', '.join(force_codes)}"
     post_discord(DISCORD_LOG_WEBHOOK, msg)
     print(f"[scan] Done — {alerts} posted")
@@ -2003,9 +2026,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.30")
-    print(f"   v3.30: Live liquidity follow-up on every alert (price + depth)")
-    print(f"          (v3.29: overnight fixes + per-city cap; v3.28: adaptive pace)")
+    print("🌡️  Kalshi Weather Bot v3.31")
+    print(f"   v3.31: Fixed liquidity orderbook format (orderbook_fp/dollars)")
+    print(f"          pace_confirmed is now its own scoreboard category")
+    print(f"          (v3.30: liquidity follow-up; v3.29: overnight + city cap)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
