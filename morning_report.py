@@ -87,14 +87,35 @@ def run_daily_report(cur, yesterday):
         result = "✅" if correct_b == 1 else "❌"
         actual_s = f"{actual:.0f}°F" if actual is not None else "?"
 
-        # Describe the bucket/threshold
-        if kind == "B":
-            lo = thresh - 0.5
-            hi = thresh + 0.5
-            bucket_s = f"{lo:.0f}-{hi:.0f}°"
-        else:
-            bucket_s = f"≥{thresh:.0f}°" if side == "YES" else f"<{thresh:.0f}°"
+        # Bucket label: derive from the Kalshi ticker suffix when possible so
+        # the displayed range matches Kalshi exactly (avoids ±0.5 rounding
+        # artifacts that produced confusing labels like "92-92°"). Ticker ends
+        # in e.g. "-B91.5" (bucket floor .5 → 91-92°) or "-T90" (threshold).
+        bucket_s = None
+        if ticker and "-B" in ticker:
+            try:
+                bval = float(ticker.rsplit("-B", 1)[1])
+                # B-buckets are 2° wide; floor .5 means range is (b-0.5)-(b+0.5)
+                blo = bval - 0.5
+                bhi = bval + 0.5
+                bucket_s = f"{blo:.0f}-{bhi:.0f}°"
+            except (ValueError, IndexError):
+                bucket_s = None
+        elif ticker and "-T" in ticker:
+            try:
+                tval = float(ticker.rsplit("-T", 1)[1])
+                bucket_s = f"≥{tval:.0f}°" if side == "YES" else f"<{tval:.0f}°"
+            except (ValueError, IndexError):
+                bucket_s = None
 
+        if bucket_s is None:
+            # Fallback to stored threshold
+            if kind == "B":
+                bucket_s = f"{thresh-0.5:.0f}-{thresh+0.5:.0f}°"
+            else:
+                bucket_s = f"≥{thresh:.0f}°" if side == "YES" else f"<{thresh:.0f}°"
+
+        # Show whether the settled temp was inside/outside the bucket as a check
         bet_lines.append(
             f"{result} {emoji} `{code:<4}` {side} {bucket_s} → settled {actual_s}"
         )
