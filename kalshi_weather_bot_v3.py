@@ -1,19 +1,20 @@
 """
-Kalshi Weather Temperature Bot — v3.32
+Kalshi Weather Temperature Bot — v3.34
 
-Changes from v3.31:
-  v3.32 — Developer-tier Wethr features:
-           1. Push API for ALL stations (was capped at 5 on Professional).
-              Every city now gets real-time new_high events instead of
-              10-min polling, so afternoon pacing updates instantly
-              everywhere, not just the top 5.
-           2. Model Accuracy API auto-weighting — pulls each model's
-              trailing-30-day MAE per station and weights the blend by
-              real accuracy (inverse-MAE squared, 1-6 copies). Replaces
-              the previous fixed guesses (NBM 5x, NWS 3x, etc.). Falls
-              back to fixed weights for any model without accuracy data.
-           NOTE: Developer-tier only — requires the Developer API key.
-           No Professional fallback for Push-all or Model Accuracy.
+Changes from v3.33:
+  v3.34 — Cross-scan duplicate fix:
+           The same ticker was alerting twice in one night at different
+           prices (e.g. Seattle B73.5 at 9pm and 11:32pm) because the
+           dedup alert-key was anchored on 'today' (ET calendar date),
+           which rolled over at ET midnight and minted a fresh key for a
+           bet that was really the same settlement market. Alert keys and
+           the DB dedup query are now anchored on the SETTLEMENT date
+           (target_date) and the afternoon re-alert window is tightened to
+           2pm-8pm local. One ticker → one alert per settlement date (plus
+           at most one afternoon re-alert).
+
+  (v3.33 — overnight ASOS display fix; v3.32 — Dev tier Push-all +
+   Model Accuracy auto-weight; v3.31 — liquidity fix + categories)
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -1496,10 +1497,15 @@ def build_embed(market, forecast, ev_data, obs_high, afd_hit,
         {"name":"Half Kelly",     "value":f"{side_data['taker_hk']}%",       "inline":True},
         {"name":"Maker EV",       "value":f"+{m_ev}%",                       "inline":True},
     ]
-    if obs_high is not None and not is_next_day:
-        city_tz  = get_city_tz(city_code)
-        local_hr = datetime.now(city_tz).strftime("%H:%M")
+    # ASOS high only meaningful for same-day daytime bets. Overnight bets carry
+    # a stale prior-day reading, so suppress it to avoid confusion (v3.33).
+    _city_hour = datetime.now(get_city_tz(city_code)).hour
+    _is_overnight = (category == "overnight") or (_city_hour >= 20 or _city_hour < 6)
+    if obs_high is not None and not is_next_day and not _is_overnight:
+        local_hr = datetime.now(get_city_tz(city_code)).strftime("%H:%M")
         fields.append({"name":"ASOS high","value":f"{obs_high}°F @ {local_hr} local","inline":True})
+    elif _is_overnight and not is_next_day:
+        fields.append({"name":"ASOS high","value":"n/a (overnight — day not started)","inline":True})
     if is_next_day:
         fields.append({"name":"Market type","value":"📅 Next-day forecast","inline":True})
     if asos_yes:
@@ -1632,28 +1638,35 @@ async def scan_market_async(session, semaphore, market, today, afd_cities):
     city_tz_check   = get_city_tz(cc)
     now_local_check = datetime.now(city_tz_check)
 
-    # Alert key — afternoon window gets separate key for re-alerts
-    if not is_next_day and now_local_check.hour >= 14:
-        alert_key = f"{market['ticker']}_{today}_afternoon"
+    # Alert key — anchored to SETTLEMENT date (target_date), not 'today', so
+    # late-night bets for tomorrow's settlement don't get a fresh key after the
+    # ET midnight rollover. Afternoon (2pm-8pm local) gets a separate re-alert
+    # key; overnight and morning share one key per settlement date (v3.33).
+    _ck_hour = now_local_check.hour
+    if not is_next_day and 14 <= _ck_hour < 20:
+        alert_key = f"{market['ticker']}_{target_date}_afternoon"
     else:
-        alert_key = f"{market['ticker']}_{today}"
+        alert_key = f"{market['ticker']}_{target_date}"
 
     with _lock:
         if alert_key in posted_alert_keys:
             return None
 
-    # v3.21: DB dedup — check if ticker already logged for this settlement date
-    # This survives restarts unlike the in-memory set
+    # v3.21/v3.33: DB dedup — check if ticker already logged for this settlement
+    # date. Anchored on market_date (settlement) so it survives ET midnight
+    # rollover and restarts. Afternoon re-alerts allowed once per afternoon.
     if BIAS_LOGGING:
         try:
             import psycopg2
             conn = psycopg2.connect(os.environ.get("DATABASE_URL", ""))
             cur  = conn.cursor()
-            # For afternoon re-alerts, check if afternoon entry exists
             if "afternoon" in alert_key:
+                # Only re-alert if no afternoon-window entry exists for this
+                # settlement date (compare against 2pm local ~ logged_at time).
                 cur.execute(
-                    "SELECT 1 FROM predictions WHERE ticker = %s AND logged_at > %s LIMIT 1",
-                    (market["ticker"], f"{today}T14:00:00")
+                    "SELECT 1 FROM predictions WHERE ticker = %s AND market_date = %s "
+                    "AND bet_category IN ('pacing','pace_confirmed') LIMIT 1",
+                    (market["ticker"], str(target_date))
                 )
             else:
                 cur.execute(
@@ -2113,9 +2126,9 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.32")
-    print(f"   v3.32: Developer tier — Push API all {len(WETHR_PUSH_STATIONS)} stations")
-    print(f"          Model Accuracy API auto-weighting (real 30-day MAE)")
+    print("🌡️  Kalshi Weather Bot v3.34")
+    print(f"   v3.34: Cross-scan duplicate fix (alert key on settlement date)")
+    print(f"          (v3.33: overnight ASOS fix; v3.32: Dev tier features)")
     print(f"          (v3.31: liquidity fix + pace_confirmed category)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
