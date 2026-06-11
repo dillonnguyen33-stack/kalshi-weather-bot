@@ -252,17 +252,21 @@ def calibration_report(city_filter=None, days=90):
     conn = get_conn()
     try:
         cur = conn.cursor()
+        # market_date is TEXT and may contain dates in mixed formats or with a
+        # time component. Cast the leading 10 chars (YYYY-MM-DD) to DATE for a
+        # correct comparison instead of fragile string comparison.
         query = """
             SELECT city_code, city_name, model_prob, best_side, taker_ev,
                    model_correct, clv, ensemble_mean, spread, market_date, ticker
             FROM predictions
-            WHERE settled = 1 AND market_date >= %s
+            WHERE settled = 1
+              AND NULLIF(LEFT(market_date, 10), '')::date >= %s::date
         """
         params = [cutoff]
         if city_filter:
             query += " AND city_code = %s"
             params.append(city_filter.upper())
-        query += " ORDER BY market_date"
+        query += " ORDER BY NULLIF(LEFT(market_date, 10), '')::date"
         cur.execute(query, params)
         rows = cur.fetchall()
     finally:
@@ -332,7 +336,8 @@ def calibration_report(city_filter=None, days=90):
             SELECT bet_category, COUNT(*),
                    SUM(CASE WHEN model_correct=1 THEN 1 ELSE 0 END)
             FROM predictions
-            WHERE settled=1 AND market_date >= %s
+            WHERE settled=1
+              AND NULLIF(LEFT(market_date,10),'')::date >= %s::date
             GROUP BY bet_category
         """, (cutoff,))
         cat_rows = cur.fetchall()
@@ -341,11 +346,35 @@ def calibration_report(city_filter=None, days=90):
 
     if cat_rows:
         print(f"\n{'─'*60}")
-        print(f"{'Category':<15} {'N':>4} {'Acc%':>6}")
+        print(f"{'Category':<16} {'N':>4} {'Acc%':>6}")
         print(f"{'─'*60}")
-        for cat, n, c in cat_rows:
+        for cat, n, c in sorted(cat_rows, key=lambda x: -(x[1] or 0)):
             acc = (c or 0) / n * 100 if n else 0
-            print(f"{cat or 'none':<15} {n:>4} {acc:>5.1f}%")
+            print(f"{(cat or 'none'):<16} {n:>4} {acc:>5.1f}%")
+
+    # ── BY SIDE (NO vs YES) ───────────────────────────────────────────────────
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT best_side, COUNT(*),
+                   SUM(CASE WHEN model_correct=1 THEN 1 ELSE 0 END)
+            FROM predictions
+            WHERE settled=1
+              AND NULLIF(LEFT(market_date,10),'')::date >= %s::date
+            GROUP BY best_side
+        """, (cutoff,))
+        side_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if side_rows:
+        print(f"\n{'─'*60}")
+        print(f"{'Side':<16} {'N':>4} {'Acc%':>6}")
+        print(f"{'─'*60}")
+        for sd, n, c in side_rows:
+            acc = (c or 0) / n * 100 if n else 0
+            print(f"{(sd or 'none'):<16} {n:>4} {acc:>5.1f}%")
 
     print(f"{'='*60}\n")
 
