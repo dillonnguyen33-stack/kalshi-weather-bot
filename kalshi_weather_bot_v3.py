@@ -1,20 +1,19 @@
 """
-Kalshi Weather Temperature Bot — v3.31
+Kalshi Weather Temperature Bot — v3.32
 
-Changes from v3.30:
-  v3.31 — Liquidity bug fix + pace_confirmed as its own category:
-           1. Fixed the orderbook fetcher — Kalshi's format is orderbook_fp
-              with yes_dollars/no_dollars arrays of [price_dollars, count]
-              strings (e.g. ["0.4200","13.00"]), not orderbook.yes/no in
-              integer cents. This was why every alert said "order book
-              unavailable". Now shows real best price + $ liquidity.
-           2. pace_confirmed is now its own bet category (was lumped into
-              'pacing'). Scoreboard breaks down into 4 types: overnight,
-              morning, pacing, pace_confirmed — so the highest-confidence
-              bets are tracked separately from regular afternoon ones.
-
-  (v3.30 — liquidity follow-up; v3.29 — overnight fixes + per-city cap;
-   v3.28 — adaptive pace-confirm; v3.27 — categories + sizing)
+Changes from v3.31:
+  v3.32 — Developer-tier Wethr features:
+           1. Push API for ALL stations (was capped at 5 on Professional).
+              Every city now gets real-time new_high events instead of
+              10-min polling, so afternoon pacing updates instantly
+              everywhere, not just the top 5.
+           2. Model Accuracy API auto-weighting — pulls each model's
+              trailing-30-day MAE per station and weights the blend by
+              real accuracy (inverse-MAE squared, 1-6 copies). Replaces
+              the previous fixed guesses (NBM 5x, NWS 3x, etc.). Falls
+              back to fixed weights for any model without accuracy data.
+           NOTE: Developer-tier only — requires the Developer API key.
+           No Professional fallback for Push-all or Model Accuracy.
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -506,15 +505,21 @@ WETHR_STATIONS = {
     "SA":  "KSAT", "MN":  "KMSP", "NO":  "KMSY",
 }
 
-# Top 5 cities for Push API (Professional tier limit)
-WETHR_PUSH_STATIONS = ["KHOU", "KPHX", "KMIA", "KDFW", "KMDW"]
+# Push API — Developer tier supports ALL stations (was 5 on Professional)
+WETHR_PUSH_STATIONS = list(WETHR_STATIONS.values())
 
 # Reverse map: Wethr station → city code (for Push API)
 WETHR_STATION_TO_CITY = {v: k for k, v in WETHR_STATIONS.items()}
 
 WETHR_FORECAST_BASE = "https://wethr.net/api/v2/forecasts.php"
 WETHR_NWS_BASE      = "https://wethr.net/api/v2/nws_forecasts.php"
+WETHR_ACCURACY_BASE = "https://wethr.net/api/v2/model_accuracy.php"  # Developer tier
 WETHR_MODELS        = ["HRRR", "NBM", "RAP", "NAM4KM", "GFS", "ECMWF-IFS"]
+
+# Model Accuracy cache — refreshed once per scan cycle, drives auto-weighting
+_model_accuracy_cache: dict = {}   # {station: {model: mae_f}}
+_model_accuracy_ts: dict    = {}
+MODEL_ACCURACY_TTL = 21600  # 6 hours — accuracy stats change slowly
 
 # Cache NWS forecasts to avoid rate limiting (refresh every 2 hours)
 _nws_cache: dict = {}
@@ -632,6 +637,68 @@ def fetch_wethr_all_models(station: str, target_date: str, cache_only: bool = Fa
         if nws is not None:
             results["NWS"] = nws
     return results
+
+def fetch_model_accuracy(station: str) -> dict:
+    """
+    Fetch per-model accuracy (MAE in °F) for a station from Wethr's
+    Model Accuracy API (Developer tier). Returns {model: mae_f}.
+    Lower MAE = more accurate model. Cached 6h.
+    """
+    if not WETHR_API_KEY or not station:
+        return {}
+    now = time.time()
+    if station in _model_accuracy_cache and \
+       now - _model_accuracy_ts.get(station, 0) < MODEL_ACCURACY_TTL:
+        return _model_accuracy_cache[station]
+    try:
+        r = requests.get(WETHR_ACCURACY_BASE, params={
+            "station_code": station,
+            "window":       "30d",   # 30-day trailing accuracy
+            "metric":       "mae",
+        }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
+        if r.status_code == 429:
+            time.sleep(5)
+            r = requests.get(WETHR_ACCURACY_BASE, params={
+                "station_code": station, "window": "30d", "metric": "mae",
+            }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        # Expected: {"models": {"HRRR": {"mae_f": 1.8}, "NBM": {"mae_f": 1.4}, ...}}
+        accuracy = {}
+        models_obj = data.get("models", {})
+        for model, stats in models_obj.items():
+            mae = stats.get("mae_f") if isinstance(stats, dict) else None
+            if mae is not None:
+                accuracy[model] = float(mae)
+        _model_accuracy_cache[station] = accuracy
+        _model_accuracy_ts[station]    = now
+        if accuracy:
+            best = min(accuracy, key=accuracy.get)
+            print(f"[accuracy] {station}: {len(accuracy)} models, best={best} "
+                  f"(MAE {accuracy[best]:.1f}°F)")
+        return accuracy
+    except Exception as e:
+        print(f"[accuracy] {station}: {e}")
+        return {}
+
+def accuracy_to_weights(accuracy: dict) -> dict:
+    """
+    Convert per-model MAE into blend weights. Lower MAE → higher weight.
+    Uses inverse-MAE weighting: weight = (1 / mae)^2, normalized so the
+    best model gets a meaningful edge but no model is fully dropped.
+    Returns {model: weight_multiplier} where multiplier scales how many
+    copies of that model go into the blend (clamped 1-6).
+    """
+    if not accuracy:
+        return {}
+    weights = {}
+    inv = {m: (1.0 / max(mae, 0.3)) ** 2 for m, mae in accuracy.items()}
+    max_inv = max(inv.values()) if inv else 1.0
+    for model, v in inv.items():
+        # Scale to 1-6 copies; best model ~6, worst ~1
+        w = 1 + round(5 * (v / max_inv))
+        weights[model] = max(1, min(6, w))
+    return weights
 
 def calculate_model_pacing(wethr_models: dict, current_wethr_high: float | None) -> dict:
     """Calculate how each model is pacing vs live Wethr High."""
@@ -1084,20 +1151,37 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         print(f"[v3.26] {city_code} skipped: only {len(available)} models available (need 2)")
         return None
 
-    # ── BUILD BLEND ───────────────────────────────────────────────────────────
+    # ── BUILD BLEND (v3.32: accuracy-driven auto-weights) ─────────────────────
     all_members = list(gfs) + list(ecmwf_ens) + list(icon_ens)
 
+    # Pull per-model accuracy weights (cache-only during scan; prefetched).
+    accuracy = _model_accuracy_cache.get(station, {}) if station else {}
+    auto_w   = accuracy_to_weights(accuracy)
+
+    # Default fixed weights (used when accuracy data missing for a model)
+    fixed_w = {"NBM": 5, "NWS": 3, "ECMWF-IFS": 2, "HRRR": 2, "RAP": 2,
+               "NAM4KM": 1, "GFS": 1}
+
+    def w_for(model):
+        if model in auto_w:
+            return auto_w[model]
+        return fixed_w.get(model, 1)
+
     blend = list(all_members)
-    if wethr_nbm:   blend += [wethr_nbm] * 5
-    if nbm_prob:    blend += nbm_prob * 3
-    if wethr_nws:   blend += [wethr_nws] * 3   # NWS gets extra weight
-    if wethr_ecmwf: blend += [wethr_ecmwf, wethr_ecmwf]
-    if wethr_hrrr:  blend += [wethr_hrrr, wethr_hrrr]
-    if wethr_rap:   blend += [wethr_rap, wethr_rap]
-    if wethr_nam:   blend.append(wethr_nam)
-    if wethr_gfs:   blend.append(wethr_gfs)
+    if wethr_nbm:   blend += [wethr_nbm]   * w_for("NBM")
+    if nbm_prob:    blend += nbm_prob      * 3
+    if wethr_nws:   blend += [wethr_nws]   * w_for("NWS")
+    if wethr_ecmwf: blend += [wethr_ecmwf] * w_for("ECMWF-IFS")
+    if wethr_hrrr:  blend += [wethr_hrrr]  * w_for("HRRR")
+    if wethr_rap:   blend += [wethr_rap]   * w_for("RAP")
+    if wethr_nam:   blend += [wethr_nam]   * w_for("NAM4KM")
+    if wethr_gfs:   blend += [wethr_gfs]   * w_for("GFS")
     if tomorrow:    blend.append(tomorrow)
     if not blend:   return None
+
+    if auto_w:
+        wstr = " ".join(f"{m}:{w}" for m, w in sorted(auto_w.items(), key=lambda x:-x[1]))
+        print(f"[autoweight] {city_code} {wstr}")
 
     mean = sum(blend) / len(blend)
 
@@ -1864,6 +1948,9 @@ async def run_scan_async(force_codes=None):
             station = WETHR_STATIONS.get(cc)
             if not station:
                 continue
+            # Pre-fetch model accuracy for this station (cached 6h)
+            await asyncio.get_event_loop().run_in_executor(
+                None, fetch_model_accuracy, station)
             for ds in dates_needed:
                 # Check if already cached and fresh
                 sample_key = f"{station}_HRRR_{ds}"
@@ -2026,10 +2113,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.31")
-    print(f"   v3.31: Fixed liquidity orderbook format (orderbook_fp/dollars)")
-    print(f"          pace_confirmed is now its own scoreboard category")
-    print(f"          (v3.30: liquidity follow-up; v3.29: overnight + city cap)")
+    print("🌡️  Kalshi Weather Bot v3.32")
+    print(f"   v3.32: Developer tier — Push API all {len(WETHR_PUSH_STATIONS)} stations")
+    print(f"          Model Accuracy API auto-weighting (real 30-day MAE)")
+    print(f"          (v3.31: liquidity fix + pace_confirmed category)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
