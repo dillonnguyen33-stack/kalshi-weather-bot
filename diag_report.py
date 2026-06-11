@@ -89,6 +89,37 @@ def main():
     for k,(n,c) in sorted(city.items(), key=lambda x:-x[1][0])[:20]:
         print(f"{str(k):<10}{n:>6}{c/n*100:>7.1f}%")
 
+    # 8) NO BETS ONLY — the current bot is NO-only (YES disabled ~a week ago)
+    print("\n" + "=" * 60)
+    print("NO BETS ONLY (reflects current bot)")
+    print("=" * 60)
+    no_rows = [r for r in rows if r[2] == "NO"]
+    nt = len(no_rows)
+    nc = sum(1 for r in no_rows if r[3] == 1)
+    print(f"Total NO settled: {nt}")
+    print(f"NO accuracy: {nc}/{nt} = {nc/nt*100:.1f}%" if nt else "none")
+
+    # NO calibration buckets
+    print(f"\n{'Prob bucket':<14}{'Pred':>7}{'Actual%':>9}{'N':>6}{'Bias':>8}")
+    print("-" * 46)
+    for lo, hi in [(0.50,0.60),(0.60,0.70),(0.70,0.80),(0.80,0.90),(0.90,1.01)]:
+        b = [r for r in no_rows if r[1] is not None and lo <= r[1] < hi]
+        if not b: continue
+        n = len(b); wins = sum(1 for r in b if r[3]==1); wp = wins/n*100
+        mid = (lo+hi)/2*100
+        print(f"{int(lo*100)}-{int(hi*100)}%{'':<8}{mid:>6.0f}%{wp:>8.1f}%{n:>6}{wp-mid:>+7.1f}%")
+
+    # NO bets by city
+    print(f"\n{'City (NO)':<10}{'N':>6}{'Acc%':>8}")
+    print("-" * 26)
+    ncity = defaultdict(lambda:[0,0])
+    for r in no_rows:
+        ncity[r[0]][0]+=1
+        ncity[r[0]][1]+= (r[3] or 0)
+    for k,(n,c) in sorted(ncity.items(), key=lambda x:-x[1][0]):
+        flag = "  <-- weak" if c/n < 0.55 else ""
+        print(f"{str(k):<10}{n:>6}{c/n*100:>7.1f}%{flag}")
+
     conn.close()
 
 if __name__ == "__main__":
