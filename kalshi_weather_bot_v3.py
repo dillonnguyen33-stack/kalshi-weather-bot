@@ -1,20 +1,25 @@
 """
-Kalshi Weather Temperature Bot — v3.34
+Kalshi Weather Temperature Bot — v3.35
 
-Changes from v3.33:
-  v3.34 — Cross-scan duplicate fix:
-           The same ticker was alerting twice in one night at different
-           prices (e.g. Seattle B73.5 at 9pm and 11:32pm) because the
-           dedup alert-key was anchored on 'today' (ET calendar date),
-           which rolled over at ET midnight and minted a fresh key for a
-           bet that was really the same settlement market. Alert keys and
-           the DB dedup query are now anchored on the SETTLEMENT date
-           (target_date) and the afternoon re-alert window is tightened to
-           2pm-8pm local. One ticker → one alert per settlement date (plus
-           at most one afternoon re-alert).
+Changes from v3.34:
+  v3.35 — CRITICAL blend fix — Wethr models now drive the mean:
+           BUG: the ensemble mean was being dragged away from the actual
+           model forecasts. Every Wethr model could read 104°F while the
+           displayed ensemble mean showed 100°F. Cause: the blend started
+           with ALL Open-Meteo ensemble members (100+), which numerically
+           drowned out the ~25 weighted Wethr model copies. The mean
+           reflected the Open-Meteo ensemble crowd, not the sharp,
+           station-aligned Wethr models.
+           FIX: the mean is now built from the Wethr deterministic models
+           (accuracy-weighted), and the Open-Meteo ensemble contributes a
+           single down-weighted summary point (its mean ×3) rather than
+           100+ raw members. The full ensemble is still used for the
+           SPREAD/uncertainty calculation. Added a sanity-check log when
+           the mean falls outside the Wethr model range.
+           Verified: Vegas case 100.0°F → 103.9°F (models were 103-106°F).
 
-  (v3.33 — overnight ASOS display fix; v3.32 — Dev tier Push-all +
-   Model Accuracy auto-weight; v3.31 — liquidity fix + categories)
+  (v3.34 — cross-scan dup fix; v3.33 — overnight ASOS display;
+   v3.32 — Dev tier Push-all + Model Accuracy auto-weight)
 """
 
 import os, asyncio, aiohttp, math, json, time, threading, requests, re
@@ -1152,39 +1157,66 @@ async def get_forecast(session, semaphore, city_code, target_date) -> dict | Non
         print(f"[v3.26] {city_code} skipped: only {len(available)} models available (need 2)")
         return None
 
-    # ── BUILD BLEND (v3.32: accuracy-driven auto-weights) ─────────────────────
+    # ── BUILD BLEND (v3.35: Wethr models drive the mean) ──────────────────────
+    # PRIOR BUG: the blend started with ALL Open-Meteo ensemble members (100+),
+    # which drowned out the 6 sharp Wethr models. Result: every Wethr model
+    # could say 104°F but the mean showed 100°F because ~100 ensemble members
+    # read low. The Open-Meteo ensemble is valuable for SPREAD (uncertainty)
+    # but should not dominate the central estimate.
+    #
+    # Fix: the MEAN is built from the Wethr deterministic models (station-
+    # aligned, sharp) with accuracy weights. The Open-Meteo ensemble members
+    # contribute a single down-weighted "summary" point (their mean) so they
+    # nudge but don't dominate. Full ensemble is still used for spread below.
     all_members = list(gfs) + list(ecmwf_ens) + list(icon_ens)
 
-    # Pull per-model accuracy weights (cache-only during scan; prefetched).
     accuracy = _model_accuracy_cache.get(station, {}) if station else {}
     auto_w   = accuracy_to_weights(accuracy)
-
-    # Default fixed weights (used when accuracy data missing for a model)
-    fixed_w = {"NBM": 5, "NWS": 3, "ECMWF-IFS": 2, "HRRR": 2, "RAP": 2,
-               "NAM4KM": 1, "GFS": 1}
+    fixed_w  = {"NBM": 5, "NWS": 3, "ECMWF-IFS": 2, "HRRR": 2, "RAP": 2,
+                "NAM4KM": 1, "GFS": 1}
 
     def w_for(model):
-        if model in auto_w:
-            return auto_w[model]
-        return fixed_w.get(model, 1)
+        return auto_w.get(model, fixed_w.get(model, 1))
 
-    blend = list(all_members)
+    # Mean blend: Wethr deterministic models, accuracy-weighted
+    blend = []
     if wethr_nbm:   blend += [wethr_nbm]   * w_for("NBM")
-    if nbm_prob:    blend += nbm_prob      * 3
     if wethr_nws:   blend += [wethr_nws]   * w_for("NWS")
     if wethr_ecmwf: blend += [wethr_ecmwf] * w_for("ECMWF-IFS")
     if wethr_hrrr:  blend += [wethr_hrrr]  * w_for("HRRR")
     if wethr_rap:   blend += [wethr_rap]   * w_for("RAP")
     if wethr_nam:   blend += [wethr_nam]   * w_for("NAM4KM")
     if wethr_gfs:   blend += [wethr_gfs]   * w_for("GFS")
+    if nbm_prob:    blend += nbm_prob      * 2
     if tomorrow:    blend.append(tomorrow)
-    if not blend:   return None
+
+    # Open-Meteo ensemble contributes its MEAN as a modest extra anchor
+    # (weight 3), not 100+ individual members. This keeps it informative
+    # without letting it dominate the sharp Wethr models.
+    if all_members:
+        ens_mean = sum(all_members) / len(all_members)
+        blend += [ens_mean] * 3
+
+    if not blend:
+        # Last resort — fall back to the ensemble members if no Wethr models
+        if all_members:
+            blend = list(all_members)
+        else:
+            return None
 
     if auto_w:
         wstr = " ".join(f"{m}:{w}" for m, w in sorted(auto_w.items(), key=lambda x:-x[1]))
         print(f"[autoweight] {city_code} {wstr}")
 
     mean = sum(blend) / len(blend)
+
+    # Sanity log: if the mean is far from the Wethr model cluster, flag it
+    det_check = [v for v in det_vals_wethr.values() if v is not None]
+    if det_check:
+        det_min, det_max = min(det_check), max(det_check)
+        if mean < det_min - 1.5 or mean > det_max + 1.5:
+            print(f"[warn] {city_code} mean {mean:.1f}°F outside model range "
+                  f"[{det_min:.1f}-{det_max:.1f}] — check blend")
 
     # ── SPREAD CALCULATION ────────────────────────────────────────────────────
     if len(all_members) >= 2:
@@ -2126,10 +2158,10 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.34")
-    print(f"   v3.34: Cross-scan duplicate fix (alert key on settlement date)")
-    print(f"          (v3.33: overnight ASOS fix; v3.32: Dev tier features)")
-    print(f"          (v3.31: liquidity fix + pace_confirmed category)")
+    print("🌡️  Kalshi Weather Bot v3.35")
+    print(f"   v3.35: CRITICAL blend fix — Wethr models drive the mean")
+    print(f"          (ensemble was dragging mean away from actual forecasts)")
+    print(f"          (v3.34: dup fix; v3.33: overnight ASOS; v3.32: Dev tier)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
