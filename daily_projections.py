@@ -170,8 +170,12 @@ def build_projection(city_code, wethr_models, ens, target_date):
     if not det and not ens:
         return None
 
-    # Blend — same weights as main bot
-    blend = list(ens)
+    # Blend (v3.35 fix): Wethr models drive the mean, NOT the Open-Meteo
+    # ensemble crowd. Previously this started with all ensemble members, which
+    # dragged the mean 3-4°F off when models and ensemble diverged. Now the
+    # ensemble contributes only its mean as a modest anchor; full ensemble is
+    # still used for the spread below.
+    blend = []
     if det.get("NBM"):       blend += [det["NBM"]] * 5
     if det.get("NWS"):       blend += [det["NWS"]] * 3
     if det.get("ECMWF-IFS"): blend += [det["ECMWF-IFS"], det["ECMWF-IFS"]]
@@ -180,8 +184,17 @@ def build_projection(city_code, wethr_models, ens, target_date):
     if det.get("NAM4KM"):    blend.append(det["NAM4KM"])
     if det.get("GFS"):       blend.append(det["GFS"])
 
+    # Open-Meteo ensemble contributes its MEAN as a modest anchor (×3),
+    # not 100+ individual members.
+    if ens:
+        ens_mean = sum(ens) / len(ens)
+        blend += [ens_mean] * 3
+
     if not blend:
-        return None
+        if ens:
+            blend = list(ens)
+        else:
+            return None
 
     mean = sum(blend) / len(blend)
 
