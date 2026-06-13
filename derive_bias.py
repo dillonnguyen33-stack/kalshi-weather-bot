@@ -117,41 +117,66 @@ def derive_from_predictions(cur):
         print(f"    {name:24s} {typ}")
 
     # Resolve the columns we need, tolerating naming variations.
+    # IMPORTANT: actual_high_f is the SETTLED TEMPERATURE. Do NOT use the
+    # column literally named "settled" — that is a 0/1 settled-yet FLAG.
     city_col    = pick_column(cols, "city_code", "city", "code")
-    settled_col = pick_column(cols, "settled_high", "actual_high", "settled",
-                              "final_high", "obs_high")
-    mean_col    = pick_column(cols, "corrected_mean", "ensemble_mean",
-                              "model_mean", "mean")
+    actual_col  = pick_column(cols, "actual_high_f", "settled_high",
+                              "actual_high", "final_high", "obs_high")
+    # The bot bet on the CORRECTED mean = ensemble_mean + bias_applied.
+    # We compare the outcome against that, so the new bias replaces the old.
+    ens_col     = pick_column(cols, "ensemble_mean", "model_mean", "mean")
+    bias_col    = pick_column(cols, "bias_applied")
+    # Flag that tells us a row has actually settled.
+    settled_flag = pick_column(cols, "settled")
     date_col    = pick_column(cols, "market_date", "target_date", "date",
                               "logged_at", "created_at")
 
-    missing = [n for n, c in [("city", city_col), ("settled", settled_col),
-                              ("corrected_mean", mean_col), ("date", date_col)]
+    missing = [n for n, c in [("city", city_col),
+                              ("actual_high_f", actual_col),
+                              ("ensemble_mean", ens_col),
+                              ("date", date_col)]
                if c is None]
     if missing:
         print(f"\n[predictions] Missing required column(s): {missing}")
         print("Edit pick_column() candidates to match your schema, then rerun.")
         return {}, None
 
-    print(f"\n[predictions] using: city={city_col} settled={settled_col} "
-          f"mean={mean_col} date={date_col}")
+    bias_expr = f"COALESCE({bias_col}, 0)" if bias_col else "0"
+    flag_clause = f"AND {settled_flag} = 1" if settled_flag else ""
+    print(f"\n[predictions] using: city={city_col} actual={actual_col} "
+          f"mean=({ens_col} + {bias_expr}) date={date_col} "
+          f"settled_flag={settled_flag or 'none'}")
 
-    # Only rows where the bet actually settled (settled high is present).
+    # Only rows that have actually settled (settled flag = 1) and have a
+    # real settled high temperature recorded.
     cur.execute(f"""
-        SELECT {city_col}, {mean_col}, {settled_col},
+        SELECT {city_col},
+               ({ens_col} + {bias_expr}) AS corrected_mean,
+               {actual_col} AS actual_high,
                EXTRACT(MONTH FROM {date_col}::timestamp)::int AS mon
         FROM predictions
-        WHERE {settled_col} IS NOT NULL
-          AND {mean_col}    IS NOT NULL
+        WHERE {actual_col} IS NOT NULL
+          AND {ens_col}    IS NOT NULL
+          {flag_clause}
     """)
     rows = cur.fetchall()
 
     errors = defaultdict(lambda: defaultdict(list))  # city -> month0 -> [err,...]
-    for city, mean_v, settled_v, mon in rows:
-        if city is None or mean_v is None or settled_v is None or not mon:
+    skipped = 0
+    for city, corrected_mean, actual, mon in rows:
+        if city is None or corrected_mean is None or actual is None or not mon:
             continue
-        err = float(settled_v) - float(mean_v)
+        # Sanity guard: a real high temp is roughly -50..140F. If actual is 0/1
+        # we picked the wrong column — refuse rather than emit garbage.
+        if not (-50.0 <= float(actual) <= 140.0):
+            skipped += 1
+            continue
+        err = float(actual) - float(corrected_mean)
         errors[city][mon - 1].append(err)
+
+    if skipped:
+        print(f"[predictions] WARNING: skipped {skipped} rows with out-of-range "
+              f"actual_high (column may be wrong) — investigate if large.")
 
     bias = {}
     for city, by_month in errors.items():
@@ -207,6 +232,13 @@ def build_new_table(derived):
             new_table[city] = list(DEFAULT_BIAS)
         for m0, (mean_err, n) in by_month.items():
             old_val = new_table[city][m0]
+            # Sanity: a real monthly bias should be small (a few degrees).
+            # If it's wild, something is wrong upstream — keep the old value
+            # and shout, rather than poison the table.
+            if abs(mean_err) > 15.0:
+                notes.append(f"  {city:4s} {MONTHS[m0]}: REJECTED {mean_err:+.1f} "
+                             f"(implausible, kept {old_val:+.1f}) — check columns")
+                continue
             if n >= MIN_SAMPLES_PER_MONTH:
                 new_table[city][m0] = mean_err
                 strength = "STRONG" if n >= STRONG_SAMPLES else "ok"
