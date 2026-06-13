@@ -1,22 +1,24 @@
 """
-Kalshi Weather Temperature Bot — v3.36
+Kalshi Weather Temperature Bot — v3.37
 
-Changes from v3.35:
-  v3.36 — Contrarian guard on pace bets (sharpness fix):
-           Observed pattern: afternoon pace bets where Kalshi implied was
-           HIGH (>60%) consistently cashed, while bets where implied was
-           LOW (~25-30%) consistently missed. When the market strongly
-           disagrees with the model (implied < 40% for our side), the
-           market is usually pricing something the model misses — e.g.
-           Phoenix's large afternoon heating potential on a hot day, which
-           the heating-profile average underestimates.
-           FIX: afternoon NO pace bets with implied < 40% now REQUIRE
-           pace-confirmation (observed trajectory must back them up). If
-           the market thinks the bucket is likely and the live obs don't
-           confirm our NO, the bet is blocked rather than fired on model
-           confidence alone. High-implied bets (market agrees) unaffected.
+Changes from v3.36:
+  v3.37 — Bias table re-derived from logged outcomes + dead-key fix:
+           1. CITY_BIAS_F was keyed with SHORT codes (AT/DA/HO/SE/SF/PH/BO)
+              that never matched the city codes used at runtime in CITY_COORDS
+              (ATL/DAL/HOU/SEA/SFO/PHI/BOS). Those seven cities were silently
+              running on DEFAULT_BIAS (zeros) — their hand-tuned values were
+              never applied. Keys are now the long forms that actually match.
+           2. June values re-derived from the bot's own settled predictions
+              via derive_bias.py (damped, floor=3). The model was running
+              ~2-3F COLD on hot inland/desert cities (settled highs landing in
+              the bucket we bet NO against, at the ceiling). New June bias:
+                ATL +1.41  DAL +1.25  HOU +1.25  SEA +2.43
+                PHX +1.02  LV  +1.53  AUS +0.47
+              AUS/OKC added as explicit keys.
+           Re-run derive_bias.py weekly; values sharpen as samples grow.
 
-  (v3.35 — blend fix: Wethr drives mean; v3.34 — cross-scan dup fix;
+  (v3.36 — contrarian guard on low-implied pace bets;
+   v3.35 — blend fix: Wethr drives mean; v3.34 — cross-scan dup fix;
    v3.33 — overnight ASOS display; v3.32 — Dev tier features)
 """
 
@@ -352,22 +354,30 @@ CITY_COORDS = {
 }
 
 # ── BIAS CORRECTIONS ──────────────────────────────────────────────────────────
+# Keys MUST match the city codes used in CITY_COORDS (long forms like ATL/DAL/
+# HOU/SEA/SFO/AUS/OKC). Earlier versions used short codes (AT/DA/HO/SE) that
+# never matched at runtime, so those cities silently ran on DEFAULT_BIAS (zeros).
+# June values derived from logged outcomes via derive_bias.py (damped). Other
+# months carry the prior hand-tuned values until enough data accrues to replace
+# them. Index 0 = January ... index 11 = December.
 CITY_BIAS_F = {
     "NY":  [ 0.8,  0.7,  0.5,  0.3,  0.2,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.7],
     "CHI": [ 1.2,  1.0,  0.8,  0.4,  0.2,  0.0, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
     "LAX": [-0.5, -0.4, -0.3, -0.2, -0.2, -0.3, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
     "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  2.5,  2.5,  2.5,  0.0,  0.1,  0.2,  0.3],
-    "PH":  [ 0.7,  0.6,  0.5,  0.3,  0.1,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.6],
-    "AT":  [ 0.5,  0.4,  0.3,  0.2,  0.1,  0.0, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
+    "PHI": [ 0.7,  0.6,  0.5,  0.3,  0.1,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.6],
+    "ATL": [ 0.5,  0.4,  0.3,  0.2,  0.1,  1.41, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
     "MN":  [ 1.5,  1.3,  1.0,  0.5,  0.2,  0.0, -0.5, -0.4,  0.0,  0.6,  1.0,  1.4],
-    "SF":  [-0.8, -0.7, -0.6, -0.5, -0.5, -0.6, -0.7, -0.7, -0.6, -0.5, -0.6, -0.7],
-    "DA":  [ 0.3,  0.2,  0.1,  0.0, -0.1, -0.3, -0.6, -0.5, -0.2,  0.0,  0.2,  0.3],
-    "BO":  [ 0.9,  0.8,  0.6,  0.4,  0.2,  0.0, -0.3, -0.2,  0.0,  0.4,  0.6,  0.8],
-    "PHX": [-0.4, -0.3, -0.2, -0.1,  0.0, -0.3, -0.8, -0.7, -0.3, -0.1, -0.2, -0.3],
+    "SFO": [-0.8, -0.7, -0.6, -0.5, -0.5, -0.6, -0.7, -0.7, -0.6, -0.5, -0.6, -0.7],
+    "DAL": [ 0.3,  0.2,  0.1,  0.0, -0.1,  1.25, -0.6, -0.5, -0.2,  0.0,  0.2,  0.3],
+    "BOS": [ 0.9,  0.8,  0.6,  0.4,  0.2,  0.0, -0.3, -0.2,  0.0,  0.4,  0.6,  0.8],
+    "PHX": [-0.4, -0.3, -0.2, -0.1,  0.0,  1.02, -0.8, -0.7, -0.3, -0.1, -0.2, -0.3],
     "DEN": [ 0.6,  0.5,  0.4,  0.2,  0.1,  0.0, -0.4, -0.3,  0.0,  0.3,  0.5,  0.6],
-    "SE":  [-0.3, -0.3, -0.2, -0.1,  0.0,  0.0, -0.2, -0.2, -0.1,  0.0, -0.2, -0.3],
-    "HO":  [ 0.2,  0.1,  0.0, -0.1, -0.2, -0.4, -0.6, -0.6, -0.3, -0.1,  0.1,  0.2],
-    "LV":  [-0.5, -0.4, -0.2,  0.0,  0.1, -0.2, -0.8, -0.7, -0.2,  0.0, -0.2, -0.4],
+    "SEA": [-0.3, -0.3, -0.2, -0.1,  0.0,  2.43, -0.2, -0.2, -0.1,  0.0, -0.2, -0.3],
+    "HOU": [ 0.2,  0.1,  0.0, -0.1, -0.2,  1.25, -0.6, -0.6, -0.3, -0.1,  0.1,  0.2],
+    "LV":  [-0.5, -0.4, -0.2,  0.0,  0.1,  1.53, -0.8, -0.7, -0.2,  0.0, -0.2, -0.4],
+    "AUS": [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.47,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
+    "OKC": [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
 }
 DEFAULT_BIAS = [0.0] * 12
 
@@ -445,19 +455,19 @@ CITY_KEYWORD_MAP = {
     "chicago":"CHI","windy city":"CHI",
     "los angeles":"LAX","socal":"LAX","l.a.":"LAX",
     "miami":"MIA","south florida":"MIA",
-    "philadelphia":"PH","philly":"PH",
-    "atlanta":"AT","atl":"AT",
+    "philadelphia":"PHI","philly":"PHI",
+    "atlanta":"ATL","atl":"ATL",
     "minneapolis":"MN","twin cities":"MN",
-    "san francisco":"SF","bay area":"SF",
-    "dallas":"DA","dfw":"DA","fort worth":"DA",
-    "boston":"BO","houston":"HO","detroit":"DE","seattle":"SE",
+    "san francisco":"SFO","bay area":"SFO",
+    "dallas":"DAL","dfw":"DAL","fort worth":"DAL",
+    "boston":"BOS","houston":"HOU","detroit":"DE","seattle":"SEA",
     "phoenix":"PHX","denver":"DEN","las vegas":"LV","san diego":"SD",
     "kansas city":"KC","st. louis":"SL","saint louis":"SL",
     "new orleans":"NO","nola":"NO","cleveland":"CL","pittsburgh":"PI",
     "baltimore":"BA","washington":"DC","d.c.":"DC","nashville":"OL",
     "memphis":"MEM","san antonio":"SA","austin":"AUS","portland":"PO",
     "salt lake":"SLC","charlotte":"AL","indianapolis":"IN","columbus":"COL",
-    "oklahoma city":"OK","okc":"OK","tucson":"TUC","el paso":"EL",
+    "oklahoma city":"OKC","okc":"OKC","tucson":"TUC","el paso":"EL",
     "milwaukee":"MIL","raleigh":"RAL","tampa":"TAM",
 }
 
@@ -918,13 +928,13 @@ def names_to_codes(cities: list[str]) -> list[str]:
 def wfo_to_city_codes(wfo: str) -> list[str]:
     mapping = {
         "OKX":["NY"],"LOT":["CHI","MIL"],"LOX":["LAX","SD"],
-        "MFL":["MIA","TAM"],"PHI":["PH","BA","DC"],"LWX":["BA","DC"],
-        "FFC":["AT"],"MPX":["MN"],"MTR":["SF"],"FWD":["DA"],"BOX":["BO"],
-        "HGX":["HO"],"DTX":["DE","CL"],"SEW":["SE"],"PSR":["PHX","TUC"],
+        "MFL":["MIA","TAM"],"PHI":["PHI","BA","DC"],"LWX":["BA","DC"],
+        "FFC":["ATL"],"MPX":["MN"],"MTR":["SFO"],"FWD":["DAL"],"BOX":["BOS"],
+        "HGX":["HOU"],"DTX":["DE","CL"],"SEW":["SEA"],"PSR":["PHX","TUC"],
         "BOU":["DEN"],"VEF":["LV"],"SGX":["SD"],"EAX":["KC"],"LSX":["SL"],
         "LIX":["NO"],"CLE":["CL","PI"],"PBZ":["PI"],"OHX":["OL"],
         "MEG":["MEM"],"EWX":["SA","AUS"],"PQR":["PO"],"SLC":["SLC"],
-        "GSP":["AL","RAL"],"IND":["IN"],"ILN":["COL"],"OUN":["OK"],
+        "GSP":["AL","RAL"],"IND":["IN"],"ILN":["COL"],"OUN":["OKC"],
         "TWC":["TUC"],"EPZ":["EL"],"MKX":["MIL"],"RAH":["RAL"],"TBW":["TAM"],
     }
     return mapping.get(wfo.upper(), [])
@@ -2173,10 +2183,11 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.36")
-    print(f"   v3.36: Contrarian guard — low-implied (<40%) pace bets need pace-confirm")
-    print(f"          (market usually right when it strongly disagrees with model)")
-    print(f"          (v3.35: blend fix; v3.34: dup fix; v3.32: Dev tier)")
+    print("🌡️  Kalshi Weather Bot v3.37")
+    print(f"   v3.37: Bias table re-derived from logs + dead-key fix")
+    print(f"          (AT/DA/HO/SE keys never matched ATL/DAL/HOU/SEA — now fixed)")
+    print(f"          (June bias +1 to +2.4F on hot cities — model was running cold)")
+    print(f"          (v3.36: contrarian guard; v3.35: blend fix)")
     print(f"   Cities: {len(CITY_COORDS)} | "
           f"WFOs: {len(set(info[4] for info in CITY_COORDS.values()))}")
 
