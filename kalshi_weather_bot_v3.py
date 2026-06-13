@@ -677,9 +677,18 @@ def fetch_model_accuracy(station: str) -> dict:
             }, headers={"Authorization": f"Bearer {WETHR_API_KEY}"}, timeout=10)
         r.raise_for_status()
         data = r.json()
+        print(f"[accuracy DEBUG] {station} raw: {data}")  # TEMP: remove after we see the shape
         # Expected: {"models": {"HRRR": {"mae_f": 1.8}, "NBM": {"mae_f": 1.4}, ...}}
         accuracy = {}
         models_obj = data.get("models", {})
+        # Guard: if the API returns a list instead of a dict, skip cleanly
+        # (real fix comes once the debug line above shows us the structure)
+        if not isinstance(models_obj, dict):
+            print(f"[accuracy] {station}: models is {type(models_obj).__name__}, "
+                  f"not dict — skipping until parser updated")
+            _model_accuracy_cache[station] = {}
+            _model_accuracy_ts[station]    = now
+            return {}
         for model, stats in models_obj.items():
             mae = stats.get("mae_f") if isinstance(stats, dict) else None
             if mae is not None:
