@@ -44,9 +44,33 @@ except ImportError:
     print("psycopg2 not installed. Run: pip install psycopg2-binary")
     sys.exit(1)
 
-# ── Minimum logged samples required before we trust a derived value ──────────
-MIN_SAMPLES_PER_MONTH = 5      # below this, keep the existing hand value
-STRONG_SAMPLES        = 15     # at/above this, treat the derived value as solid
+# ── Sample thresholds and damping ────────────────────────────────────────────
+# Floor lowered to 3 so the current problem cities (LV/PHX/DAL/ATL/HOU/AUS,
+# all n>=3 in June) get corrected NOW instead of waiting weeks. To protect
+# against a thin-sample average being off, we apply only a FRACTION of the
+# measured bias (damping), and we damp harder when samples are fewer.
+MIN_SAMPLES_PER_MONTH = 3      # below this, keep the existing hand value
+STRONG_SAMPLES        = 15     # at/above this, apply (almost) the full bias
+
+# Damping: applied_bias = measured_bias * damp_factor(n)
+#   Few samples  -> trust the measurement less -> smaller fraction applied.
+#   Many samples -> trust it more -> closer to full.
+# This is deliberately conservative: half-correcting a real +2.5F cold bias
+# still removes most of the 50%-hit-rate problem while not over-betting on
+# noise. As n grows on each weekly re-run, the correction sharpens.
+def damp_factor(n: int) -> float:
+    if n >= STRONG_SAMPLES: return 0.85   # strong data, apply most of it
+    if n >= 8:              return 0.65
+    if n >= 5:              return 0.55
+    return 0.50                            # 3-4 samples: apply half
+
+# A measured bias bigger than this is treated as implausible (wrong column,
+# bad settle) and rejected rather than written.
+MAX_PLAUSIBLE_BIAS_F  = 15.0
+
+# Rolling window (days). 0 = all-time (default). Set via --window N for
+# seasonal tracking once each month has enough recent samples to stand alone.
+WINDOW_DAYS = 0
 
 # ── EXISTING hand-coded table (so thin-data months are preserved verbatim) ───
 # Paste from the bot. Index 0 = January ... index 11 = December.
@@ -143,9 +167,15 @@ def derive_from_predictions(cur):
 
     bias_expr = f"COALESCE({bias_col}, 0)" if bias_col else "0"
     flag_clause = f"AND {settled_flag} = 1" if settled_flag else ""
+    # Optional rolling window: only rows within the last WINDOW_DAYS.
+    window_clause = ""
+    if WINDOW_DAYS and WINDOW_DAYS > 0:
+        window_clause = (f"AND {date_col}::timestamp "
+                         f">= NOW() - INTERVAL '{int(WINDOW_DAYS)} days'")
     print(f"\n[predictions] using: city={city_col} actual={actual_col} "
           f"mean=({ens_col} + {bias_expr}) date={date_col} "
-          f"settled_flag={settled_flag or 'none'}")
+          f"settled_flag={settled_flag or 'none'} "
+          f"window={'all-time' if not WINDOW_DAYS else str(WINDOW_DAYS)+'d'}")
 
     # Only rows that have actually settled (settled flag = 1) and have a
     # real settled high temperature recorded.
@@ -158,6 +188,7 @@ def derive_from_predictions(cur):
         WHERE {actual_col} IS NOT NULL
           AND {ens_col}    IS NOT NULL
           {flag_clause}
+          {window_clause}
     """)
     rows = cur.fetchall()
 
@@ -223,7 +254,15 @@ def climatology_from_historical(cur):
 
 
 def build_new_table(derived):
-    """Merge derived bias into existing table; keep hand value when thin."""
+    """Merge derived bias into existing table; keep hand value when thin.
+
+    For cells with enough samples we apply a DAMPED fraction of the measured
+    bias rather than the raw value, blending toward the existing value:
+        new = old + (measured - old) * damp_factor(n)
+    With damp_factor ~0.5 at low n, this moves the cell HALFWAY from the old
+    (often wrong-signed) value toward the measured one — enough to fix the
+    cold skew, conservative enough to survive a noisy small sample.
+    """
     new_table = {c: list(v) for c, v in EXISTING_CITY_BIAS_F.items()}
     notes = []
 
@@ -232,18 +271,19 @@ def build_new_table(derived):
             new_table[city] = list(DEFAULT_BIAS)
         for m0, (mean_err, n) in by_month.items():
             old_val = new_table[city][m0]
-            # Sanity: a real monthly bias should be small (a few degrees).
-            # If it's wild, something is wrong upstream — keep the old value
-            # and shout, rather than poison the table.
-            if abs(mean_err) > 15.0:
+            if abs(mean_err) > MAX_PLAUSIBLE_BIAS_F:
                 notes.append(f"  {city:4s} {MONTHS[m0]}: REJECTED {mean_err:+.1f} "
                              f"(implausible, kept {old_val:+.1f}) — check columns")
                 continue
             if n >= MIN_SAMPLES_PER_MONTH:
-                new_table[city][m0] = mean_err
-                strength = "STRONG" if n >= STRONG_SAMPLES else "ok"
+                d = damp_factor(n)
+                applied = round(old_val + (mean_err - old_val) * d, 2)
+                new_table[city][m0] = applied
+                strength = ("STRONG" if n >= STRONG_SAMPLES
+                            else "ok" if n >= 5 else "thin")
                 notes.append(f"  {city:4s} {MONTHS[m0]}: {old_val:+.1f} -> "
-                             f"{mean_err:+.2f}  (n={n}, {strength})")
+                             f"{applied:+.2f}  (measured {mean_err:+.1f}, "
+                             f"n={n}, damp={d:.2f}, {strength})")
             else:
                 notes.append(f"  {city:4s} {MONTHS[m0]}: kept {old_val:+.1f} "
                              f"(only n={n}, need {MIN_SAMPLES_PER_MONTH})")
@@ -262,10 +302,22 @@ def print_table(new_table):
 
 
 def main():
+    global WINDOW_DAYS
+    # Parse --window N (days). Default stays all-time.
+    args = sys.argv[1:]
+    if "--window" in args:
+        try:
+            WINDOW_DAYS = int(args[args.index("--window") + 1])
+        except (ValueError, IndexError):
+            print("Usage: python3 derive_bias.py [--window DAYS]")
+            sys.exit(1)
+
     conn = connect()
     cur = conn.cursor()
     print("=" * 70)
     print("BIAS DERIVATION — reading logged outcomes (read-only)")
+    if WINDOW_DAYS:
+        print(f"  Rolling window: last {WINDOW_DAYS} days")
     print("=" * 70)
 
     derived, n_pred = derive_from_predictions(cur)
