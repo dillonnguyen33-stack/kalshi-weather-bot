@@ -36,6 +36,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from weatherquant.db import ddl
+
 metadata = sa.MetaData()
 
 
@@ -163,44 +165,22 @@ fills = sa.Table(
 
 
 # --- Append-only enforcement (D-10) -------------------------------------------------
-# Attach a per-table BEFORE UPDATE/DELETE trigger that raises, turning any mutation into
-# an error. Wiring it to the table's after_create / before_drop DDL events means the
-# guard ships with BOTH metadata.create_all (used by the test fixture) and the Alembic
-# migration — the schema is insert-only no matter how it is built. The ledger is
-# corrected by INSERTing a new row with a later available_at, never by mutating one.
-#
-# Triggers (not ON UPDATE/DELETE rewrite RULES) are used deliberately: a DO INSTEAD rule
-# on a table suppresses the row-count / RETURNING tag of *other* commands (INSERT then
-# reports rowcount -1), whereas a BEFORE trigger leaves INSERT semantics untouched and
-# still rejects UPDATE/DELETE with a clear exception.
+# The enforcement DDL (the shared raise_append_only() function + per-table triggers) is
+# single-sourced in weatherquant.db.ddl and consumed identically here (via create_all
+# DDL events) and by the Alembic migration, so the two schemas cannot drift. Wiring the
+# trigger DDL to each table's after_create / before_drop event ships the guard with BOTH
+# metadata.create_all (test fixture) and the migration. The shared raise function is
+# created before the first table and dropped after the last. Corrections are new INSERTs
+# with a later available_at, never UPDATE/DELETE — see ddl.py for the full rationale
+# (BEFORE-trigger choice, static RAISE message, % escaping trap).
 for _table in metadata.tables.values():
-    _name = _table.name
-    _create_guard = sa.DDL(
-        f'CREATE TRIGGER "{_name}_append_only" '
-        f'BEFORE UPDATE OR DELETE ON "{_name}" '
-        f"FOR EACH ROW EXECUTE FUNCTION raise_append_only();"
-    )
-    _drop_guard = sa.DDL(
-        f'DROP TRIGGER IF EXISTS "{_name}_append_only" ON "{_name}";'
-    )
-    sa.event.listen(_table, "after_create", _create_guard)
-    sa.event.listen(_table, "before_drop", _drop_guard)
+    for _create_stmt in ddl.create_trigger_sql(_table.name):
+        sa.event.listen(_table, "after_create", sa.DDL(_create_stmt))
+    for _drop_stmt in ddl.drop_trigger_sql(_table.name):
+        sa.event.listen(_table, "before_drop", sa.DDL(_drop_stmt))
 
-
-# A shared PL/pgSQL trigger function raises so any UPDATE/DELETE fails loudly with a
-# clear append-only message. Created before the first table, dropped after the last.
-# NOTE: ``sa.DDL`` runs ``statement % context`` for table-name substitution, so any
-# literal ``%`` in the body MUST be escaped as ``%%`` (TG_TABLE_NAME carries the name).
-_create_raise_fn = sa.DDL(
-    "CREATE OR REPLACE FUNCTION raise_append_only() RETURNS trigger AS $$ "
-    "BEGIN RAISE EXCEPTION 'append-only ledger: %% on table %% is forbidden "
-    "(D-10) — correct via a new INSERT with a later available_at', "
-    "TG_OP, TG_TABLE_NAME; END; $$ LANGUAGE plpgsql;"
-)
-_drop_raise_fn = sa.DDL("DROP FUNCTION IF EXISTS raise_append_only();")
-
-sa.event.listen(metadata, "before_create", _create_raise_fn)
-sa.event.listen(metadata, "after_drop", _drop_raise_fn)
+sa.event.listen(metadata, "before_create", sa.DDL(ddl.CREATE_RAISE_FUNCTION_SQL))
+sa.event.listen(metadata, "after_drop", sa.DDL(ddl.DROP_RAISE_FUNCTION_SQL))
 
 
 __all__ = [

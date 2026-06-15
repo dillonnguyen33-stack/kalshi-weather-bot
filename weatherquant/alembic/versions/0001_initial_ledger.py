@@ -18,6 +18,11 @@ from typing import Sequence, Union
 from alembic import op
 import sqlalchemy as sa
 
+# Append-only enforcement DDL is single-sourced in weatherquant.db.ddl; this migration
+# and weatherquant.db.models both consume it, so the migrated schema and the
+# metadata.create_all schema cannot drift apart.
+from weatherquant.db import ddl
+
 
 # revision identifiers, used by Alembic.
 revision: str = '0001'
@@ -25,40 +30,21 @@ down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-LEDGER_TABLES: tuple[str, ...] = (
-    "forecasts",
-    "observations",
-    "calibration_params",
-    "market_snapshots",
-    "fills",
-)
-
 
 def _install_append_only_guards() -> None:
-    """Create the raise trigger function + per-table BEFORE UPDATE/DELETE triggers (D-10).
-
-    A BEFORE trigger (not a DO INSTEAD rewrite rule) is used so that INSERT semantics —
-    including the RETURNING/rowcount tag — are left untouched while UPDATE/DELETE raise.
-    """
-    op.execute(
-        "CREATE OR REPLACE FUNCTION raise_append_only() RETURNS trigger AS $$ "
-        "BEGIN RAISE EXCEPTION 'append-only ledger: % on table % is forbidden "
-        "(D-10) — correct via a new INSERT with a later available_at', "
-        "TG_OP, TG_TABLE_NAME; END; $$ LANGUAGE plpgsql;"
-    )
-    for name in LEDGER_TABLES:
-        op.execute(
-            f'CREATE TRIGGER "{name}_append_only" '
-            f'BEFORE UPDATE OR DELETE ON "{name}" '
-            f"FOR EACH ROW EXECUTE FUNCTION raise_append_only();"
-        )
+    """Create the raise trigger function + per-table triggers (D-10), from ddl.py."""
+    op.execute(ddl.CREATE_RAISE_FUNCTION_SQL)
+    for name in ddl.LEDGER_TABLES:
+        for stmt in ddl.create_trigger_sql(name):
+            op.execute(stmt)
 
 
 def _remove_append_only_guards() -> None:
     """Drop the triggers + trigger function (inverse of the install helper)."""
-    for name in LEDGER_TABLES:
-        op.execute(f'DROP TRIGGER IF EXISTS "{name}_append_only" ON "{name}";')
-    op.execute("DROP FUNCTION IF EXISTS raise_append_only();")
+    for name in ddl.LEDGER_TABLES:
+        for stmt in ddl.drop_trigger_sql(name):
+            op.execute(stmt)
+    op.execute(ddl.DROP_RAISE_FUNCTION_SQL)
 
 
 def upgrade() -> None:
