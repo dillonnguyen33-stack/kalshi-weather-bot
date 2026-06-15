@@ -1,0 +1,29 @@
+# Local Postgres for development and the integration test suite.
+# Not the authoritative ledger — the persistent, backed-up paper-trading
+# database is provisioned as a managed instance starting in Phase 2.
+#
+#   docker compose up -d        # start
+#   docker compose down         # stop (keeps data volume)
+#   docker compose down -v      # stop and wipe data
+#
+# DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/weatherquant
+services:
+  db:
+    image: postgres:16
+    container_name: weatherquant-pg
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: weatherquant
+    ports:
+      - "5432:5432"
+    volumes:
+      - weatherquant_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d weatherquant"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  weatherquant_pgdata:
