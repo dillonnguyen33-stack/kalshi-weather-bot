@@ -68,11 +68,14 @@ def pg_engine():
             "(set DATABASE_URL=postgresql+psycopg://... to enable)."
         )
 
-    if "+psycopg" not in url:
-        pytest.fail(
-            "DATABASE_URL must use the 'postgresql+psycopg://' dialect (psycopg v3, "
-            "not psycopg2) — D-09 / Pitfall 4."
-        )
+    # Exact-match dialect guard, single-sourced in weatherquant.db.engine (Pitfall 4 /
+    # D-09) so the conftest, the Settings validator, and the Alembic env stay identical.
+    from weatherquant.db.engine import require_psycopg3_scheme
+
+    try:
+        require_psycopg3_scheme(url)
+    except ValueError as exc:
+        pytest.fail(str(exc))
 
     import sqlalchemy as sa
 

@@ -14,6 +14,27 @@ from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Engine, create_engine
 
+# The one required SQLAlchemy dialect — psycopg v3, never the legacy psycopg2 (D-09).
+_REQUIRED_SCHEME = "postgresql+psycopg"
+
+
+def require_psycopg3_scheme(url: str) -> None:
+    """Raise ``ValueError`` unless ``url``'s dialect is exactly ``postgresql+psycopg``.
+
+    Single source for the Pitfall-4 / D-09 guard, consumed by the ``Settings`` validator,
+    the Alembic env, and the test conftest. The scheme is parsed from the part before
+    ``://`` and compared by EXACT equality — a substring check like ``'+psycopg' in
+    scheme`` wrongly accepts ``postgresql+psycopg2`` (the legacy driver), since
+    ``'+psycopg'`` is a prefix of ``'+psycopg2'``. The error never echoes the credential
+    (ASVS V14) — only the scheme is shown.
+    """
+    scheme = url.split("://", 1)[0] if "://" in url else url
+    if scheme != _REQUIRED_SCHEME:
+        raise ValueError(
+            f"DATABASE_URL must use the '{_REQUIRED_SCHEME}://' dialect (psycopg v3 "
+            f"only, never psycopg2). Got scheme: {scheme}://"
+        )
+
 
 class Settings(BaseSettings):
     """Typed application settings sourced from the environment / local ``.env``.
@@ -31,19 +52,14 @@ class Settings(BaseSettings):
 
     @field_validator("database_url")
     @classmethod
-    def _require_psycopg3_scheme(cls, value: str) -> str:
-        """Reject any DATABASE_URL whose scheme is not ``postgresql+psycopg://``.
+    def _validate_psycopg3_scheme(cls, value: str) -> str:
+        """Reject any DATABASE_URL whose dialect is not exactly ``postgresql+psycopg``.
 
-        Guards against the legacy-driver dialect leak (Pitfall 4 / D-09): a bare
-        ``postgresql://`` URL defaults SQLAlchemy to the old psycopg-2 driver, which is
-        forbidden and may not be installed. The error never echoes the credential.
+        Delegates to the shared :func:`require_psycopg3_scheme` so the engine, the Alembic
+        env, and the test conftest all enforce the identical exact-match check (Pitfall 4
+        / D-09). A bare ``postgresql://`` or ``postgresql+psycopg2://`` URL is rejected.
         """
-        scheme = value.split("://", 1)[0] if "://" in value else value
-        if "+psycopg" not in scheme:
-            raise ValueError(
-                "DATABASE_URL must use the 'postgresql+psycopg://' dialect "
-                f"(psycopg v3 only). Got scheme: {scheme}://"
-            )
+        require_psycopg3_scheme(value)
         return value
 
     def __repr__(self) -> str:  # never leak the credential-bearing URL (ASVS V14)

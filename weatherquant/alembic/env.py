@@ -40,11 +40,11 @@ config = context.config
 # .ini provides — offline `--sql` generation does not require a live DB.
 _database_url = os.environ.get("DATABASE_URL")
 if _database_url:
-    if "+psycopg" not in _database_url:
-        raise RuntimeError(
-            "DATABASE_URL must use the 'postgresql+psycopg://' dialect (psycopg v3), "
-            f"not psycopg2. Got scheme in: {_database_url.split('://', 1)[0]}://"
-        )
+    # Exact-match dialect guard, single-sourced in weatherquant.db.engine so the env,
+    # the Settings validator, and the test conftest cannot diverge (Pitfall 4 / D-09).
+    from weatherquant.db.engine import require_psycopg3_scheme
+
+    require_psycopg3_scheme(_database_url)
     config.set_main_option("sqlalchemy.url", _database_url)
 
 # Interpret the config file for Python logging.
