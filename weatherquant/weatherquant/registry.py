@@ -55,13 +55,16 @@ class City:
 
 # Exactly the 7 in-scope Kalshi cities (D-06), keyed by Kalshi city code.
 # Stations / offsets verified against Kalshi contract terms (01-RESEARCH).
-# Elevation in meters. LA is locked to KLAX (the live KXHIGHLAX airport series),
-# confirmed via the 01-04 human-verify checkpoint — do NOT switch to KCQT.
+# Elevation in meters. LA is locked to KLAX (the live KXHIGHLAX airport series);
+# the 01-04 human-verify checkpoint resolved the KLAX-vs-KCQT residual risk
+# (RESEARCH A1 / Open Question 1 / Pitfall 2) — see the LAX entry note below.
 CITIES: dict[str, City] = {
     "NYC": City(40.779, -73.969, 48.0, "KNYC", "America/New_York", -5),
     "CHI": City(41.786, -87.752, 189.0, "KMDW", "America/Chicago", -6),
     "AUS": City(30.183, -97.680, 165.0, "KAUS", "America/Chicago", -6),
     "MIA": City(25.791, -80.316, 3.0, "KMIA", "America/New_York", -5),
+    # LA series confirmed 2026-06-15: operator approved KLAX / KXHIGHLAX (LAXHIGH
+    # airport series). KEEP the registry default — no KCQT / LA_DT entry added.
     "LAX": City(33.938, -118.389, 39.0, "KLAX", "America/Los_Angeles", -8),
     "DEN": City(39.847, -104.656, 1656.0, "KDEN", "America/Denver", -7),
     "PHI": City(39.872, -75.241, 11.0, "KPHL", "America/New_York", -5),
