@@ -13,14 +13,24 @@ Three jobs:
 
 v3.27: Added bet_category (overnight/morning/pacing) and actual_high_f storage
        so the scoreboard can break down results by bet type and show final temps.
+v3.38: Fixed calibration_report date filter — the ::date cast on market_date
+       was silently excluding every row whose stored value didn't cast cleanly
+       (time component / odd format), so reports returned "No settled
+       predictions" even with scored rows present. Switched to a plain string
+       comparison on LEFT(market_date,10), which sorts correctly for YYYY-MM-DD.
+       Added a 'cal' subcommand: a quoting-free calibration dump (overall,
+       prob-bucket calibration, by-side, by-category) that runs cleanly as a
+       Railway start command with no multi-line / nested-quote issues.
 
 Usage:
-  python3 bias_logger.py score           # score yesterday's markets
+  python3 bias_logger.py score             # score yesterday's markets
   python3 bias_logger.py score 2026-05-25  # score a specific date
-  python3 bias_logger.py report          # full calibration report
-  python3 bias_logger.py report NYC      # report for one city
+  python3 bias_logger.py report            # full calibration report
+  python3 bias_logger.py report NYC        # report for one city
   python3 bias_logger.py report --days 30
-  python3 bias_logger.py summary         # quick one-liner
+  python3 bias_logger.py cal               # quick calibration dump (start-command friendly)
+  python3 bias_logger.py cal --days 30     # calibration dump, last 30 days
+  python3 bias_logger.py summary           # quick one-liner
 """
 
 import os, sys, requests
@@ -252,21 +262,24 @@ def calibration_report(city_filter=None, days=90):
     conn = get_conn()
     try:
         cur = conn.cursor()
-        # market_date is TEXT and may contain dates in mixed formats or with a
-        # time component. Cast the leading 10 chars (YYYY-MM-DD) to DATE for a
-        # correct comparison instead of fragile string comparison.
+        # market_date is TEXT. A previous version cast LEFT(market_date,10) to
+        # ::date for the comparison, but any row whose stored value didn't cast
+        # cleanly (time component, blank, odd format) was silently dropped —
+        # which made the whole report return "No settled predictions" even when
+        # scored rows existed. YYYY-MM-DD strings sort correctly lexically, so a
+        # plain string comparison is both correct and robust here.
         query = """
             SELECT city_code, city_name, model_prob, best_side, taker_ev,
                    model_correct, clv, ensemble_mean, spread, market_date, ticker
             FROM predictions
             WHERE settled = 1
-              AND NULLIF(LEFT(market_date, 10), '')::date >= %s::date
+              AND LEFT(market_date, 10) >= %s
         """
         params = [cutoff]
         if city_filter:
             query += " AND city_code = %s"
             params.append(city_filter.upper())
-        query += " ORDER BY NULLIF(LEFT(market_date, 10), '')::date"
+        query += " ORDER BY LEFT(market_date, 10)"
         cur.execute(query, params)
         rows = cur.fetchall()
     finally:
@@ -337,7 +350,7 @@ def calibration_report(city_filter=None, days=90):
                    SUM(CASE WHEN model_correct=1 THEN 1 ELSE 0 END)
             FROM predictions
             WHERE settled=1
-              AND NULLIF(LEFT(market_date,10),'')::date >= %s::date
+              AND LEFT(market_date,10) >= %s
             GROUP BY bet_category
         """, (cutoff,))
         cat_rows = cur.fetchall()
@@ -361,7 +374,7 @@ def calibration_report(city_filter=None, days=90):
                    SUM(CASE WHEN model_correct=1 THEN 1 ELSE 0 END)
             FROM predictions
             WHERE settled=1
-              AND NULLIF(LEFT(market_date,10),'')::date >= %s::date
+              AND LEFT(market_date,10) >= %s
             GROUP BY best_side
         """, (cutoff,))
         side_rows = cur.fetchall()
@@ -378,6 +391,71 @@ def calibration_report(city_filter=None, days=90):
 
     print(f"{'='*60}\n")
 
+# ── QUICK CALIBRATION DUMP (start-command friendly) ───────────────────────────
+def cal_dump(days=90):
+    """
+    Quoting-free calibration dump designed to run cleanly as a Railway start
+    command (no multi-line python -c, no nested quotes). Prints overall
+    accuracy, the prob-bucket calibration table, and by-side / by-category
+    breakdowns. Uses the same robust LEFT(market_date,10) string comparison as
+    calibration_report so it never silently drops rows.
+    """
+    ensure_schema()
+    cutoff = str(date.today() - timedelta(days=days))
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT model_prob, model_correct, best_side, bet_category,
+                   threshold_kind, taker_ev
+            FROM predictions
+            WHERE settled = 1
+              AND model_correct IS NOT NULL
+              AND LEFT(market_date, 10) >= %s
+        """, (cutoff,))
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    print(f"TOTAL settled (last {days}d): {len(rows)}")
+    if not rows:
+        return
+
+    corr = sum(r[1] for r in rows)
+    print(f"Overall: {corr}/{len(rows)} = {corr/len(rows)*100:.1f}%")
+
+    print("--- calibration (predicted prob vs actual win%) ---")
+    for lo, hi in [(0.0,0.5),(0.5,0.6),(0.6,0.7),(0.7,0.8),(0.8,0.9),(0.9,1.01)]:
+        b = [r for r in rows if lo <= r[0] < hi]
+        if not b:
+            continue
+        n = len(b)
+        won = sum(x[1] for x in b) / n * 100
+        mid = (lo + min(hi, 1.0)) / 2 * 100
+        gap = won - mid
+        flag = ""
+        if gap < -7:  flag = "  <- overconfident"
+        elif gap > 7: flag = "  <- underconfident"
+        print(f"  {int(lo*100):>3}-{int(min(hi,1.0)*100):<3}% | n={n:>3} | won {won:5.1f}% (mid {mid:4.0f}%, gap {gap:+5.1f}%){flag}")
+
+    print("--- by side ---")
+    for s in sorted(set(r[2] for r in rows), key=lambda x: x or ""):
+        b = [r for r in rows if r[2] == s]
+        n = len(b); won = sum(x[1] for x in b) / n * 100
+        print(f"  {str(s or 'none'):<6} n={n:>3} won {won:5.1f}%")
+
+    print("--- by category ---")
+    for c in sorted(set(r[3] for r in rows), key=lambda x: x or ""):
+        b = [r for r in rows if r[3] == c]
+        n = len(b); won = sum(x[1] for x in b) / n * 100
+        print(f"  {str(c or 'none'):<14} n={n:>3} won {won:5.1f}%")
+
+    print("--- by threshold kind ---")
+    for k in sorted(set(r[4] for r in rows), key=lambda x: x or ""):
+        b = [r for r in rows if r[4] == k]
+        n = len(b); won = sum(x[1] for x in b) / n * 100
+        print(f"  {str(k or 'none'):<6} n={n:>3} won {won:5.1f}%")
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     args = sys.argv[1:]
@@ -390,6 +468,14 @@ if __name__ == "__main__":
                 days = int(args[args.index(a)+1])
             elif not a.startswith("--"):  city = a
         calibration_report(city_filter=city, days=days)
+
+    elif args[0] == "cal":
+        days = 90
+        for a in args[1:]:
+            if a.startswith("--days="): days = int(a.split("=")[1])
+            elif a == "--days" and args.index(a)+1 < len(args):
+                days = int(args[args.index(a)+1])
+        cal_dump(days=days)
 
     elif args[0] == "score":
         target = date.fromisoformat(args[1]) if len(args) > 1 else None
