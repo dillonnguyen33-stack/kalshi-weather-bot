@@ -85,10 +85,9 @@ def pg_engine():
     with engine.connect() as conn:
         conn.execute(sa.text("SELECT 1"))
 
-    # Build the schema from the (about-to-exist) Core metadata. Imported lazily: at
-    # plan 01-01 weatherquant.db.models does not exist yet, so the integration tests
-    # are RED on this ImportError — correct, since the schema is delivered by 01-03.
-    from weatherquant.db.models import metadata  # noqa: WPS433 (deferred import)
+    # Build the schema from the Core metadata. Imported lazily so the no-DB subset never
+    # pays the models import — this fixture only runs when DATABASE_URL is set.
+    from weatherquant.db.models import metadata
 
     # Rebuild from scratch so schema/DDL changes (e.g. new triggers) always take effect:
     # create_all is a no-op on pre-existing tables and would NOT re-run their after_create

@@ -2,11 +2,12 @@
 
 Creates the five append-only ledger tables (forecasts, observations,
 calibration_params, market_snapshots, fills), their ``ix_<table>_latest`` indexes, and
-the append-only enforcement (D-10): a shared ``raise_append_only`` function plus a pair
-of ON UPDATE / ON DELETE rules per table that turn any mutation into an error. This
-mirrors the DDL-event guards on ``weatherquant.db.models.metadata`` so the migrated
-schema is identical to ``metadata.create_all`` — corrections are new INSERTs with a
-later ``available_at``, never UPDATE/DELETE (threat T-01-07).
+the append-only enforcement (D-10): a shared ``raise_append_only`` trigger function plus,
+per table, a ``BEFORE UPDATE OR DELETE`` row-level trigger and a ``BEFORE TRUNCATE``
+statement-level trigger that turn any mutation into an error. This mirrors the DDL-event
+guards on ``weatherquant.db.models.metadata`` so the migrated schema is identical to
+``metadata.create_all`` — corrections are new INSERTs with a later ``available_at``,
+never UPDATE/DELETE (threat T-01-07).
 
 Revision ID: 0001
 Revises:
@@ -97,8 +98,8 @@ def upgrade() -> None:
     op.create_index('ix_observations_latest', 'observations', ['city', 'target_date', 'source', 'available_at'], unique=False)
     # ### end Alembic commands ###
 
-    # Append-only enforcement (D-10) — hand-added; rules/functions are not reflectable
-    # by autogenerate, so they live here to keep the migrated schema insert-only.
+    # Append-only enforcement (D-10) — hand-added; trigger functions/triggers are not
+    # reflectable by autogenerate, so they live here to keep the migrated schema insert-only.
     _install_append_only_guards()
 
 

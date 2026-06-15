@@ -33,6 +33,8 @@ is never referenced; the engine uses the ``postgresql+psycopg://`` (v3) dialect.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import sqlalchemy as sa
 
 from weatherquant.db import ddl
@@ -51,12 +53,12 @@ metadata = sa.MetaData()
 # on the Engine class, which only worked by import-order luck) — see that module.
 
 
-def _id_column() -> sa.Column:
+def _id_column() -> sa.Column[int]:
     """Surrogate serial primary key shared by every ledger table."""
     return sa.Column("id", sa.BigInteger, sa.Identity(), primary_key=True)
 
 
-def _available_at_column() -> sa.Column:
+def _available_at_column() -> sa.Column[datetime]:
     """Point-in-time-of-knowledge timestamptz shared by every ledger table (D-12)."""
     return sa.Column("available_at", sa.TIMESTAMP(timezone=True), nullable=False)
 
