@@ -1,0 +1,26 @@
+# OS
+.DS_Store
+
+# Secrets — Kalshi/API credentials are loaded from the environment
+.env
+.env.*
+
+# Kalshi RSA auth keys
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local runtime data — SQLite bias ledger, logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Local files
+.a/
+.planning/
