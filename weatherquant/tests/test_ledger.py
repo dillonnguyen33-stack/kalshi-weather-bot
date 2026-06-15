@@ -95,6 +95,19 @@ def test_append_only_no_update(pg_engine):
             conn.execute(sa.update(forecasts).values(city="MUTATED"))
 
 
+@pytest.mark.parametrize("table_name", LEDGER_TABLES)
+def test_append_only_no_truncate(pg_engine, table_name):
+    """D-10: TRUNCATE must be rejected on every ledger table. The per-row UPDATE/DELETE
+    trigger does NOT fire on TRUNCATE, so a dedicated BEFORE TRUNCATE statement-level
+    trigger guards against a TRUNCATE silently wiping the append-only ledger."""
+    import sqlalchemy as sa
+
+    _import_db()
+    with pytest.raises(Exception):
+        with pg_engine.begin() as conn:
+            conn.execute(sa.text(f'TRUNCATE "{table_name}"'))
+
+
 def _sample_value(col):
     import sqlalchemy as sa
 

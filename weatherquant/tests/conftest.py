@@ -87,6 +87,11 @@ def pg_engine():
     # are RED on this ImportError — correct, since the schema is delivered by 01-03.
     from weatherquant.db.models import metadata  # noqa: WPS433 (deferred import)
 
+    # Rebuild from scratch so schema/DDL changes (e.g. new triggers) always take effect:
+    # create_all is a no-op on pre-existing tables and would NOT re-run their after_create
+    # trigger DDL, leaving a stale schema from a prior run. drop_all first guarantees the
+    # current append-only guards (UPDATE/DELETE + TRUNCATE) are installed every session.
+    metadata.drop_all(engine)
     metadata.create_all(engine)
     try:
         yield engine

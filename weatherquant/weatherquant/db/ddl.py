@@ -18,6 +18,11 @@ Why BEFORE triggers (not DO INSTEAD rewrite rules): a rewrite rule on a table su
 the row-count / RETURNING tag of OTHER commands (an INSERT would then report
 ``rowcount -1``), whereas a BEFORE trigger leaves INSERT semantics untouched and still
 rejects the forbidden mutations with a clear exception.
+
+Why a per-statement TRUNCATE trigger in addition to the per-row UPDATE/DELETE trigger:
+``BEFORE UPDATE OR DELETE FOR EACH ROW`` does NOT fire on ``TRUNCATE`` (TRUNCATE removes
+rows without per-row processing), so without a dedicated ``BEFORE TRUNCATE ... FOR EACH
+STATEMENT`` trigger a ``TRUNCATE`` would silently wipe the append-only ledger.
 """
 
 from __future__ import annotations
@@ -47,13 +52,20 @@ DROP_RAISE_FUNCTION_SQL: str = "DROP FUNCTION IF EXISTS raise_append_only();"
 def create_trigger_sql(table: str) -> tuple[str, ...]:
     """Return the CREATE TRIGGER statements that guard ``table`` (D-10).
 
+    Two triggers per table:
+
     * ``<table>_append_only`` — ``BEFORE UPDATE OR DELETE ... FOR EACH ROW``: rejects
       row-level mutations while leaving INSERT semantics untouched.
+    * ``<table>_no_truncate`` — ``BEFORE TRUNCATE ... FOR EACH STATEMENT``: rejects
+      TRUNCATE, which the per-row trigger does not catch.
     """
     return (
         f'CREATE TRIGGER "{table}_append_only" '
         f'BEFORE UPDATE OR DELETE ON "{table}" '
         f"FOR EACH ROW EXECUTE FUNCTION raise_append_only();",
+        f'CREATE TRIGGER "{table}_no_truncate" '
+        f'BEFORE TRUNCATE ON "{table}" '
+        f"FOR EACH STATEMENT EXECUTE FUNCTION raise_append_only();",
     )
 
 
@@ -61,6 +73,7 @@ def drop_trigger_sql(table: str) -> tuple[str, ...]:
     """Return the DROP TRIGGER statements inverse to :func:`create_trigger_sql`."""
     return (
         f'DROP TRIGGER IF EXISTS "{table}_append_only" ON "{table}";',
+        f'DROP TRIGGER IF EXISTS "{table}_no_truncate" ON "{table}";',
     )
 
 
