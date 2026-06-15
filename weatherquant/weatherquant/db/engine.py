@@ -78,6 +78,17 @@ def get_engine() -> Engine:
 
     The engine is built on the ``postgresql+psycopg://`` dialect. ``hide_parameters``
     keeps bound values out of error logs; the connection URL itself is never logged.
+
+    ``execution_options(preserve_rowcount=True)`` is set on the engine so every INSERT
+    reports a real ``result.rowcount`` (1 for a single row) despite the implicit
+    ``RETURNING id`` on the ``Identity()`` PK (D-11 contract). Setting it on the app
+    engine here — rather than as an import-time global listener on the Engine class —
+    makes the behavior deterministic and not dependent on module import order.
     """
     settings = get_settings()
-    return create_engine(settings.database_url, future=True, hide_parameters=True)
+    return create_engine(
+        settings.database_url,
+        future=True,
+        hide_parameters=True,
+        execution_options={"preserve_rowcount": True},
+    )

@@ -34,7 +34,6 @@ is never referenced; the engine uses the ``postgresql+psycopg://`` (v3) dialect.
 from __future__ import annotations
 
 import sqlalchemy as sa
-from sqlalchemy.engine import Engine
 
 from weatherquant.db import ddl
 
@@ -42,21 +41,14 @@ metadata = sa.MetaData()
 
 
 # --- Sane INSERT rowcount (D-11 contract) ------------------------------------------
-# Each ledger table has an ``Identity()`` surrogate PK, so SQLAlchemy appends an
-# implicit ``RETURNING id`` to every INSERT to fetch the generated key. For a RETURNING
-# insert the DBAPI cursor reports ``rowcount == -1`` (PEP 249 allows this), and
-# SQLAlchemy does not pre-memoize a real count unless asked. Callers across phases 2–6
-# rely on ``result.rowcount`` to confirm a write landed, so we set the
-# ``preserve_rowcount`` execution option on every connection — this forces
-# ``cursor.rowcount`` to be captured (yielding 1 for a single-row insert) without
-# changing the emitted SQL or affecting SELECT/UPDATE semantics. Registered globally on
-# the Engine class at import time; the test fixture imports this module before creating
-# its engine, so the option is active for the whole suite.
-def _preserve_rowcount_on_connect(conn) -> None:
-    conn.execution_options(preserve_rowcount=True)
-
-
-sa.event.listen(Engine, "engine_connect", _preserve_rowcount_on_connect)
+# Each ledger table has an ``Identity()`` surrogate PK, so SQLAlchemy appends an implicit
+# ``RETURNING id`` to every INSERT. For a RETURNING insert the DBAPI cursor reports
+# ``rowcount == -1`` (PEP 249 allows this) unless ``preserve_rowcount`` is set, which
+# forces ``cursor.rowcount`` to be captured (yielding 1 for a single-row insert) without
+# changing the emitted SQL. Callers across phases 2–6 rely on ``result.rowcount`` to
+# confirm a write landed. This option is now set DETERMINISTICALLY on the engine built in
+# :func:`weatherquant.db.engine.get_engine` (not as a fragile import-time global listener
+# on the Engine class, which only worked by import-order luck) — see that module.
 
 
 def _id_column() -> sa.Column:

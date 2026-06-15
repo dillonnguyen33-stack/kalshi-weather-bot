@@ -55,11 +55,13 @@ def _database_url() -> str | None:
 def pg_engine():
     """Yield a SQLAlchemy Engine bound to the test Postgres (DATABASE_URL).
 
-    Skips cleanly (not errors) when DATABASE_URL is unset, so the fast subset stays
-    green on machines without a database. When set, the engine is created and a trivial
-    ``SELECT 1`` connectivity check runs; the schema itself is built by plan 01-03's
-    Alembic migration / ``metadata.create_all`` (imported lazily so this fixture is
-    collectable even before ``weatherquant.db`` exists).
+    Skips cleanly (not errors) when DATABASE_URL is unset, so the fast subset stays green
+    on machines without a database. When set, the engine is obtained via the production
+    ``weatherquant.db.engine.get_engine()`` — so the suite exercises the real engine
+    (validated psycopg3 scheme, ``hide_parameters``, and ``preserve_rowcount`` so INSERT
+    rowcount==1 holds, D-11) rather than an ad-hoc one. A trivial ``SELECT 1``
+    connectivity check runs before the integration tests; the schema is built from the
+    Core metadata (imported lazily).
     """
     url = _database_url()
     if url is None:
@@ -68,18 +70,16 @@ def pg_engine():
             "(set DATABASE_URL=postgresql+psycopg://... to enable)."
         )
 
-    # Exact-match dialect guard, single-sourced in weatherquant.db.engine (Pitfall 4 /
-    # D-09) so the conftest, the Settings validator, and the Alembic env stay identical.
-    from weatherquant.db.engine import require_psycopg3_scheme
-
-    try:
-        require_psycopg3_scheme(url)
-    except ValueError as exc:
-        pytest.fail(str(exc))
-
+    # Obtain the PRODUCTION engine. get_settings() inside get_engine() runs the same
+    # exact-match psycopg3 scheme validator (Pitfall 4 / D-09); a bad scheme raises here.
     import sqlalchemy as sa
 
-    engine = sa.create_engine(url, future=True)
+    from weatherquant.db.engine import get_engine
+
+    try:
+        engine = get_engine()
+    except ValueError as exc:
+        pytest.fail(str(exc))
 
     # Connectivity check — proves Postgres is reachable before integration tests run.
     with engine.connect() as conn:
