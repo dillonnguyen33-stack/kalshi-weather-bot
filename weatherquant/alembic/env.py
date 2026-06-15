@@ -7,10 +7,9 @@ can autogenerate (D-09). Two project-specific deviations from the stock scaffold
    git-ignored ``.env`` via python-dotenv) and MUST use the ``postgresql+psycopg://``
    dialect — psycopg v3, never psycopg2 (D-09 / Pitfall 4).
 
-2. ``target_metadata`` imports ``weatherquant.db.models.metadata`` behind a
-   forward-reference guard. The ``weatherquant.db`` package does not exist yet at
-   plan 01-01 (it lands in 01-03); the try/except keeps this scaffold committable
-   now and resolves automatically once the models module is written.
+2. ``target_metadata`` is a HARD import of ``weatherquant.db.models.metadata``. A failed
+   import (broken module) raises rather than silently leaving ``target_metadata=None``,
+   which would make autogenerate emit an empty diff and hide schema drift.
 """
 
 from logging.config import fileConfig
@@ -19,6 +18,14 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 
 from alembic import context
+
+# MetaData for 'autogenerate' support. This is a HARD import on purpose: if
+# weatherquant.db.models cannot be imported (a real breakage — bad syntax, missing dep,
+# broken DDL), autogenerate must fail loud rather than silently set target_metadata=None,
+# which would emit an EMPTY diff and mask schema drift. (An earlier try/except guard was
+# only a forward-reference workaround for when the models module did not yet exist; it
+# does now, so the guard is removed.)
+from weatherquant.db.models import metadata as target_metadata
 
 # Load DATABASE_URL from a local .env if present (dev convenience; never committed).
 try:
@@ -51,15 +58,6 @@ if _database_url:
 # This line sets up loggers basically.
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
-
-# add your model's MetaData object here for 'autogenerate' support.
-# Forward reference: weatherquant.db.models is created in plan 01-03. Until then the
-# import fails and target_metadata stays None (autogenerate produces an empty diff,
-# which is correct for 01-01 — there is no schema yet).
-try:
-    from weatherquant.db.models import metadata as target_metadata
-except ImportError:
-    target_metadata = None
 
 
 def run_migrations_offline() -> None:
