@@ -194,14 +194,22 @@ fills = sa.Table(
 # created before the first table and dropped after the last. Corrections are new INSERTs
 # with a later available_at, never UPDATE/DELETE — see ddl.py for the full rationale
 # (BEFORE-trigger choice, static RAISE message, % escaping trap).
+
+
+def _ddl(stmt: str) -> sa.DDL:
+    # sa.DDL lacks a typed stub, so a bare call trips mypy --strict's no-untyped-call.
+    # One wrapper confines that single suppression instead of repeating it per call site.
+    return sa.DDL(stmt)  # type: ignore[no-untyped-call]
+
+
 for _table in metadata.tables.values():
     for _create_stmt in ddl.create_trigger_sql(_table.name):
-        sa.event.listen(_table, "after_create", sa.DDL(_create_stmt))
+        sa.event.listen(_table, "after_create", _ddl(_create_stmt))
     for _drop_stmt in ddl.drop_trigger_sql(_table.name):
-        sa.event.listen(_table, "before_drop", sa.DDL(_drop_stmt))
+        sa.event.listen(_table, "before_drop", _ddl(_drop_stmt))
 
-sa.event.listen(metadata, "before_create", sa.DDL(ddl.CREATE_RAISE_FUNCTION_SQL))
-sa.event.listen(metadata, "after_drop", sa.DDL(ddl.DROP_RAISE_FUNCTION_SQL))
+sa.event.listen(metadata, "before_create", _ddl(ddl.CREATE_RAISE_FUNCTION_SQL))
+sa.event.listen(metadata, "after_drop", _ddl(ddl.DROP_RAISE_FUNCTION_SQL))
 
 
 __all__ = [
