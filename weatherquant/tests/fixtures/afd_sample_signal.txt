@@ -1,0 +1,21 @@
+000
+FXUS61 KOKX 131830
+AFDOKX
+
+Area Forecast Discussion
+National Weather Service New York NY
+230 PM EDT Sat Jun 13 2026
+
+.SYNOPSIS...
+There is considerable model disagreement regarding the timing and
+placement of the approaching cold front. The 12Z guidance suite shows
+a notable spread, with the ECMWF significantly faster than the GFS in
+bringing the front through the area. Forecaster confidence in the
+high temperature for tomorrow is low given this uncertainty, and the
+potential exists for a several-degree bust either way depending on
+cloud cover and frontal timing.
+
+.NEAR TERM /THROUGH TONIGHT/...
+Increasing clouds ahead of the front. Highs were near normal today.
+
+$$

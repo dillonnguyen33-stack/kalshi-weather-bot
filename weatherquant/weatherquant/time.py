@@ -61,6 +61,12 @@ def settlement_window(city: City, day: date) -> SettlementWindow:
     (the sign is ``- off``; US offsets are negative — RESEARCH Pitfall 3), so
     ``start_utc.hour == (-std_offset_hours) % 24``.
     """
+    # std_offset_hours is whole-hour by contract — every in-scope Kalshi city is a
+    # whole-hour standard offset. A half-hour zone (e.g. India +5:30, Newfoundland
+    # -3:30) would need a minutes-based field; routed through this int-hours path it
+    # would SILENTLY shift the window 30m — the same wrong-settlement-day failure
+    # class Phase 1 exists to prevent. Switch registry.City to minutes before adding
+    # any such city; do not coerce a fractional offset into this int.
     off = timedelta(hours=city.std_offset_hours)
     start_utc = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - off
     end_utc = start_utc + timedelta(days=1)  # half-open [start, end); always 24h (no DST)

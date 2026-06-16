@@ -12,6 +12,7 @@ can autogenerate (D-09). Two project-specific deviations from the stock scaffold
    which would make autogenerate emit an empty diff and hide schema drift.
 """
 
+import os
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config
@@ -34,8 +35,6 @@ try:
     load_dotenv()
 except ImportError:  # python-dotenv is a declared dep; guard only for minimal envs.
     pass
-
-import os
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
