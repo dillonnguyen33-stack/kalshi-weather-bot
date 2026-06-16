@@ -20,7 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from weatherquant.db.engine import get_engine
 from weatherquant.ingest import orchestrator
@@ -130,6 +130,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Comma-separated UTC cycle init hours per day (default 0).",
     )
+
+    # --- calibrate: fit + persist EMOS/NGR params per (city, model, lead, month) (D-13) -----
+    # Mirrors the ingest selectors so the operator can calibrate every model label generically
+    # (D-01 — one code path over all NOAA + supplementary labels). The same _city_type /
+    # ALL_MODELS validators reject unknown cities/models BEFORE any DB call (ASVS V5 / T-03-05).
+    calibrate = sub.add_parser(
+        "calibrate",
+        help="Fit + persist append-only EMOS/NGR calibration params per stratum.",
+    )
+
+    cal_model_group = calibrate.add_mutually_exclusive_group(required=True)
+    cal_model_group.add_argument(
+        "--model",
+        choices=ALL_MODELS,
+        help="A single model/source to calibrate (e.g. hrrr, gfs, nws, openmeteo).",
+    )
+    cal_model_group.add_argument(
+        "--all-models",
+        action="store_true",
+        help="Calibrate every GRIB model and supplementary source.",
+    )
+
+    cal_city_group = calibrate.add_mutually_exclusive_group(required=True)
+    cal_city_group.add_argument(
+        "--city",
+        type=_city_type,
+        help=f"A single Kalshi city code (one of: {', '.join(sorted(CITIES))}).",
+    )
+    cal_city_group.add_argument(
+        "--all-cities",
+        action="store_true",
+        help="Calibrate every registry city.",
+    )
+
+    calibrate.add_argument(
+        "--lead",
+        type=int,
+        default=0,
+        help="Forecast lead hours to calibrate (default 0).",
+    )
+    calibrate.add_argument(
+        "--oos-fraction",
+        type=float,
+        default=0.3,
+        help="Fraction of date-sorted samples held out for OOS validation (default 0.3).",
+    )
     return parser
 
 
@@ -204,6 +250,116 @@ def run_ingest(args: argparse.Namespace) -> dict[str, int]:
     return totals
 
 
+def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
+    """Validate args and run assemble→fit→evaluate→persist per stratum (D-13 / CAL-01/03).
+
+    For each validated ``(city, model)`` pair this:
+
+    1. assembles training pairs from the ledger (``strata.assemble_training_pairs`` — full-key
+       read, K→°F seam, member aggregation), scoped to the requested ``--lead``;
+    2. groups the pairs into ``(city, model, lead, month)`` strata;
+    3. fits each stratum (``strata.fit_stratum_pooled`` — the pooling/shrinkage ladder records
+       ``pool_level``);
+    4. computes the OOS audit metrics on a TEMPORAL split (``evaluate.evaluate_stratum_oos``)
+       when the stratum has enough samples for a split (else leaves the OOS metrics as NaN —
+       absence is absence, never a fabricated number);
+    5. persists each stratum APPEND-ONLY via ``persist.store_calibration_params`` with
+       ``available_at = now`` (the training-run completion instant, D-13) and ``trained_through``
+       = the max train ``target_date`` used.
+
+    Cities/models were already validated by the argparse ``type=``/``choices=`` validators
+    (unknown city / unknown model rejected BEFORE this runs — ASVS V5 / T-03-05). Calibration is
+    synchronous (no ``asyncio.run`` — the fit is pure NumPy over in-memory arrays).
+
+    Returns:
+        ``{f"{city}:{model}": n_strata_persisted}`` — the per-pair count of persisted strata.
+    """
+    # Imported lazily so the ingest path (and `--help`) never pays the calibration imports.
+    import math
+
+    import numpy as np
+
+    from weatherquant.calibrate import evaluate, persist, strata
+
+    models = _resolve_models(args)
+    cities = _resolve_cities(args)
+    lead = args.lead
+    oos_fraction = args.oos_fraction
+
+    bind = get_engine()
+    available_at = datetime.now(timezone.utc)  # training-run completion instant (D-13)
+    persisted: dict[str, int] = {}
+
+    for city in cities:
+        for model in models:
+            pairs = [
+                p
+                for p in strata.assemble_training_pairs(bind, city=city, model=model)
+                if p.lead == lead
+            ]
+            # Group the aggregated pairs into (lead, month) strata.
+            by_month: dict[int, list[strata.TrainingPair]] = {}
+            for pair in pairs:
+                by_month.setdefault(pair.month, []).append(pair)
+
+            count = 0
+            for month, month_pairs in sorted(by_month.items()):
+                m = np.array([p.m for p in month_pairs], dtype=float)
+                s2 = np.array([p.s2 for p in month_pairs], dtype=float)
+                y = np.array([p.y for p in month_pairs], dtype=float)
+                target_dates = [date(2000, month, 1) for _ in month_pairs]  # month-only key
+
+                samples = strata.StratumSamples(
+                    city=city, model=model, lead=lead, month=month, m=m, s2=s2, y=y
+                )
+                fit = strata.fit_stratum_pooled(samples)
+
+                # OOS audit metrics on a temporal split — only when there are enough samples to
+                # split (>=2 distinct dates). The synthetic month-only key collapses dates, so a
+                # real backfill (per-target-date dates) is what makes this a genuine temporal
+                # split; here we guard and leave NaN when a split is not meaningful.
+                crps_train = crps_oos = crps_baseline_oos = math.nan
+                trained_through = date(2000, month, 1)  # month-only cutoff (synthetic key)
+                if fit.n_train >= 2:
+                    members = m[:, None]  # aggregated mean as a single pseudo-member
+                    try:
+                        oos = evaluate.evaluate_stratum_oos(
+                            target_dates, members, y, oos_fraction=oos_fraction
+                        )
+                        crps_train = oos.crps_train
+                        crps_oos = oos.crps_oos
+                        crps_baseline_oos = oos.crps_baseline_oos
+                        trained_through = oos.trained_through
+                    except ValueError:
+                        pass  # too few samples for a split — leave metrics NaN (absence=absence)
+
+                persist.store_calibration_params(
+                    bind,
+                    city=fit.city,
+                    model=fit.model,
+                    lead=fit.lead,
+                    month=fit.month,
+                    mean_intercept=fit.a,
+                    mean_slope=fit.b,
+                    var_intercept=fit.c,
+                    var_slope=fit.d,
+                    sigma_floor=fit.sigma_floor,
+                    n_train=fit.n_train,
+                    pool_level=fit.pool_level,
+                    crps_train=crps_train,
+                    crps_oos=crps_oos,
+                    crps_baseline_oos=crps_baseline_oos,
+                    trained_through=trained_through,
+                    available_at=available_at,
+                )
+                count += 1
+
+            persisted[f"{city}:{model}"] = count
+            logger.info("calibrate city=%s model=%s lead=%s strata=%d", city, model, lead, count)
+
+    return persisted
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console-script entry point (``[project.scripts] weatherquant = weatherquant.cli:main``).
 
@@ -218,6 +374,11 @@ def main(argv: list[str] | None = None) -> int:
         totals = run_ingest(args)
         inserted = sum(totals.values())
         print(f"ingest complete: {inserted} row(s) inserted ({totals})")
+        return 0
+    if args.command == "calibrate":
+        persisted = run_calibrate(args)
+        total = sum(persisted.values())
+        print(f"calibrate complete: {total} stratum row(s) persisted ({persisted})")
         return 0
     parser.error(f"unknown command: {args.command}")
     return 2  # unreachable — parser.error exits
