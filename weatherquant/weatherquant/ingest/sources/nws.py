@@ -26,13 +26,14 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from typing import Any
 
 import httpx
 
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import UnitError
 from weatherquant.ingest.sources._client import get_client, request_with_retry
-from weatherquant.ingest.writer import insert_forecast
+from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, settlement_window
 
@@ -119,7 +120,7 @@ def _parse_iso_duration(duration: str) -> "datetime.timedelta":  # type: ignore[
     return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
 
 
-def window_max_kelvin(temperature: dict, win: SettlementWindow) -> float | None:
+def window_max_kelvin(temperature: dict[str, Any], win: SettlementWindow) -> float | None:
     """Bucket ``properties.temperature`` intervals into ``win`` and return the in-window MAX (K).
 
     Each ``values`` entry contributes its (unit-converted) Kelvin value if its half-open
@@ -204,7 +205,7 @@ async def fetch_nws_forecast(
 
 
 def store_nws_forecast(
-    bind: object,
+    bind: Bind,
     city: str,
     target_date: date,
     temp_kelvin: float,

@@ -52,6 +52,12 @@ markers = [
 # Async source-client tests (httpx) need no per-test @pytest.mark.asyncio decorator.
 asyncio_mode = "auto"
 
+[[tool.mypy.overrides]]
+# herbie-data and apscheduler ship no type stubs; silence import-not-found for them
+# only (the rest of the tree stays under --strict with real types).
+module = ["herbie.*", "apscheduler.*"]
+ignore_missing_imports = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

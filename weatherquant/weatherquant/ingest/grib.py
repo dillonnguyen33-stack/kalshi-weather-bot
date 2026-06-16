@@ -35,11 +35,17 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from weatherquant.ingest.errors import SanityError, UnitError
 from weatherquant.registry import get_city
+
+# 2-D float field / coordinate array at the GRIB I/O edge. GRIB temps decode as float32
+# and cfgrib coords as float64, so the element type is left as any floating kind.
+FloatArray = npt.NDArray[np.floating[Any]]
 
 logger = logging.getLogger(__name__)
 
@@ -66,9 +72,9 @@ class T2MField:
         units: the decoded unit string — asserted ``"K"`` at decode time (D-03).
     """
 
-    values: np.ndarray
-    lat2d: np.ndarray
-    lon2d: np.ndarray
+    values: FloatArray
+    lat2d: FloatArray
+    lon2d: FloatArray
     units: str
 
 
@@ -90,7 +96,7 @@ def member_to_axis(member: str) -> int:
     raise ValueError(f"unrecognized GEFS member label: {member!r}")
 
 
-def _to_2d(lat: np.ndarray, lon: np.ndarray, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+def _to_2d(lat: FloatArray, lon: FloatArray, shape: tuple[int, int]) -> tuple[FloatArray, FloatArray]:
     """Broadcast coordinate arrays to 2-D aligned with the field (Pitfall 2).
 
     HRRR/NBM are Lambert: cfgrib already exposes 2-D ``latitude``/``longitude``. GFS/GEFS
@@ -160,7 +166,7 @@ def decode_t2m(path: str | Path) -> T2MField:
     return _open_t2m_field(Path(path))
 
 
-def _haversine_m(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndarray) -> np.ndarray:
+def _haversine_m(lat1: float, lon1: float, lat2: FloatArray, lon2: FloatArray) -> FloatArray:
     """Great-circle distance (meters) from one point to every grid cell (vectorized).
 
     Longitudes are normalized to [-180, 180) before the difference so a 0..360 GFS grid and
@@ -173,7 +179,8 @@ def _haversine_m(lat1: float, lon1: float, lat2: np.ndarray, lon2: np.ndarray) -
     dlat = lat2r - lat1r
     dlon = lon2r - lon1r
     a = np.sin(dlat / 2.0) ** 2 + math.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2.0) ** 2
-    return 2.0 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
+    dist: FloatArray = 2.0 * _EARTH_RADIUS_M * np.arcsin(np.sqrt(a))
+    return dist
 
 
 def snap_to_station(

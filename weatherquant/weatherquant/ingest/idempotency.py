@@ -22,6 +22,7 @@ Core bound parameters.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
@@ -30,7 +31,7 @@ from sqlalchemy.engine import Connection, Engine
 from weatherquant.db.models import metadata
 
 
-def _match_condition(column: sa.Column, value: object):
+def _match_condition(column: sa.Column[Any], value: object) -> sa.ColumnElement[bool]:
     """Build the equality/NULL predicate for one (column, value), JSONB-aware.
 
     A plain ``column == None`` renders ``column = NULL`` (never true), so a None must

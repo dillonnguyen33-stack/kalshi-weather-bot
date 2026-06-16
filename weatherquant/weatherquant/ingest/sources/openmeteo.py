@@ -27,12 +27,13 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from datetime import date, datetime, timezone
+from typing import Any, cast
 
 import httpx
 
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.sources._client import get_client, request_with_retry
-from weatherquant.ingest.writer import insert_forecast
+from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, settlement_window
 
@@ -108,7 +109,7 @@ def _window_max_kelvin(
         if not (win.start_utc <= ts < win.end_utc):
             continue  # half-open bucket — a wrong-LST-day hour cannot raise the member high
         try:
-            value = float(temp)
+            value = float(cast(Any, temp))
         except (TypeError, ValueError):
             continue
         if best_c is None or value > best_c:
@@ -116,7 +117,7 @@ def _window_max_kelvin(
     return celsius_to_kelvin(best_c) if best_c is not None else None
 
 
-def parse_members(payload: dict, win: SettlementWindow) -> dict[int, float]:
+def parse_members(payload: dict[str, Any], win: SettlementWindow) -> dict[int, float]:
     """Parse the ``/ensemble`` payload into ``{member_index: in-window-max Kelvin}`` (D-05).
 
     Reads ``hourly.time`` once and each ``temperature_2m_memberNN`` series, bucketing each
@@ -196,7 +197,7 @@ async def fetch_openmeteo_ensemble(
 
 
 def store_members(
-    bind: object,
+    bind: Bind,
     city: str,
     target_date: date,
     members: dict[int, float],

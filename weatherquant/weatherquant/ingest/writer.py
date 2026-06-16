@@ -31,6 +31,11 @@ from weatherquant.db.models import forecasts, observations
 from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.ingest.idempotency import row_exists
 
+# A SQLAlchemy execution target. Single-sourced here so every write path (writer +
+# the store_* helpers + the orchestrator) types its ``bind`` identically — a ``bind``
+# built by get_engine() carries the preserve_rowcount contract (D-11).
+Bind = Engine | Connection
+
 
 class WriteIntegrityError(CorrectnessError, RuntimeError):
     """The single-row insert integrity contract was violated (D-11, WR-06).

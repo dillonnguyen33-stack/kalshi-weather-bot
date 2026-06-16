@@ -42,7 +42,7 @@ from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
-from weatherquant.ingest.writer import insert_forecast
+from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import CITIES, get_city
 from weatherquant.time import settlement_window
 
@@ -102,7 +102,7 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
 
 
 async def _ingest_grib_model(
-    bind: object,
+    bind: Bind,
     model: str,
     city_code: str,
     cycle_init: datetime,
@@ -197,7 +197,7 @@ def _log_live_only_skip(source: str, city: str, cycle: datetime) -> None:
 
 
 async def ingest_cycle(
-    bind: object,
+    bind: Bind,
     model: str,
     city: str,
     cycle_init: datetime,
@@ -267,7 +267,7 @@ async def ingest_cycle(
 
 
 async def _ingest_nws(
-    bind: object, city: str, cycle_init: datetime, lead: int, *, mode: Mode
+    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode
 ) -> int:
     """NWS gridpoint -> in-window max -> one ``nws`` forecast row (02-04, live-forward)."""
     target_date = _target_date_for(city, cycle_init, lead)
@@ -281,7 +281,7 @@ async def _ingest_nws(
 
 
 async def _ingest_openmeteo(
-    bind: object, city: str, cycle_init: datetime, lead: int, *, mode: Mode
+    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode
 ) -> int:
     """Open-Meteo ensemble -> per-member rows (02-04, live-forward)."""
     target_date = _target_date_for(city, cycle_init, lead)
@@ -295,7 +295,7 @@ async def _ingest_openmeteo(
 
 
 async def _ingest_wethr(
-    bind: object, city: str, cycle_init: datetime, *, mode: Mode
+    bind: Bind, city: str, cycle_init: datetime, *, mode: Mode
 ) -> int:
     """Wethr deterministic models -> per-model rows; graceful skip when key unset (02-04)."""
     target_date = _target_date_for(city, cycle_init, 0)
@@ -313,7 +313,7 @@ async def _ingest_wethr(
 
 
 async def ingest_obs(
-    bind: object, city: str, target_date: date, *, cli_max_f: float | None = None
+    bind: Bind, city: str, target_date: date, *, cli_max_f: float | None = None
 ) -> int:
     """Ground-truth ASOS daily-high for ``city``/``target_date`` (02-03, D-16).
 
@@ -338,7 +338,7 @@ async def ingest_obs(
 
 
 async def ingest_afd(
-    bind: object,
+    bind: Bind,
     city: str,
     target_date: date,
     *,
@@ -401,7 +401,7 @@ def target_date_to_dt(target_date: date) -> datetime:
 
 
 async def ingest_all_models(
-    bind: object,
+    bind: Bind,
     city: str,
     cycle_init: datetime,
     *,
@@ -444,7 +444,7 @@ async def ingest_all_models(
 
 
 async def ingest_range(
-    bind: object,
+    bind: Bind,
     models: Sequence[str],
     cities: Sequence[str],
     start_date: date,

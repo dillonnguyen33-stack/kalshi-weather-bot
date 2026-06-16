@@ -31,10 +31,11 @@ import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from typing import Any, cast
 
 import httpx
 
-from weatherquant.ingest.writer import insert_observation
+from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, settlement_window
 
@@ -118,7 +119,8 @@ def _coerce(reading: object) -> tuple[datetime, float] | None:
     try:
         if tmpf_raw is None:
             return None
-        tmpf = float(tmpf_raw)
+        # Untrusted parsed value (CSV/JSON edge); the except below catches a bad type.
+        tmpf = float(cast(Any, tmpf_raw))
     except (TypeError, ValueError):
         return None
     return ts, tmpf
@@ -330,7 +332,7 @@ async def _fetch_awc_fallback(
 
 
 def store_daily_high(
-    bind: object,
+    bind: Bind,
     city: str,
     target_date: date,
     result: DailyHigh,

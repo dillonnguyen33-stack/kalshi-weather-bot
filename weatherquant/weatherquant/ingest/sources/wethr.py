@@ -31,7 +31,7 @@ import httpx
 from weatherquant.db.engine import get_settings
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.sources._client import get_client, request_with_retry
-from weatherquant.ingest.writer import insert_forecast
+from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 
 logger = logging.getLogger(__name__)
@@ -149,7 +149,7 @@ async def fetch_wethr_forecast(
 
 
 def store_wethr_forecast(
-    bind: object,
+    bind: Bind,
     city: str,
     model: str,
     target_date: date,

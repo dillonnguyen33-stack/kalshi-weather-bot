@@ -31,12 +31,13 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timezone
+from typing import Any
 
 import httpx
 
 from weatherquant.db.engine import get_settings
 from weatherquant.ingest.errors import AvailabilityError
-from weatherquant.ingest.writer import insert_observation
+from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import CITIES
 
 logger = logging.getLogger(__name__)
@@ -157,7 +158,7 @@ def classify_afd(
     text: str,
     wfo: str,
     client: object | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """Classify one AFD excerpt into a structured disagreement signal (ING-07, D-13).
 
     Order of operations:
@@ -259,7 +260,8 @@ async def fetch_afd_text(
             headers={"User-Agent": _USER_AGENT},
         )
         prod_resp.raise_for_status()
-        return prod_resp.json().get("productText", "")
+        text = prod_resp.json().get("productText", "")
+        return text if isinstance(text, str) else ""
     except (httpx.HTTPError, ValueError) as exc:
         logger.warning("AFD fetch failed for WFO=%s (%s)", wfo, exc)
         return None
@@ -269,10 +271,10 @@ async def fetch_afd_text(
 
 
 def store_afd_signal(
-    bind: object,
+    bind: Bind,
     city: str,
     target_date: date,
-    result: dict,
+    result: dict[str, Any],
     available_at: datetime | None = None,
     mode: str = "live",
 ) -> int:
