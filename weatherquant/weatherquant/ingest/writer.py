@@ -7,7 +7,9 @@ private helper so there is exactly ONE place that:
 1. runs the content/cycle skip-before-insert (``idempotency.row_exists``) FIRST, returning
    0 (a no-op skip) when an identical row already exists (D-10), and
 2. otherwise executes a SQLAlchemy Core ``table.insert().values(...)`` (Core only, no ORM)
-   and asserts ``result.rowcount == 1`` — the preserve_rowcount contract (D-11).
+   and raises ``RuntimeError`` unless ``result.rowcount == 1`` — the preserve_rowcount
+   contract (D-11). An explicit raise (not a bare ``assert``) so the guard survives
+   ``python -O`` (WR-06).
 
 There is NO UPDATE / upsert / ON CONFLICT path anywhere here: the append-only trigger
 (:mod:`weatherquant.db.ddl`) would raise, so a correction is a fresh INSERT with a later
@@ -40,7 +42,8 @@ def _insert_row(
 
     The ONE audited insert path (D-10/D-11). Calls ``row_exists`` over the natural key +
     content FIRST; if the identical row is already present, returns 0 (no-op skip) without
-    touching the table. Otherwise executes a Core insert and asserts ``rowcount == 1``.
+    touching the table. Otherwise executes a Core insert and raises ``RuntimeError`` unless
+    ``rowcount == 1`` (WR-06: an explicit raise, not a stripped-under-``-O`` assert).
     Never issues an UPDATE/upsert — the append-only trigger would raise.
     """
 
@@ -50,10 +53,14 @@ def _insert_row(
         values = {**natural_key, **content, "available_at": available_at}
         result = conn.execute(table.insert().values(**values))
         # preserve_rowcount (engine.get_engine) makes a single-row insert report 1 despite
-        # the implicit RETURNING id on the Identity() PK (D-11 contract).
-        assert result.rowcount == 1, (
-            f"expected rowcount==1 inserting into {table.name}, got {result.rowcount}"
-        )
+        # the implicit RETURNING id on the Identity() PK (D-11 contract). This integrity
+        # guard is an explicit raise, NOT a bare assert: `python -O` / PYTHONOPTIMIZE strips
+        # asserts, which would silently disable the only check that the single audited insert
+        # actually landed a row (WR-06).
+        if result.rowcount != 1:
+            raise RuntimeError(
+                f"expected rowcount==1 inserting into {table.name}, got {result.rowcount}"
+            )
         return result.rowcount
 
     if isinstance(bind, Engine):
