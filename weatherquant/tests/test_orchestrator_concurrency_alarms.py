@@ -20,6 +20,12 @@ import pytest
 
 from weatherquant.ingest import afd as afd_mod
 from weatherquant.ingest import grib, orchestrator
+from weatherquant.ingest.errors import (
+    CorrectnessError,
+    SanityError,
+    TargetDateError,
+    UnitError,
+)
 from weatherquant.ingest.writer import WriteIntegrityError
 
 _CYCLE = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
@@ -118,3 +124,73 @@ async def test_transient_runtimeerror_still_degrades_gracefully(
         n = await orchestrator.ingest_cycle(object(), "hrrr", "NYC", _CYCLE, mode="backfill", lead=0)
     assert n == 0  # graceful skip
     assert any("ingest fallback" in r.message and "source=hrrr" in r.message for r in caplog.records)
+
+
+# --- WR-05 FULL: the bare-ValueError correctness alarms now propagate (the partial gap) ------
+
+
+async def test_unit_error_propagates_not_swallowed(
+    grib_alarm_env, monkeypatch: pytest.MonkeyPatch
+):
+    """WR-05 (full): a UnitError (unit mismatch) PROPAGATES — previously a bare ValueError swallowed.
+
+    A UnitError IS-A ValueError, so the old ``except Exception`` would have downgraded it to a
+    silent "missing cycle" skip. It must now fail loud (it is a CorrectnessError).
+    """
+
+    def _raise_unit(_bind, **_kw):  # noqa: ANN001
+        raise UnitError("decoded TMP:2 m units must be 'K'; got units='F'")
+
+    monkeypatch.setattr(orchestrator, "insert_forecast", _raise_unit)
+
+    with pytest.raises(UnitError):
+        await orchestrator.ingest_cycle(object(), "nbm", "NYC", _CYCLE, mode="backfill", lead=0)
+
+
+async def test_sanity_error_propagates_not_swallowed(monkeypatch: pytest.MonkeyPatch):
+    """WR-05 (full): a SanityError (lead-0 / snap breach) raised during the GRIB path PROPAGATES."""
+
+    fake_field = object()
+
+    def _fake_fetch_t2m(model, cycle_init, fxx, member="c00"):  # noqa: ANN001
+        return fake_field
+
+    def _snap_breach(_field, _city, **_kw):  # noqa: ANN001
+        # The snap raises a SanityError (out-of-domain station / wrong grid) — a correctness
+        # alarm, NOT a transient absence. It is a ValueError too, so the old catch swallowed it.
+        raise SanityError("nearest grid point 9e9 m from station exceeds bound (Pitfall 2)")
+
+    monkeypatch.setattr(grib, "fetch_t2m", _fake_fetch_t2m)
+    monkeypatch.setattr(grib, "snap_city", _snap_breach)
+
+    with pytest.raises(SanityError):
+        await orchestrator.ingest_cycle(object(), "nbm", "NYC", _CYCLE, mode="backfill", lead=0)
+
+
+# --- NEW-1: _target_date_for's fail-loud raise now actually escapes ingest_cycle ------------
+
+
+async def test_target_date_error_propagates_out_of_ingest_cycle(monkeypatch: pytest.MonkeyPatch):
+    """NEW-1: an impossible settlement window raises TargetDateError OUT of ingest_cycle.
+
+    ``_target_date_for`` runs INSIDE ingest_cycle's try; the regression was that its raise was a
+    bare ValueError, caught and downgraded to a silent skip — neutralizing WR-04 for every
+    ingest path. With TargetDateError (a CorrectnessError) the fail-loud guard actually escapes.
+    """
+
+    def _raise_target_date(_city, _cycle, _lead):  # noqa: ANN001
+        raise TargetDateError("no settlement window contains valid instant ... (D-16)")
+
+    monkeypatch.setattr(orchestrator, "_target_date_for", _raise_target_date)
+
+    with pytest.raises(TargetDateError):
+        await orchestrator.ingest_cycle(object(), "nbm", "NYC", _CYCLE, mode="backfill", lead=0)
+
+
+def test_all_alarms_are_correctness_errors():
+    """Source guard: every alarm type the orchestrator must re-raise IS-A CorrectnessError."""
+    for exc in (WriteIntegrityError, UnitError, SanityError, TargetDateError):
+        assert issubclass(exc, CorrectnessError), exc.__name__
+    # And the ValueError-compatible ones preserve the legacy contract.
+    for exc in (UnitError, SanityError, TargetDateError):
+        assert issubclass(exc, ValueError), exc.__name__

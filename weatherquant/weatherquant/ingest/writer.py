@@ -28,17 +28,18 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
 
 from weatherquant.db.models import forecasts, observations
+from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.ingest.idempotency import row_exists
 
 
-class WriteIntegrityError(RuntimeError):
+class WriteIntegrityError(CorrectnessError, RuntimeError):
     """The single-row insert integrity contract was violated (D-11, WR-06).
 
-    Raised when the audited insert reports ``rowcount != 1``. A dedicated type (rather than a
-    bare ``RuntimeError``) so the orchestrator's graceful-degradation handler (WR-05) can let
-    this CORRECTNESS ALARM propagate loudly instead of swallowing it as a transient
-    "missing cycle" — a row that should have landed silently vanishing is a real bug, not a
-    backfillable gap.
+    Raised when the audited insert reports ``rowcount != 1``. A :class:`CorrectnessError`
+    (and still a ``RuntimeError`` for back-compat) so the orchestrator's graceful-degradation
+    handler (WR-05) lets this CORRECTNESS ALARM propagate loudly via the single
+    ``except CorrectnessError`` re-raise — a row that should have landed silently vanishing is a
+    real bug, not a backfillable gap.
     """
 
 

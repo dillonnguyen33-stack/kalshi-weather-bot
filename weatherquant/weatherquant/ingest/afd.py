@@ -35,6 +35,7 @@ from datetime import date, datetime, timezone
 import httpx
 
 from weatherquant.db.engine import get_settings
+from weatherquant.ingest.errors import AvailabilityError
 from weatherquant.ingest.writer import insert_observation
 from weatherquant.registry import CITIES
 
@@ -300,8 +301,10 @@ def store_afd_signal(
     if available_at is None:
         if mode == "backfill":
             # CR-01: never stamp now() on a backfilled (historical) AFD row — that is the
-            # wall-clock look-ahead leak this whole module exists to prevent (D-09).
-            raise ValueError(
+            # wall-clock look-ahead leak this whole module exists to prevent (D-09). An
+            # AvailabilityError (a CorrectnessError) so it fails LOUD if it ever surfaces
+            # through the orchestrator, never a silent skip (WR-05). Still a ValueError.
+            raise AvailabilityError(
                 f"store_afd_signal in backfill requires an explicit available_at "
                 f"(AFD issuance time) for city={city} target_date={target_date} — refusing to "
                 f"stamp now() on a historical row (CR-01/D-09)"

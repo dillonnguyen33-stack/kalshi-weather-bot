@@ -40,8 +40,9 @@ from typing import Literal
 from weatherquant.ingest import afd as afd_mod
 from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
+from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
-from weatherquant.ingest.writer import WriteIntegrityError, insert_forecast
+from weatherquant.ingest.writer import insert_forecast
 from weatherquant.registry import CITIES, get_city
 from weatherquant.time import settlement_window
 
@@ -90,8 +91,10 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
     # ALWAYS matches, so reaching here means the offset/window math is broken — a real bug, not
     # a backfillable gap. Silently substituting the raw UTC date (the v3 "hand-rolled UTC day"
     # anti-pattern, D-16) would mislabel target_date and the obs path would never join against
-    # it. Fail loud instead (WR-04).
-    raise ValueError(
+    # it. Fail loud instead (WR-04). NEW-1: this raise is a TargetDateError (a CorrectnessError)
+    # NOT a bare ValueError — _target_date_for runs INSIDE ingest_cycle's try, so a bare
+    # ValueError was caught and downgraded to a silent skip, neutralizing the fail-loud guard.
+    raise TargetDateError(
         f"no settlement window contains valid instant {valid.isoformat()} "
         f"for city={city_code} (cycle_init={cycle_init.isoformat()}, lead={lead}) — "
         f"offset/window math is broken; refusing a hand-rolled UTC target_date (D-16)"
@@ -244,18 +247,21 @@ async def ingest_cycle(
         # An unknown city code (ASVS V5) is a caller error, not a graceful-degradation case —
         # never swallow it into a silent fallback.
         raise
-    except (WriteIntegrityError, AssertionError):
-        # WR-05: correctness ALARMS must NOT be downgraded to a silent "missing cycle" skip.
-        # The writer's rowcount integrity breach (a row that should have landed did not) and
-        # any AssertionError are real bugs — let them propagate LOUDLY so they page, rather
-        # than vanishing into a graceful fallback that satisfies absence=absence while masking
-        # corruption (D-11).
+    except (CorrectnessError, AssertionError):
+        # WR-05 / NEW-1: correctness ALARMS must NOT be downgraded to a silent "missing cycle"
+        # skip. CorrectnessError covers ALL of them by base class — the writer's rowcount
+        # integrity breach (WriteIntegrityError), a unit mismatch (UnitError), a lead-0 / snap
+        # breach (SanityError), and the impossible-window target_date raise (TargetDateError) —
+        # plus any AssertionError. These are real bugs: let them propagate LOUDLY so they page,
+        # rather than vanishing into a graceful fallback that masks corruption (D-11). (The
+        # earlier version caught only WriteIntegrityError/AssertionError, so the bare-ValueError
+        # alarms — and WR-04's own raise — were still swallowed below: WR-05 partial + NEW-1.)
         raise
     except Exception as exc:  # noqa: BLE001 - per-source graceful degradation (D-11).
-        # Expected transient/degradation failures: a late/missing model cycle, an HTTP fetch
-        # error, a Herbie/cfgrib decode error, a unit/snap ValueError from a source parser.
-        # These log a STRUCTURED fallback and the day proceeds with the other sources — but
-        # the correctness alarms above are explicitly excluded so they cannot hide here.
+        # EXPECTED transient/degradation failures ONLY: a late/missing model cycle, an HTTP
+        # fetch error (httpx), a Herbie/cfgrib decode error, a timeout/connection error. These
+        # log a STRUCTURED fallback and the day proceeds with the other sources. The correctness
+        # alarms above are excluded by type, so a real bug can never hide here.
         _log_fallback(model, city, cycle_init, exc)
         return 0
 
@@ -322,8 +328,9 @@ async def ingest_obs(
         return obs.store_daily_high(bind, city, target_date, result)
     except KeyError:
         raise
-    except (WriteIntegrityError, AssertionError):
-        # WR-05: an integrity breach on the obs write path is a correctness alarm — propagate.
+    except (CorrectnessError, AssertionError):
+        # WR-05/NEW-1: any correctness alarm on the obs write path (rowcount/unit/sanity/
+        # target_date) is a real bug — propagate loudly, do not degrade to a silent skip.
         raise
     except Exception as exc:  # noqa: BLE001 - graceful degradation (D-11).
         _log_fallback("asos", city, target_date_to_dt(target_date), exc)
@@ -378,8 +385,10 @@ async def ingest_afd(
         )
     except KeyError:
         raise
-    except (WriteIntegrityError, AssertionError):
-        # WR-05: an integrity breach on the AFD write path is a correctness alarm — propagate.
+    except (CorrectnessError, AssertionError):
+        # WR-05/NEW-1: any correctness alarm on the AFD path (rowcount integrity, the
+        # AvailabilityError backfill-now() guard, target_date, etc.) is a real bug — propagate
+        # loudly, do not degrade to a silent skip.
         raise
     except Exception as exc:  # noqa: BLE001 - graceful degradation (D-11).
         _log_fallback("afd", city, target_date_to_dt(target_date), exc)

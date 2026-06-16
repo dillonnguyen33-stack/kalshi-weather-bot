@@ -38,6 +38,7 @@ from pathlib import Path
 
 import numpy as np
 
+from weatherquant.ingest.errors import SanityError, UnitError
 from weatherquant.registry import get_city
 
 logger = logging.getLogger(__name__)
@@ -129,8 +130,10 @@ def _open_t2m_field(path: Path) -> T2MField:
     units = str(da.attrs.get("units", ""))
     if units != "K":
         # Pitfall 3: a non-Kelvin forecast field is a hard error — °F/°C must never enter
-        # the Kelvin-only forecast path (D-07).
-        raise ValueError(
+        # the Kelvin-only forecast path (D-07). A CorrectnessError (UnitError) so the
+        # orchestrator fails LOUD instead of degrading it to a silent skip (WR-05). Still a
+        # ValueError ("units must be 'K'") so the existing units-boundary test holds.
+        raise UnitError(
             f"decoded TMP:2 m units must be 'K' (Kelvin-only forecast path, D-03/D-07); "
             f"got units={units!r}"
         )
@@ -213,7 +216,9 @@ def snap_to_station(
         temp_kelvin,
     )
     if max_distance_m is not None and distance_m > max_distance_m:
-        raise ValueError(
+        # Snap-distance breach is a correctness alarm (SanityError): a bad station coord / grid
+        # mislabel must fail LOUD, not degrade to a silent skip (WR-05). Still a ValueError.
+        raise SanityError(
             f"nearest grid point {distance_m:.0f} m from station exceeds bound "
             f"{max_distance_m:.0f} m — likely a bad station coord or grid mislabel "
             f"(Pitfall 2)"
@@ -266,7 +271,8 @@ def lead0_sanity_check(
         city_code: optional city; ``"DEN"`` relaxes the default tolerance to 4 °C.
 
     Raises:
-        ValueError: if ``|forecast_k - asos_k|`` exceeds the tolerance (loud breach).
+        SanityError: if ``|forecast_k - asos_k|`` exceeds the tolerance (loud breach). It is a
+            ``CorrectnessError`` (so the orchestrator fails loud, WR-05) and a ``ValueError``.
     """
     if tolerance_c is None:
         if city_code == "DEN":
@@ -279,7 +285,9 @@ def lead0_sanity_check(
             tolerance_c = _LEAD0_TOLERANCE_C
     delta_c = abs(forecast_k - asos_k)
     if delta_c > tolerance_c:
-        raise ValueError(
+        # Lead-0 breach is a correctness alarm (SanityError): a wrong snap / unit / grid error
+        # must fail LOUD, not degrade to a silent skip (WR-05). Still a ValueError.
+        raise SanityError(
             f"lead-0 sanity breach: |forecast {forecast_k:.2f}K - ASOS {asos_k:.2f}K| = "
             f"{delta_c:.2f} C > {tolerance_c:.1f} C tolerance"
             + (f" (city={city_code})" if city_code else "")

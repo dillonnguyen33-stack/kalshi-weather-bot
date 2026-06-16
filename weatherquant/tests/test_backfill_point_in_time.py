@@ -171,5 +171,11 @@ def test_target_date_for_raises_on_impossible_window(monkeypatch: pytest.MonkeyP
         )
 
     monkeypatch.setattr(orch, "settlement_window", _empty_window)
-    with pytest.raises(ValueError, match="no settlement window contains valid instant"):
+    # NEW-1: the real raise is a TargetDateError (a CorrectnessError) so it escapes the
+    # ingest_cycle catch — and still a ValueError so this legacy contract holds.
+    from weatherquant.ingest.errors import CorrectnessError, TargetDateError
+
+    with pytest.raises(TargetDateError, match="no settlement window contains valid instant"):
         orch._target_date_for("NYC", _CYCLE, 0)
+    assert issubclass(TargetDateError, CorrectnessError)
+    assert issubclass(TargetDateError, ValueError)

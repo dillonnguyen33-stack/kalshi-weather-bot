@@ -30,6 +30,7 @@ from datetime import date, datetime, timezone
 import httpx
 
 from weatherquant.ingest.available_at import available_at
+from weatherquant.ingest.errors import UnitError
 from weatherquant.ingest.sources._client import get_client, request_with_retry
 from weatherquant.ingest.writer import insert_forecast
 from weatherquant.registry import get_city
@@ -63,7 +64,10 @@ def _to_kelvin(value: float, uom: str) -> float:
         return (value - 32.0) * 5.0 / 9.0 + _KELVIN_OFFSET
     if code in ("k", "kelvin"):
         return value
-    raise ValueError(
+    # An unrecognized unit is a correctness alarm (UnitError): storing an assumed unit into the
+    # Kelvin-only path would corrupt the ledger, so it must fail LOUD and NOT degrade to a
+    # silent skip (WR-05). Still a ValueError for any caller catching that.
+    raise UnitError(
         f"unrecognized NWS temperature unit {uom!r} — refusing to store an assumed unit "
         f"into the Kelvin-only forecast path (Pitfall 3 / D-07)"
     )
