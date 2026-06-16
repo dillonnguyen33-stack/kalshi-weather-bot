@@ -13,6 +13,19 @@ dependencies = [
     # Typed config + .env loading (V14 secrets handling). DATABASE_URL is read from env.
     "pydantic-settings==2.14.1",
     "python-dotenv==1.2.2",
+    # Ingestion edge (D-01/D-02): Herbie .idx byte-range subset + cfgrib/eccodes GRIB2
+    # decode + xarray at the I/O edge only (convert to np.ndarray before the calibration
+    # core; the pure-NumPy calibration constraint governs calibration, NOT ingestion).
+    # eccodes is the C-binary cfgrib binds to — the #1 install pitfall (cfgrib selfcheck
+    # is the gate). APScheduler stays on 3.11.x (4.x is a different, in-flux API).
+    "herbie-data==2026.3.0",
+    "cfgrib==0.9.15.1",
+    "xarray==2026.4.0",
+    "eccodes==2.47.0",
+    "httpx==0.28.1",
+    "anthropic>=0.109,<0.110",
+    "apscheduler==3.11.2",
+    "numpy==2.4.6",
 ]
 
 [dependency-groups]
@@ -20,6 +33,7 @@ dependencies = [
 # runtime settlement path (D-02 / Pitfall 1). The no-runtime-DST guard test enforces this.
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio==1.4.0",
     "timezonefinder==8.2.4",
 ]
 
@@ -30,6 +44,8 @@ testpaths = ["tests"]
 markers = [
     "integration: tests that require a reachable Postgres via DATABASE_URL (postgresql+psycopg://)",
 ]
+# Async source-client tests (httpx) need no per-test @pytest.mark.asyncio decorator.
+asyncio_mode = "auto"
 
 [build-system]
 requires = ["hatchling"]
