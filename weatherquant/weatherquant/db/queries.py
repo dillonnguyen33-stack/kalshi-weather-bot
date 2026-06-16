@@ -18,7 +18,8 @@ f-string-interpolated into SQL (threat T-01-05 / SQL injection via dynamic ident
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine, RowMapping
@@ -30,6 +31,7 @@ def latest(
     bind: Engine | Connection,
     table_name: str,
     natural_key: Sequence[str],
+    where: Mapping[str, Any] | None = None,
 ) -> list[RowMapping]:
     """Return the newest row per natural key for ``table_name`` (DISTINCT ON, D-10).
 
@@ -41,6 +43,12 @@ def latest(
             ``["city", "target_date", "model", "lead"]``). Each must be a real column of
             the table; resolution goes through ``table.c[name]`` so no caller string is
             ever interpolated into the SQL text (T-01-05).
+        where: optional ``{column_name: value}`` equality filter applied BEFORE the
+            DISTINCT ON, so callers can scope to a single key (e.g.
+            ``{"city": "NYC", "model": "gfs"}``) instead of fetching every key and
+            filtering in Python. Column names resolve through ``table.c[name]`` (same
+            injection-safe path as ``natural_key``); values are passed as bound
+            parameters by SQLAlchemy, never interpolated.
 
     Returns:
         One ``RowMapping`` per distinct natural-key tuple — the row with the greatest
@@ -60,6 +68,10 @@ def latest(
         .distinct(*key_cols)
         .order_by(*key_cols, table.c.available_at.desc(), table.c.id.desc())
     )
+
+    if where:
+        # Same validated-handle resolution as the key columns; values are bound params.
+        stmt = stmt.where(*(table.c[name] == value for name, value in where.items()))
 
     if isinstance(bind, Engine):
         with bind.connect() as conn:
