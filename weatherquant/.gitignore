@@ -1,2 +1,8 @@
 # Planning docs kept local-only
 .planning/
+
+# cfgrib regenerates a per-file .idx cache sidecar on first open of a GRIB2 file.
+# The vendored *.grib2 fixtures are committed; their .idx caches are recreated on demand
+# and must NOT be vendored (they embed an absolute-path/mtime cache key).
+*.grib2.*.idx
+

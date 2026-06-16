@@ -42,6 +42,12 @@ except ImportError:  # python-dotenv is a declared dep; guard for minimal envs o
 
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parent / "fixtures" / "cli"
 
+# Vendored byte-range GRIB2 subsets (HRRR Lambert, GFS lat/lon, GEFS member p01) live
+# directly under tests/fixtures/ and decode OFFLINE with cfgrib — no network, no Herbie
+# in the test path (RESEARCH § Validation: vendor a real sample, not a mock). The two
+# AFD pre-filter text fixtures live here too.
+GRIB_FIXTURE_DIR = pathlib.Path(__file__).resolve().parent / "fixtures"
+
 
 def _database_url() -> str | None:
     """Return DATABASE_URL from the environment, or None if genuinely unset/blank."""
@@ -108,6 +114,34 @@ def _load_all_fixtures() -> dict:
         payload = json.loads(path.read_text())
         data[payload["city"]] = payload
     return data
+
+
+@pytest.fixture(scope="session")
+def grib_fixture():
+    """Return a loader resolving a vendored GRIB2 fixture by short name.
+
+    Mirrors the ``cli_fixture``/``FIXTURE_DIR`` idiom: ``grib_fixture("hrrr")`` →
+    ``tests/fixtures/hrrr_t2m_sample.grib2`` as a ``pathlib.Path``. Tests open the
+    returned path with cfgrib directly (offline, deterministic) — the GRIB decode path
+    is exercised against the real eccodes binary without any network or Herbie call.
+    Skips cleanly if a requested fixture is missing so a partial checkout fails loud-but-
+    skippable rather than erroring at collection.
+    """
+
+    _NAMES = {
+        "hrrr": "hrrr_t2m_sample.grib2",
+        "gfs": "gfs_t2m_sample.grib2",
+        "gefs": "gefs_p01_t2m_sample.grib2",
+    }
+
+    def _load(name: str) -> pathlib.Path:
+        filename = _NAMES.get(name, name)
+        path = GRIB_FIXTURE_DIR / filename
+        if not path.exists():
+            pytest.skip(f"GRIB fixture not found: {path}")
+        return path
+
+    return _load
 
 
 @pytest.fixture(scope="session")

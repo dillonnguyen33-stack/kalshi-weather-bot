@@ -1,0 +1,18 @@
+000
+FXUS61 KOKX 131835
+AFDOKX
+
+Area Forecast Discussion
+National Weather Service New York NY
+235 PM EDT Sat Jun 13 2026
+
+.SYNOPSIS...
+Quiet weather; temperatures near normal through the period with high
+pressure in control. No significant forecast challenges; models
+are in good agreement and confidence is high. Highs tomorrow will be
+close to seasonal averages with light winds and ample sunshine.
+
+.NEAR TERM /THROUGH TONIGHT/...
+Clear skies overnight with light winds. Lows near normal.
+
+$$

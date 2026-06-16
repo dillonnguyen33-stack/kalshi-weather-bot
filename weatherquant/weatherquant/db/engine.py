@@ -39,7 +39,12 @@ def require_psycopg3_scheme(url: str) -> None:
 class Settings(BaseSettings):
     """Typed application settings sourced from the environment / local ``.env``.
 
-    Only the Phase-1 persistence config lives here; later phases add their own fields.
+    Phase-1 added ``database_url``; Phase-2 (02-01) adds the two ingestion secrets
+    ``anthropic_api_key`` (AFD forecaster-disagreement classification, D-13) and
+    ``wethr_api_key`` (Wethr.net bearer auth, ING-06). Both are nullable so ingestion
+    degrades gracefully when a key is absent (D-11) — the AFD/Wethr clients skip rather
+    than fail. The redacted ``__repr__``/``__str__`` below is a FIXED string, so adding
+    secret fields here can never leak them in a log line (ASVS V14, threat T-02-01).
     """
 
     model_config = SettingsConfigDict(
@@ -49,6 +54,8 @@ class Settings(BaseSettings):
     )
 
     database_url: str
+    anthropic_api_key: str | None = None
+    wethr_api_key: str | None = None
 
     @field_validator("database_url")
     @classmethod
@@ -62,8 +69,13 @@ class Settings(BaseSettings):
         require_psycopg3_scheme(value)
         return value
 
-    def __repr__(self) -> str:  # never leak the credential-bearing URL (ASVS V14)
-        return "Settings(database_url=<redacted>)"
+    def __repr__(self) -> str:  # never leak credential-bearing fields (ASVS V14)
+        # Fixed string: no field VALUE is ever interpolated, so neither the URL nor the
+        # API keys can leak through an accidental log/repr (threat T-02-01).
+        return (
+            "Settings(database_url=<redacted>, anthropic_api_key=<redacted>, "
+            "wethr_api_key=<redacted>)"
+        )
 
     __str__ = __repr__
 
