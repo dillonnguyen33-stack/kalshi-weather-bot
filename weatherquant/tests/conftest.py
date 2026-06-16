@@ -107,6 +107,26 @@ def pg_engine():
         engine.dispose()
 
 
+@pytest.fixture
+def pg_conn(pg_engine):
+    """Yield a Connection inside a transaction that is rolled back after each test.
+
+    The ledger is append-only (UPDATE/DELETE/TRUNCATE all raise), so committed test rows
+    can never be cleaned up — left uncontrolled they accumulate across runs on the
+    session-scoped engine and make row-counting assertions flaky. The guard triggers are
+    BEFORE UPDATE/DELETE/TRUNCATE only, so uncommitted INSERTs roll back cleanly here,
+    isolating every test. Reads issued on this same Connection see the in-transaction
+    rows (pass it straight to ``queries.latest(pg_conn, ...)``).
+    """
+    conn = pg_engine.connect()
+    txn = conn.begin()
+    try:
+        yield conn
+    finally:
+        txn.rollback()
+        conn.close()
+
+
 def _load_all_fixtures() -> dict:
     """Read every <city>.json under fixtures/cli/ into a dict keyed by city code."""
     data: dict = {}
