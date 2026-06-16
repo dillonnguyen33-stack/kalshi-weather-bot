@@ -358,6 +358,7 @@ async def ingest_range(
     mode: Mode = "backfill",
     lead: int = 0,
     cycle_hours: Sequence[int] | None = None,
+    include_obs: bool = True,
 ) -> dict[str, int]:
     """Backfill a date range on the SAME code path the scheduler uses (D-15/D-10).
 
@@ -367,6 +368,11 @@ async def ingest_range(
     (02-02) makes re-running a completed range a no-op (each duplicate cycle returns 0
     inserted, D-10). Validates every city via :func:`get_city` (ASVS V5) BEFORE any fetch.
 
+    When ``include_obs`` is set (default), the ground-truth ASOS daily-high and the AFD signal
+    are ALSO ingested once per city/day (the obs/AFD path is keyed by settlement date, not by
+    cycle) — so a backfill lands the verifying truth alongside the forecasts. Their counts are
+    reported under the ``"asos"`` and ``"afd"`` keys.
+
     Args:
         models: model/source labels to ingest (GRIB and/or supplementary).
         cities: Kalshi city codes (each validated up front; unknown raises KeyError).
@@ -374,9 +380,11 @@ async def ingest_range(
         mode: ``"backfill"`` (default) or ``"live"`` — the single live/backfill seam (D-15).
         lead: forecast lead hours for the GRIB models.
         cycle_hours: UTC cycle init hours to fetch per day (default ``[0]`` — the 00Z run).
+        include_obs: also ingest the ASOS daily-high + AFD signal per city/day (default True).
 
     Returns:
-        ``{model: total_rows_inserted}`` across the whole range.
+        ``{model: total_rows_inserted}`` across the whole range (plus ``asos``/``afd`` when
+        ``include_obs``).
     """
     for city in cities:
         get_city(city)  # ASVS V5: reject an unknown city before any fetch.
@@ -385,6 +393,9 @@ async def ingest_range(
 
     hours = list(cycle_hours) if cycle_hours is not None else [0]
     totals: dict[str, int] = {m: 0 for m in models}
+    if include_obs:
+        totals.setdefault("asos", 0)
+        totals.setdefault("afd", 0)
 
     day = start_date
     while day <= end_date:
@@ -398,6 +409,12 @@ async def ingest_range(
                         bind, model, city, cycle_init, mode=mode, lead=lead
                     )
                     totals[model] += inserted
+        # The obs/AFD ground truth is keyed by the settlement DATE (not the cycle), so it is
+        # ingested once per city/day after the day's forecast cycles (D-16/D-13).
+        if include_obs:
+            for city in cities:
+                totals["asos"] += await ingest_obs(bind, city, day)
+                totals["afd"] += await ingest_afd(bind, city, day)
         day += timedelta(days=1)
 
     logger.info(

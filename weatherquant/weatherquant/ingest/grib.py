@@ -33,7 +33,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -321,10 +321,19 @@ def fetch_t2m(
     """
     from herbie import Herbie  # lazy import: keep Herbie off the offline test path.
 
+    # Herbie's _validate() compares the run date against a tz-NAIVE pandas Timestamp
+    # (``pd.Timestamp.utcnow().tz_localize(None)``), so a tz-aware ``cycle_init`` raises
+    # "Cannot compare tz-naive and tz-aware timestamps". Herbie treats the run time as UTC
+    # implicitly; normalize an aware datetime to a naive UTC instant before handing it over.
+    if cycle_init.tzinfo is not None:
+        herbie_date = cycle_init.astimezone(timezone.utc).replace(tzinfo=None)
+    else:
+        herbie_date = cycle_init
+
     h_kwargs: dict[str, object] = {"model": model, "fxx": fxx}
     if model == "gefs":
         h_kwargs["member"] = member
-    herbie = Herbie(cycle_init, **h_kwargs)
+    herbie = Herbie(herbie_date, **h_kwargs)
 
     # Log the resolved S3 key + the selected .idx record / byte range (D-01) before fetch.
     try:
@@ -342,7 +351,10 @@ def fetch_t2m(
     except Exception:  # noqa: BLE001 - logging probe must never block the fetch.
         logger.warning("herbie .idx inventory probe failed for model=%s; proceeding", model)
 
-    local_path = herbie.download(":TMP:2 m", remove_grib=False)
+    # Download ONLY the :TMP:2 m byte-range subset (~1 MB, never the full ~700 MB file). The
+    # ``search`` argument is the GRIB message filter; herbie-data 2026.3.0 dropped the old
+    # ``remove_grib`` kwarg, so the subset file is kept by default and decoded below.
+    local_path = herbie.download(":TMP:2 m")
     return decode_t2m(local_path)
 
 

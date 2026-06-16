@@ -43,7 +43,10 @@ def _ensemble_payload() -> dict:
     for m in range(N_MEMBERS):
         # member m peak (in-window) = 20 + m*0.1 °C; the out-of-window hour is a hot 99 °C.
         peak_c = 20.0 + m * 0.1
-        hourly[f"temperature_2m_member{m:02d}"] = [99.0, peak_c - 2, peak_c, peak_c - 1]
+        # The /ensemble response keys the CONTROL as the bare "temperature_2m" (member 0) and
+        # the perturbations as "temperature_2m_member01..member30" — there is NO member00 key.
+        key = "temperature_2m" if m == 0 else f"temperature_2m_member{m:02d}"
+        hourly[key] = [99.0, peak_c - 2, peak_c, peak_c - 1]
     return {"hourly": hourly}
 
 
@@ -95,7 +98,10 @@ async def test_fetch_single_call_all_members_no_fahrenheit():
     assert len(captured["calls"]) == 1
     query = captured["last_query"].lower()
     assert "fahrenheit" not in query  # Pitfall 3 / D-07 — API-default Celsius only
-    assert "member00" in query and "member30" in query  # all members in the one request
+    # The request asks for the BASE variable; the /ensemble endpoint expands it into every
+    # member in the response (requesting the explicit member00..member30 list 400s).
+    assert "hourly=temperature_2m" in query
+    assert "member00" not in query  # never request the (nonexistent) member00 variable
     assert set(members) == set(range(N_MEMBERS))
 
 

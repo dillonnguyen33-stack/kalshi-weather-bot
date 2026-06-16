@@ -71,9 +71,23 @@ def member_label(member: int) -> str:
     return MODEL_BASE if member == 0 else f"{MODEL_BASE}:{member}"
 
 
+# The base hourly variable requested from the /ensemble endpoint. The ensemble API expands
+# this ONE requested variable into the full member set in the response: the bare
+# ``temperature_2m`` series is the CONTROL (member 0), and ``temperature_2m_member01`` ..
+# ``temperature_2m_member30`` are the 30 perturbations. There is NO ``temperature_2m_member00``
+# variable — requesting it (or the explicit member00..member30 list) is a 400 "Data corrupted"
+# error, so the request asks for the base variable and the response is demultiplexed below.
+HOURLY_VAR = "temperature_2m"
+
+
 def _member_var(member: int) -> str:
-    """The Open-Meteo hourly variable name for a member index (``temperature_2m_memberNN``)."""
-    return f"temperature_2m_member{member:02d}"
+    """The Open-Meteo RESPONSE key for a member index in the ``/ensemble`` payload.
+
+    Member 0 (the control) is the bare ``temperature_2m`` series; members 1..30 are
+    ``temperature_2m_member01`` .. ``temperature_2m_member30``. (Open-Meteo has no
+    ``temperature_2m_member00`` key — the control is unsuffixed.)
+    """
+    return HOURLY_VAR if member == 0 else f"{HOURLY_VAR}_member{member:02d}"
 
 
 def _window_max_kelvin(
@@ -143,12 +157,15 @@ async def fetch_openmeteo_ensemble(
         client: optional injected ``httpx.AsyncClient`` (the unit test passes a mock).
     """
     station = get_city(city)
-    members = ",".join(_member_var(m) for m in range(N_MEMBERS))
     ds = target_date.isoformat()
     params = {
         "latitude": station.lat,
         "longitude": station.lon,
-        "hourly": members,  # all 31 members in ONE request (A3 — stay in budget)
+        # Request the BASE variable; the /ensemble endpoint expands it into all 31 members in
+        # the response (control = bare temperature_2m, member01..member30 the perturbations).
+        # Requesting the explicit member00..member30 list 400s ("Data corrupted"). ONE request
+        # still returns every member (A3 — stay in budget).
+        "hourly": HOURLY_VAR,
         "models": ENSEMBLE_MODEL,
         "start_date": ds,
         "end_date": ds,
