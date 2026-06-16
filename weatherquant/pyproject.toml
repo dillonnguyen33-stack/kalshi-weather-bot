@@ -28,6 +28,11 @@ dependencies = [
     "numpy==2.4.6",
 ]
 
+[project.scripts]
+# Console entrypoint for the idempotent ingestion CLI (D-15) — the historical backfill
+# half of the one ingestion code path the live scheduler also drives.
+weatherquant = "weatherquant.cli:main"
+
 [dependency-groups]
 # Dev/test only. timezonefinder + zoneinfo live in tests/tooling ONLY — never on the
 # runtime settlement path (D-02 / Pitfall 1). The no-runtime-DST guard test enforces this.
