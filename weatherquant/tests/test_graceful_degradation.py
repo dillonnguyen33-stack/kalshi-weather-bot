@@ -123,15 +123,56 @@ async def test_missing_cycle_does_not_abort_other_models(
     assert summary["gfs"] == 1
     assert summary["gefs"] == 31  # c00 + p01..p30
 
-    # Supplementary sources unaffected: nws (1) + openmeteo (2 members); wethr skipped (0).
-    assert summary["nws"] == 1
-    assert summary["openmeteo"] == 2
+    # WR-02: in BACKFILL the live-only HTTP sources (nws/openmeteo/wethr) are SKIPPED — they
+    # return only the current forecast and have no point-in-time historical archive, so they
+    # are not run during a historical backfill (absence = absence, D-11). All three report 0.
+    assert summary["nws"] == 0
+    assert summary["openmeteo"] == 0
     assert summary["wethr"] == 0
 
     # Absence = absence: NOT A SINGLE recorded row is for the failed hrrr model (D-11).
     assert all(row["model"] != "hrrr" for row in recorder.rows)
-    # The recorded row total matches the successful counts (no fabricated/interpolated row).
-    assert len(recorder.rows) == 1 + 1 + 31 + 1 + 2  # nbm + gfs + gefs + nws + openmeteo
+    # The recorded row total is the GRIB successes only (nbm + gfs + gefs); the live-only
+    # supplementary sources were skipped in backfill, and hrrr failed (no fabricated row).
+    assert len(recorder.rows) == 1 + 1 + 31  # nbm + gfs + gefs
+
+
+async def test_live_mode_runs_supplementary_sources(
+    recorder: _RecordingBind, caplog: pytest.LogCaptureFixture
+):
+    """In LIVE mode the supplementary HTTP sources DO run (WR-02 only gates backfill)."""
+    cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
+    summary = await orchestrator.ingest_all_models(
+        recorder, "NYC", cycle, mode="live", lead=0
+    )
+
+    # GRIB still degrades on the failing hrrr; the others land.
+    assert summary["hrrr"] == 0
+    assert summary["nbm"] == 1
+    assert summary["gfs"] == 1
+    assert summary["gefs"] == 31
+
+    # WR-02: live mode runs the live-only sources — nws (1) + openmeteo (2); wethr skips (no key).
+    assert summary["nws"] == 1
+    assert summary["openmeteo"] == 2
+    assert summary["wethr"] == 0
+
+
+async def test_backfill_skips_live_only_sources_with_structured_log(
+    recorder: _RecordingBind, caplog: pytest.LogCaptureFixture
+):
+    """WR-02: backfill emits a structured live-only skip for nws/openmeteo/wethr (D-11)."""
+    cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
+    with caplog.at_level(logging.INFO):
+        await orchestrator.ingest_all_models(
+            recorder, "NYC", cycle, mode="backfill", lead=0
+        )
+
+    skip_logs = [r.message for r in caplog.records if "live-only" in r.message]
+    for source in ("nws", "openmeteo", "wethr"):
+        assert any(f"source={source}" in m for m in skip_logs), (source, skip_logs)
+    # No supplementary-source row was recorded (absence = absence).
+    assert all(not str(row["model"]).startswith(("nws", "openmeteo", "wethr")) for row in recorder.rows)
 
 
 async def test_backfill_mode_stamps_publish_latency_not_now(

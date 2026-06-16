@@ -41,7 +41,7 @@ from weatherquant.ingest import afd as afd_mod
 from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.sources import nws, openmeteo, wethr
-from weatherquant.ingest.writer import insert_forecast
+from weatherquant.ingest.writer import WriteIntegrityError, insert_forecast
 from weatherquant.registry import CITIES, get_city
 from weatherquant.time import settlement_window
 
@@ -71,7 +71,9 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
     settlement (civil) date by walking the candidate days' half-open
     :func:`settlement_window` and returning the one that contains the valid instant. This
     keeps a forecast row's ``target_date`` consistent with the LST window the obs path
-    labels against (D-16) — never a hand-rolled UTC day.
+    labels against (D-16) — never a hand-rolled UTC day. If no candidate window contains the
+    valid instant (a broken offset/window — never expected for a US offset) this RAISES
+    ``ValueError`` rather than silently substituting the raw UTC date (WR-04 / D-16).
     """
     city = get_city(city_code)
     valid = cycle_init + timedelta(hours=lead)
@@ -84,7 +86,16 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
         win = settlement_window(city, candidate)
         if win.start_utc <= valid < win.end_utc:
             return candidate
-    return base
+    # No candidate window contains the valid instant. For any normal US offset the loop above
+    # ALWAYS matches, so reaching here means the offset/window math is broken — a real bug, not
+    # a backfillable gap. Silently substituting the raw UTC date (the v3 "hand-rolled UTC day"
+    # anti-pattern, D-16) would mislabel target_date and the obs path would never join against
+    # it. Fail loud instead (WR-04).
+    raise ValueError(
+        f"no settlement window contains valid instant {valid.isoformat()} "
+        f"for city={city_code} (cycle_init={cycle_init.isoformat()}, lead={lead}) — "
+        f"offset/window math is broken; refusing a hand-rolled UTC target_date (D-16)"
+    )
 
 
 async def _ingest_grib_model(
@@ -165,6 +176,23 @@ def _log_fallback(model: str, city: str, cycle: datetime, reason: object) -> Non
     )
 
 
+def _log_live_only_skip(source: str, city: str, cycle: datetime) -> None:
+    """Structured skip for a live-only HTTP source requested in backfill (WR-02, D-11).
+
+    nws/openmeteo/wethr return the CURRENT forecast only — they have no point-in-time
+    historical archive (the deep corpus is NOAA GRIB). Running them during a historical
+    backfill would write today's forecast under a PAST ``target_date`` (fabricated/leaky data,
+    D-09). So backfill SKIPS them and logs this event; absence = absence (D-11), no row lands.
+    """
+    logger.info(
+        "ingest skip (backfill): source=%s city=%s cycle=%s is live-only (no point-in-time "
+        "historical archive) — NOT run in backfill, NO fabricated row (WR-02/D-11)",
+        source,
+        city,
+        cycle.isoformat(),
+    )
+
+
 async def ingest_cycle(
     bind: object,
     model: str,
@@ -198,34 +226,56 @@ async def ingest_cycle(
             return await _ingest_grib_model(
                 bind, model, city, cycle_init, mode=mode, lead=lead
             )
-        if model == "nws":
-            return await _ingest_nws(bind, city, cycle_init, lead)
-        if model == "openmeteo":
-            return await _ingest_openmeteo(bind, city, cycle_init, lead)
-        if model == "wethr":
-            return await _ingest_wethr(bind, city, cycle_init)
+        if model in SUPPLEMENTARY_SOURCES:
+            # The supplementary HTTP sources (nws/openmeteo/wethr) return the CURRENT forecast
+            # only — they have no point-in-time historical archive. Running them in backfill
+            # would write today's forecast under a PAST target_date (fabricated/leaky data,
+            # D-09/D-11). Refuse + structured skip in backfill (WR-02); run normally in live.
+            if mode == "backfill":
+                _log_live_only_skip(model, city, cycle_init)
+                return 0
+            if model == "nws":
+                return await _ingest_nws(bind, city, cycle_init, lead, mode=mode)
+            if model == "openmeteo":
+                return await _ingest_openmeteo(bind, city, cycle_init, lead, mode=mode)
+            return await _ingest_wethr(bind, city, cycle_init, mode=mode)
         raise ValueError(f"unknown ingest model/source: {model!r}")
     except KeyError:
         # An unknown city code (ASVS V5) is a caller error, not a graceful-degradation case —
         # never swallow it into a silent fallback.
         raise
+    except (WriteIntegrityError, AssertionError):
+        # WR-05: correctness ALARMS must NOT be downgraded to a silent "missing cycle" skip.
+        # The writer's rowcount integrity breach (a row that should have landed did not) and
+        # any AssertionError are real bugs — let them propagate LOUDLY so they page, rather
+        # than vanishing into a graceful fallback that satisfies absence=absence while masking
+        # corruption (D-11).
+        raise
     except Exception as exc:  # noqa: BLE001 - per-source graceful degradation (D-11).
+        # Expected transient/degradation failures: a late/missing model cycle, an HTTP fetch
+        # error, a Herbie/cfgrib decode error, a unit/snap ValueError from a source parser.
+        # These log a STRUCTURED fallback and the day proceeds with the other sources — but
+        # the correctness alarms above are explicitly excluded so they cannot hide here.
         _log_fallback(model, city, cycle_init, exc)
         return 0
 
 
-async def _ingest_nws(bind: object, city: str, cycle_init: datetime, lead: int) -> int:
+async def _ingest_nws(
+    bind: object, city: str, cycle_init: datetime, lead: int, *, mode: Mode
+) -> int:
     """NWS gridpoint -> in-window max -> one ``nws`` forecast row (02-04, live-forward)."""
     target_date = _target_date_for(city, cycle_init, lead)
     temp_kelvin = await nws.fetch_nws_forecast(city, target_date)
     if temp_kelvin is None:
         _log_fallback("nws", city, cycle_init, "no in-window NWS forecast")
         return 0
-    return nws.store_nws_forecast(bind, city, target_date, temp_kelvin, cycle=cycle_init)
+    return nws.store_nws_forecast(
+        bind, city, target_date, temp_kelvin, cycle=cycle_init, mode=mode
+    )
 
 
 async def _ingest_openmeteo(
-    bind: object, city: str, cycle_init: datetime, lead: int
+    bind: object, city: str, cycle_init: datetime, lead: int, *, mode: Mode
 ) -> int:
     """Open-Meteo ensemble -> per-member rows (02-04, live-forward)."""
     target_date = _target_date_for(city, cycle_init, lead)
@@ -233,10 +283,14 @@ async def _ingest_openmeteo(
     if not members:
         _log_fallback("openmeteo", city, cycle_init, "no in-window ensemble members")
         return 0
-    return openmeteo.store_members(bind, city, target_date, members, cycle=cycle_init)
+    return openmeteo.store_members(
+        bind, city, target_date, members, cycle=cycle_init, mode=mode
+    )
 
 
-async def _ingest_wethr(bind: object, city: str, cycle_init: datetime) -> int:
+async def _ingest_wethr(
+    bind: object, city: str, cycle_init: datetime, *, mode: Mode
+) -> int:
     """Wethr deterministic models -> per-model rows; graceful skip when key unset (02-04)."""
     target_date = _target_date_for(city, cycle_init, 0)
     inserted = 0
@@ -247,7 +301,7 @@ async def _ingest_wethr(bind: object, city: str, cycle_init: datetime) -> int:
             # absence = absence (D-11), no fabricated row.
             continue
         inserted += wethr.store_wethr_forecast(
-            bind, city, model, target_date, temp_kelvin, cycle=cycle_init
+            bind, city, model, target_date, temp_kelvin, cycle=cycle_init, mode=mode
         )
     return inserted
 
@@ -268,13 +322,21 @@ async def ingest_obs(
         return obs.store_daily_high(bind, city, target_date, result)
     except KeyError:
         raise
+    except (WriteIntegrityError, AssertionError):
+        # WR-05: an integrity breach on the obs write path is a correctness alarm — propagate.
+        raise
     except Exception as exc:  # noqa: BLE001 - graceful degradation (D-11).
         _log_fallback("asos", city, target_date_to_dt(target_date), exc)
         return 0
 
 
 async def ingest_afd(
-    bind: object, city: str, target_date: date, *, available: datetime | None = None
+    bind: object,
+    city: str,
+    target_date: date,
+    *,
+    available: datetime | None = None,
+    mode: Mode = "live",
 ) -> int:
     """AFD forecaster-disagreement signal for ``city``/``target_date`` (02-03, D-13).
 
@@ -282,18 +344,42 @@ async def ingest_afd(
     any paid call, forces the Anthropic ``record_afd_signal`` tool (or degrades to no-signal
     when the key is unset), and stores ``source='afd'``. A fetch/classify failure logs a
     structured fallback and returns 0 (D-11).
+
+    POINT-IN-TIME INTEGRITY (CR-01, D-09). An AFD row's ``available_at`` MUST be the product
+    ISSUANCE time, never ``now()``. ``fetch_afd_text`` returns only the LATEST (current)
+    product, so a historical issuance time cannot be recovered in backfill. Therefore in
+    ``mode="backfill"`` AFD is SKIPPED unless the caller supplies an explicit ``available``
+    issuance time — a structured skip is logged and NO row lands (absence = absence, D-11),
+    rather than stamping ``now()`` on a row reconstructed for a past date (the CR-01 leak).
+
+    OFF-LOOP CLASSIFY (WR-03, D-14). ``classify_afd`` can make a blocking Anthropic SDK call;
+    it is run in a thread executor (like the GRIB decode) so it never blocks the async loop.
+    Paid classification is additionally gated OFF in backfill (no live AFD issuance to stamp,
+    and a range backfill must not fan out paid per-city/day calls).
     """
     try:
         wfo = afd_mod.CITY_WFO[city]
+        if mode == "backfill" and available is None:
+            # CR-01: cannot recover a historical AFD issuance time from the live "latest"
+            # product fetch. Refuse to stamp now() on a backfilled row — skip + structured log
+            # (absence = absence, D-11). Live mode (or an explicit issuance time) still runs.
+            _log_live_only_skip("afd", city, target_date_to_dt(target_date))
+            return 0
         text = await afd_mod.fetch_afd_text(wfo)
         if not text:
             _log_fallback("afd", city, target_date_to_dt(target_date), "no AFD product text")
             return 0
-        signal = afd_mod.classify_afd(text, wfo)
+        # WR-03/D-14: the classify path may issue a BLOCKING Anthropic SDK call — run it off
+        # the event loop in a thread executor so concurrent fetches are not blocked.
+        loop = asyncio.get_running_loop()
+        signal = await loop.run_in_executor(None, afd_mod.classify_afd, text, wfo)
         return afd_mod.store_afd_signal(
-            bind, city, target_date, signal, available_at=available
+            bind, city, target_date, signal, available_at=available, mode=mode
         )
     except KeyError:
+        raise
+    except (WriteIntegrityError, AssertionError):
+        # WR-05: an integrity breach on the AFD write path is a correctness alarm — propagate.
         raise
     except Exception as exc:  # noqa: BLE001 - graceful degradation (D-11).
         _log_fallback("afd", city, target_date_to_dt(target_date), exc)
@@ -368,10 +454,19 @@ async def ingest_range(
     (02-02) makes re-running a completed range a no-op (each duplicate cycle returns 0
     inserted, D-10). Validates every city via :func:`get_city` (ASVS V5) BEFORE any fetch.
 
-    When ``include_obs`` is set (default), the ground-truth ASOS daily-high and the AFD signal
-    are ALSO ingested once per city/day (the obs/AFD path is keyed by settlement date, not by
-    cycle) — so a backfill lands the verifying truth alongside the forecasts. Their counts are
-    reported under the ``"asos"`` and ``"afd"`` keys.
+    LIVE-ONLY SOURCES ARE NOT BACKFILLED (WR-02). nws/openmeteo/wethr return only the CURRENT
+    forecast — they have no point-in-time historical archive — so in ``mode="backfill"``
+    :func:`ingest_cycle` SKIPS them with a structured log (absence = absence, D-11) rather than
+    writing today's forecast under N past ``target_date``s. Only the GRIB models (NOAA archive)
+    and the ASOS obs (IEM archive) carry real historical data; AFD runs only when a historical
+    issuance time is recoverable (skipped in plain backfill — CR-01). In ``mode="live"`` every
+    source runs normally. This is a behavior change: a range backfill no longer fabricates the
+    supplementary/AFD rows it previously mis-stamped.
+
+    When ``include_obs`` is set (default), the ground-truth ASOS daily-high (and AFD in live
+    mode) are ALSO ingested once per city/day (the obs/AFD path is keyed by settlement date,
+    not by cycle) — so a backfill lands the verifying truth alongside the forecasts. Their
+    counts are reported under the ``"asos"`` and ``"afd"`` keys.
 
     Args:
         models: model/source labels to ingest (GRIB and/or supplementary).
@@ -413,8 +508,12 @@ async def ingest_range(
         # ingested once per city/day after the day's forecast cycles (D-16/D-13).
         if include_obs:
             for city in cities:
+                # ASOS has a true point-in-time historical archive (IEM) — it is the verifying
+                # truth and runs in backfill. AFD is threaded with mode: in backfill it skips
+                # (no recoverable historical issuance time — CR-01) unless an issuance time is
+                # supplied; in live it stamps the report time.
                 totals["asos"] += await ingest_obs(bind, city, day)
-                totals["afd"] += await ingest_afd(bind, city, day)
+                totals["afd"] += await ingest_afd(bind, city, day, mode=mode)
         day += timedelta(days=1)
 
     logger.info(
