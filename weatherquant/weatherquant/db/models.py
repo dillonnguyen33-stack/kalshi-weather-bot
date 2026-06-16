@@ -36,6 +36,7 @@ from __future__ import annotations
 from datetime import datetime
 
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 from weatherquant.db import ddl
 
@@ -63,7 +64,14 @@ def _available_at_column() -> sa.Column[datetime]:
     return sa.Column("available_at", sa.TIMESTAMP(timezone=True), nullable=False)
 
 
-# --- forecasts: natural key = city, target_date, model, lead -----------------------
+# --- forecasts: natural key = city, target_date, model, lead, member ---------------
+# Phase-2 (02-01, D-05) extends the natural key with ``member`` (ensemble member axis)
+# and adds the decoded GRIB payload columns. ``member`` is NOT NULL with a server default
+# of 0 so the deterministic models (HRRR/GFS/NBM) and any pre-existing rows resolve to the
+# control member; GEFS/Open-Meteo members write 1..N. ``temp_kelvin`` keeps forecasts in
+# Kelvin (units never leak to °F on the forecast path — D-07); ``cycle`` is the model
+# init time; ``station_lat``/``station_lon``/``grid_distance_m`` log the nearest-grid-point
+# snap to the Kalshi settlement station (D-05). Columns are DOUBLE PRECISION (sa.Float).
 forecasts = sa.Table(
     "forecasts",
     metadata,
@@ -72,6 +80,12 @@ forecasts = sa.Table(
     sa.Column("target_date", sa.Date, nullable=False),
     sa.Column("model", sa.Text, nullable=False),
     sa.Column("lead", sa.Integer, nullable=False),
+    sa.Column("member", sa.SmallInteger, nullable=False, server_default=sa.text("0")),
+    sa.Column("temp_kelvin", sa.Float),
+    sa.Column("cycle", sa.TIMESTAMP(timezone=True)),
+    sa.Column("station_lat", sa.Float),
+    sa.Column("station_lon", sa.Float),
+    sa.Column("grid_distance_m", sa.Float),
     _available_at_column(),
     sa.Index(
         "ix_forecasts_latest",
@@ -79,11 +93,19 @@ forecasts = sa.Table(
         "target_date",
         "model",
         "lead",
+        "member",
         "available_at",
     ),
 )
 
 # --- observations: natural key = city, target_date (LST settlement day), source ----
+# Phase-2 (02-01, D-06/D-07) adds the obs payload columns. The natural key
+# (city, target_date, source) is UNCHANGED — ``source='afd'`` slots in alongside the
+# weather-feed sources. ``daily_high_f`` keeps observations in °F (D-07; the °F→K
+# conversion is centralized in ingest/obs.py, NOT here). ``window_start``/``window_end``
+# record the LST settlement window the daily high was computed over; ``obs_count`` is the
+# number of in-window readings; ``detail`` (JSONB) carries the AFD tool-use result / raw
+# obs payload (D-06).
 observations = sa.Table(
     "observations",
     metadata,
@@ -91,6 +113,11 @@ observations = sa.Table(
     sa.Column("city", sa.Text, nullable=False),
     sa.Column("target_date", sa.Date, nullable=False),
     sa.Column("source", sa.Text, nullable=False),
+    sa.Column("daily_high_f", sa.Float),
+    sa.Column("window_start", sa.TIMESTAMP(timezone=True)),
+    sa.Column("window_end", sa.TIMESTAMP(timezone=True)),
+    sa.Column("obs_count", sa.Integer),
+    sa.Column("detail", postgresql.JSONB),
     _available_at_column(),
     sa.Index(
         "ix_observations_latest",
