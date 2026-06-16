@@ -31,6 +31,17 @@ from weatherquant.db.models import forecasts, observations
 from weatherquant.ingest.idempotency import row_exists
 
 
+class WriteIntegrityError(RuntimeError):
+    """The single-row insert integrity contract was violated (D-11, WR-06).
+
+    Raised when the audited insert reports ``rowcount != 1``. A dedicated type (rather than a
+    bare ``RuntimeError``) so the orchestrator's graceful-degradation handler (WR-05) can let
+    this CORRECTNESS ALARM propagate loudly instead of swallowing it as a transient
+    "missing cycle" — a row that should have landed silently vanishing is a real bug, not a
+    backfillable gap.
+    """
+
+
 def _insert_row(
     bind: Engine | Connection,
     table: sa.Table,
@@ -58,7 +69,7 @@ def _insert_row(
         # asserts, which would silently disable the only check that the single audited insert
         # actually landed a row (WR-06).
         if result.rowcount != 1:
-            raise RuntimeError(
+            raise WriteIntegrityError(
                 f"expected rowcount==1 inserting into {table.name}, got {result.rowcount}"
             )
         return result.rowcount
@@ -151,4 +162,4 @@ def insert_observation(
     return _insert_row(bind, observations, natural_key, content, available_at)
 
 
-__all__ = ["insert_forecast", "insert_observation"]
+__all__ = ["insert_forecast", "insert_observation", "WriteIntegrityError"]

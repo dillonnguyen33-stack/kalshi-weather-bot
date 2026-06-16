@@ -23,7 +23,7 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection
 
 from weatherquant.ingest import writer
-from weatherquant.ingest.writer import _insert_row
+from weatherquant.ingest.writer import WriteIntegrityError, _insert_row
 
 
 class _FakeResult:
@@ -82,9 +82,13 @@ def test_non_one_rowcount_raises_runtimeerror_not_assertionerror(
     monkeypatch: pytest.MonkeyPatch, bad: int
 ):
     # A 0- or 2-row outcome is an integrity breach: it must raise a REAL exception type
-    # (RuntimeError), not an AssertionError that -O would strip.
+    # (WriteIntegrityError, a RuntimeError subclass), not an AssertionError that -O would strip.
     with pytest.raises(RuntimeError, match="expected rowcount==1"):
         _call_with_rowcount(monkeypatch, bad)
+    # The dedicated correctness-alarm type (so WR-05's handler can re-raise it, not swallow it).
+    with pytest.raises(WriteIntegrityError):
+        _call_with_rowcount(monkeypatch, bad)
+    assert issubclass(WriteIntegrityError, RuntimeError)
 
 
 def test_guard_is_not_a_bare_assert_survives_dash_O():
