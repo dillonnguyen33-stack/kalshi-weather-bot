@@ -64,20 +64,21 @@ def test_shrinkage_weight_blends_toward_parent() -> None:
 
     # n == KAPPA → own-weight ~0.5: the blended params sit roughly halfway between the fine
     # fit and the parent. Use a fine stratum whose own fit is clearly different from parent.
-    fine = _samples(n=KAPPA, a=9.0, b=1.0, c=2.0, d=0.5, seed=101)
+    n_kappa = int(KAPPA)
+    fine = _samples(n=n_kappa, a=9.0, b=1.0, c=2.0, d=0.5, seed=101)
     blended = fit_stratum_pooled(fine, samples=parent, parent_fit=parent_fit)
 
-    w = KAPPA / (KAPPA + KAPPA)  # == 0.5
+    w = n_kappa / (n_kappa + KAPPA)  # == 0.5 when n == KAPPA
     assert w == pytest.approx(0.5)
     # Blended intercept must lie strictly between the parent and the fine own-fit.
     fine_own = fit_stratum_pooled(fine, samples=None)
     lo, hi = sorted((parent_fit.a, fine_own.a))
     assert lo < blended.a < hi
     assert blended.pool_level == "shrunk:month"
-    assert blended.n_train == KAPPA
+    assert blended.n_train == n_kappa
 
     # n ≫ KAPPA → own-weight → 1: blended approaches the fine own-fit.
-    big = _samples(n=20 * KAPPA, a=9.0, b=1.0, c=2.0, d=0.5, seed=102)
+    big = _samples(n=20 * n_kappa, a=9.0, b=1.0, c=2.0, d=0.5, seed=102)
     big_blended = fit_stratum_pooled(big, samples=parent, parent_fit=parent_fit)
     big_own = fit_stratum_pooled(big, samples=None)
     assert abs(big_blended.a - big_own.a) < abs(big_blended.a - parent_fit.a)
