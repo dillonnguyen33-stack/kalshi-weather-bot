@@ -82,10 +82,41 @@ def test_latest_returns_newest_by_available_at_then_id(pg_conn):
     rows = queries.latest(
         pg_conn,
         "forecasts",
-        ["city", "target_date", "model", "lead"],
+        ["city", "target_date", "model", "lead", "member"],
         where={"city": "NYC", "lead": 24},
     )
     assert len(rows) == 1, "latest must collapse to one row per natural key"
+    assert rows[0]["available_at"] == base + timedelta(hours=1)
+
+
+def test_latest_rejects_underspecified_natural_key(pg_conn):
+    """WR-02: an explicit natural_key missing a key column (here ``member``) must raise
+    rather than silently DISTINCT ON a narrower tuple and collapse distinct facts."""
+    models, queries = _import_db()
+    with pytest.raises(ValueError, match="member"):
+        queries.latest(
+            pg_conn,
+            "forecasts",
+            ["city", "target_date", "model", "lead"],
+        )
+
+
+def test_latest_defaults_to_canonical_key(pg_conn):
+    """WR-02: omitting natural_key uses the table's canonical key from NATURAL_KEYS."""
+    import sqlalchemy as sa
+
+    models, queries = _import_db()
+    forecasts = models.metadata.tables["forecasts"]
+    base = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    key = {"city": "NYC", "target_date": "2025-01-15", "model": "gfs", "lead": 24}
+    pg_conn.execute(sa.insert(forecasts).values(available_at=base, member=0, **key))
+    pg_conn.execute(
+        sa.insert(forecasts).values(
+            available_at=base + timedelta(hours=1), member=0, **key
+        )
+    )
+    rows = queries.latest(pg_conn, "forecasts", where={"city": "NYC", "lead": 24})
+    assert len(rows) == 1
     assert rows[0]["available_at"] == base + timedelta(hours=1)
 
 

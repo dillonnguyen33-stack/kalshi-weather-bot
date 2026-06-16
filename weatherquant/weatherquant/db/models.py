@@ -185,6 +185,22 @@ fills = sa.Table(
 )
 
 
+# --- Natural keys: the single source of truth for row identity (D-10/D-12) ---------
+# The natural key is the business identity of a fact; the "latest" read idiom
+# (weatherquant.db.queries.latest) MUST DISTINCT ON the COMPLETE key, or it silently
+# collapses genuinely-distinct facts (e.g. two ensemble members) into one row. Keyed by
+# table so every phase-2+ call site looks the key up instead of passing it by hand and
+# risking an under-specified key. Mirrors each ``ix_<table>_latest`` index minus the
+# trailing ``available_at`` (the point-in-time axis, not part of identity).
+NATURAL_KEYS: dict[str, tuple[str, ...]] = {
+    "forecasts": ("city", "target_date", "model", "lead", "member"),
+    "observations": ("city", "target_date", "source"),
+    "calibration_params": ("city", "model", "lead", "month"),
+    "market_snapshots": ("ticker", "snapshot_for"),
+    "fills": ("ticker", "trade_id"),
+}
+
+
 # --- Append-only enforcement (D-10) -------------------------------------------------
 # The enforcement DDL (the shared raise_append_only() function + per-table triggers) is
 # single-sourced in weatherquant.db.ddl and consumed identically here (via create_all
@@ -214,6 +230,7 @@ sa.event.listen(metadata, "after_drop", _ddl(ddl.DROP_RAISE_FUNCTION_SQL))
 
 __all__ = [
     "metadata",
+    "NATURAL_KEYS",
     "forecasts",
     "observations",
     "calibration_params",
