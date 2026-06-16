@@ -30,7 +30,7 @@ from datetime import date, datetime, timezone
 import httpx
 
 from weatherquant.ingest.available_at import available_at
-from weatherquant.ingest.sources._client import USER_AGENT, get_client, request_with_retry
+from weatherquant.ingest.sources._client import get_client, request_with_retry
 from weatherquant.ingest.writer import insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, settlement_window
@@ -102,11 +102,14 @@ def _parse_iso_duration(duration: str) -> "datetime.timedelta":  # type: ignore[
         if ch.isdigit():
             num += ch
         elif ch == "H":
-            hours = int(num); num = ""
+            hours = int(num)
+            num = ""
         elif ch == "M":
-            minutes = int(num); num = ""
+            minutes = int(num)
+            num = ""
         elif ch == "S":
-            seconds = int(num); num = ""
+            seconds = int(num)
+            num = ""
         else:
             raise ValueError(f"unsupported ISO duration time part: {duration!r}")
     return timedelta(days=days, hours=hours, minutes=minutes, seconds=seconds)
