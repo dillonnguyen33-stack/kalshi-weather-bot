@@ -273,13 +273,21 @@ def store_afd_signal(
     target_date: date,
     result: dict,
     available_at: datetime | None = None,
+    mode: str = "live",
 ) -> int:
     """Persist an AFD signal as an ``observations`` row via the audited writer (D-06/D-10/D-11).
 
     Routes through :func:`weatherquant.ingest.writer.insert_observation` with ``source='afd'``
     and ``detail`` jsonb = the tool result — never a hand-rolled Core insert, never a new table.
-    ``available_at`` should be the AFD product issuance time (the report time, D-09); it falls
-    back to ``now(UTC)`` only when the caller cannot supply the issuance time.
+
+    POINT-IN-TIME INTEGRITY (CR-01, D-09). ``available_at`` MUST be the AFD product issuance
+    time (the report time). The ``now(UTC)`` fallback is permitted ONLY in ``mode="live"`` —
+    the instant the running system actually held the product. In ``mode="backfill"`` an
+    explicit ``available_at`` (the recovered historical issuance time) is REQUIRED: stamping
+    ``now()`` on a row reconstructed for a past date would make the datum appear available
+    years late and silently corrupt Phase 6's no-look-ahead walk-forward (the CR-01 leak), so
+    a missing ``available_at`` in backfill raises ``ValueError`` rather than defaulting to
+    ``now()``.
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
@@ -289,13 +297,24 @@ def store_afd_signal(
         "direction": result.get("direction", ""),
         "summary": result.get("summary", ""),
     }
+    if available_at is None:
+        if mode == "backfill":
+            # CR-01: never stamp now() on a backfilled (historical) AFD row — that is the
+            # wall-clock look-ahead leak this whole module exists to prevent (D-09).
+            raise ValueError(
+                f"store_afd_signal in backfill requires an explicit available_at "
+                f"(AFD issuance time) for city={city} target_date={target_date} — refusing to "
+                f"stamp now() on a historical row (CR-01/D-09)"
+            )
+        # Live: now(UTC) is the instant the running system actually held the product (D-09).
+        available_at = datetime.now(timezone.utc)
     return insert_observation(
         bind,
         city=city,
         target_date=target_date,
         source=SOURCE,
         detail=detail,
-        available_at=available_at or datetime.now(timezone.utc),
+        available_at=available_at,
     )
 
 

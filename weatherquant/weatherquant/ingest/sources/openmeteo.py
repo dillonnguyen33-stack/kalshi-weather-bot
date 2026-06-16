@@ -202,14 +202,18 @@ def store_members(
     members: dict[int, float],
     *,
     cycle: datetime | None = None,
+    mode: str = "live",
 ) -> int:
     """Persist each ensemble member as a SEPARATE forecast row via the audited path (D-05).
 
     Each ``{member: temp_kelvin}`` entry routes through
     :func:`weatherquant.ingest.writer.insert_forecast` under the provider-namespaced label
     :func:`member_label` (``openmeteo`` / ``openmeteo:<member>``), the integer member axis,
-    ``lead=0`` (the daily-high quantity), Kelvin payload, and live ``available_at``. Returns
-    the count of rows actually inserted (skips already-present identical rows, D-10).
+    ``lead=0`` (the daily-high quantity), Kelvin payload, and ``available_at`` threaded with
+    ``mode`` (WR-01 — not hardcoded ``"live"``, so the live/backfill seam is genuinely single,
+    D-15). Open-Meteo is live-forward only (the free tier exposes ~3 past_days), so the
+    orchestrator refuses to run it in backfill (WR-02). Returns the count of rows actually
+    inserted (skips already-present identical rows, D-10).
     """
     station = get_city(city)
     cycle = cycle or datetime.now(timezone.utc)
@@ -227,8 +231,8 @@ def store_members(
             station_lat=station.lat,
             station_lon=station.lon,
             grid_distance_m=0.0,
-            # Live-forward fetch -> now(UTC); the live branch ignores the model label (D-09).
-            available_at=available_at(cycle, member_label(member), "live"),
+            # available_at honors the threaded mode (WR-01); the live branch ignores the label.
+            available_at=available_at(cycle, member_label(member), mode),  # type: ignore[arg-type]
         )
     return inserted
 

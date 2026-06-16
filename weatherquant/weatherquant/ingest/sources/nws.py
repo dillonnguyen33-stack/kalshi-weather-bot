@@ -206,14 +206,21 @@ def store_nws_forecast(
     temp_kelvin: float,
     *,
     cycle: datetime | None = None,
+    mode: str = "live",
 ) -> int:
     """Persist one NWS forecast row via the SINGLE audited writer path (D-10/D-11).
 
     Routes through :func:`weatherquant.ingest.writer.insert_forecast` under label ``nws``
     (D-12), ``member=0`` (deterministic), ``lead=0`` (the daily-high quantity for the target
-    day), Kelvin payload, and ``available_at`` from the live helper. The station snap fields
-    are the registry station's own lat/lon with ``grid_distance_m=0.0`` (NWS already returns
-    the gridpoint for the station, so there is no separate haversine snap here).
+    day), Kelvin payload, and ``available_at`` from the helper threaded with ``mode``. The
+    station snap fields are the registry station's own lat/lon with ``grid_distance_m=0.0``
+    (NWS already returns the gridpoint for the station, so there is no separate haversine snap
+    here).
+
+    ``mode`` is threaded into :func:`available_at` rather than hardcoded ``"live"`` so the
+    live/backfill seam is genuinely SINGLE (D-15, WR-01). NWS is a live-forward source whose
+    only historical archive is the NOAA GRIB corpus, so the orchestrator refuses to run it in
+    backfill (WR-02); this signature keeps the seam honest if it is ever called with a mode.
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
@@ -232,9 +239,9 @@ def store_nws_forecast(
         station_lat=station.lat,
         station_lon=station.lon,
         grid_distance_m=0.0,
-        # Live fetch: available_at = now(UTC). The helper's live branch ignores the model
+        # available_at honors the threaded mode (WR-01). The live branch ignores the model
         # label, so the provider-namespaced "nws" never needs a PUBLISH_LATENCY entry (D-09).
-        available_at=available_at(cycle, MODEL, "live"),
+        available_at=available_at(cycle, MODEL, mode),  # type: ignore[arg-type]
     )
 
 

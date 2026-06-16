@@ -156,13 +156,17 @@ def store_wethr_forecast(
     temp_kelvin: float,
     *,
     cycle: datetime | None = None,
+    mode: str = "live",
 ) -> int:
     """Persist one Wethr forecast row via the SINGLE audited writer path (D-10/D-11).
 
     Routes through :func:`weatherquant.ingest.writer.insert_forecast` under the provider-
     namespaced label :func:`model_label` (``wethr:<model>``, D-12), ``member=0``, ``lead=0``,
-    Kelvin payload, and live ``available_at``. The station snap fields are the registry
-    station's own lat/lon with ``grid_distance_m=0.0`` (Wethr returns a station forecast).
+    Kelvin payload, and ``available_at`` threaded with ``mode`` (WR-01 — not hardcoded
+    ``"live"``, so the live/backfill seam is genuinely single, D-15). The station snap fields
+    are the registry station's own lat/lon with ``grid_distance_m=0.0`` (Wethr returns a
+    station forecast). Wethr is live-forward only, so the orchestrator refuses to run it in
+    backfill (WR-02).
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
@@ -181,8 +185,8 @@ def store_wethr_forecast(
         station_lat=station.lat,
         station_lon=station.lon,
         grid_distance_m=0.0,
-        # Live fetch -> now(UTC); the live branch ignores the model label (D-09).
-        available_at=available_at(cycle, model_label(model), "live"),
+        # available_at honors the threaded mode (WR-01); the live branch ignores the label.
+        available_at=available_at(cycle, model_label(model), mode),  # type: ignore[arg-type]
     )
 
 
