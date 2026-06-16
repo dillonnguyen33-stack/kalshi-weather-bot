@@ -10,6 +10,8 @@ credentials.
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import Engine, create_engine
@@ -85,8 +87,13 @@ def get_settings() -> Settings:
     return Settings()  # type: ignore[call-arg]  # populated from env by pydantic-settings
 
 
+@lru_cache(maxsize=1)
 def get_engine() -> Engine:
-    """Return a SQLAlchemy ``Engine`` bound to the validated ``DATABASE_URL``.
+    """Return the process-wide SQLAlchemy ``Engine`` bound to ``DATABASE_URL``.
+
+    Memoized: an ``Engine`` owns a connection pool, so every caller must share the one
+    instance. Without this, a per-cycle caller (e.g. an APScheduler ingestion job in
+    Phase 2+) would build a fresh pool — and re-read/re-validate ``.env`` — on each call.
 
     The engine is built on the ``postgresql+psycopg://`` dialect. ``hide_parameters``
     keeps bound values out of error logs; the connection URL itself is never logged.
