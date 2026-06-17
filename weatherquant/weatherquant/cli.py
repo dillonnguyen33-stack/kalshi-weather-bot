@@ -478,6 +478,11 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
             cal["var_slope"],
             cal["sigma_floor"],
         )
+        # EMOS params are schema-nullable (db/models.py); a NULL would reach link.predict and
+        # raise an opaque TypeError on the money path (WR-04). Drop the model instead, same as a
+        # missing cal row (D-03) — incomplete fit ⇒ model drops out of the blend.
+        if any(v is None for v in params):
+            continue
         mu_i, sigma_i = link.predict(
             params, np.array([mean_f]), np.array([var_f])
         )
