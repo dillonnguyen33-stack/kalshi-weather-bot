@@ -84,6 +84,36 @@ def test_shrinkage_weight_blends_toward_parent() -> None:
     assert abs(big_blended.a - big_own.a) < abs(big_blended.a - parent_fit.a)
 
 
+def test_shrinkage_blends_variance_params_by_magnitude(monkeypatch) -> None:
+    """c/d feed σ only through c²/d² (sign-free, link.predict), so an opposite-sign child and
+    parent must NOT cancel during shrinkage. Magnitude blending keeps |c| bounded away from 0
+    instead of collapsing σ to the floor — the spurious over-confidence WR-01 guards against."""
+    parent_fit = StratumFit(
+        city="NYC", model="gfs", lead=1, month=6,
+        a=0.0, b=1.0, c=2.0, d=1.0,
+        sigma_floor=SIGMA_FLOOR_F, n_train=4000, pool_level="month",
+    )
+    # Force the fine stratum's own fit to carry the SAME spread but OPPOSITE signs on c/d — the
+    # case a naive linear blend would cancel to ~0.
+    own_fit = StratumFit(
+        city="NYC", model="gfs", lead=1, month=6,
+        a=0.0, b=1.0, c=-2.0, d=-1.0,
+        sigma_floor=SIGMA_FLOOR_F, n_train=int(KAPPA), pool_level="month",
+    )
+    monkeypatch.setattr(strata, "_fit_own", lambda stratum, pool_level: own_fit)
+
+    fine = _samples(n=int(KAPPA), a=0.0, b=1.0, c=2.0, d=1.0, seed=900)
+    blended = fit_stratum_pooled(fine, samples=fine, parent_fit=parent_fit)
+
+    # At w=0.5 a linear blend of (+2, -2) collapses to c≈0 (σ→floor); magnitude blend → 2.0.
+    w = int(KAPPA) / (int(KAPPA) + KAPPA)
+    assert w == pytest.approx(0.5)
+    assert blended.c == pytest.approx(w * 2.0 + (1.0 - w) * 2.0)  # |−2|,|2| → 2.0, no cancel
+    assert blended.d == pytest.approx(w * 1.0 + (1.0 - w) * 1.0)  # → 1.0
+    assert abs(blended.c) > 1.5  # decisively NOT collapsed toward 0
+    assert blended.pool_level == "shrunk:month"
+
+
 def test_n_min_fallback_uses_parent_entirely() -> None:
     """n < N_MIN → parent params verbatim, parent's pool_level recorded (D-08)."""
     assert N_MIN >= 2
@@ -169,4 +199,5 @@ def test_assemble_aggregates_members_in_python() -> None:
     assert p.s2 == pytest.approx(members_f.var())  # population variance over members
     assert p.y == pytest.approx(65.0)
     assert p.month == 6  # derived from target_date (D-07)
+    assert p.target_date == target  # the real verifying day is carried, not just its month (D-10)
     assert p.model == "gefs"

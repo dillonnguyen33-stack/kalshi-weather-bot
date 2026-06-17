@@ -50,6 +50,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
 
 import numpy as np
@@ -154,13 +155,16 @@ class TrainingPair:
     """One aggregated (forecast, verifying-obs) training row for a target date.
 
     ``m``/``s2`` are the ensemble mean/variance over members (°F); ``y`` the daily-high obs (°F);
-    ``month`` is derived from ``target_date`` (D-07). The member axis is gone — collapsed here.
+    ``month`` is derived from ``target_date`` (D-07). ``target_date`` is the verifying day itself —
+    kept (not just its month) so a temporal OOS split (D-10) can order samples by real date rather
+    than collapsing them to a single synthetic key. The member axis is gone — collapsed here.
     """
 
     city: str
     model: str
     lead: int
     month: int
+    target_date: date
     m: float
     s2: float
     y: float
@@ -234,6 +238,12 @@ def fit_stratum_pooled(
     # Enough data to fit, but still shrink toward the parent: own-weight w = n/(n+KAPPA).
     own = _fit_own(stratum, pool_level=rung)
     w = stratum.n / (stratum.n + KAPPA)
+    # Mean params (a, b) blend linearly. Variance params (c, d) enter the predictive σ ONLY
+    # through their squares (σ² = c² + d²·s², link.predict / D-02), so their signs are free:
+    # the fitter may return c<0 for the child and c>0 for the parent for the SAME spread. A
+    # linear blend would then cancel them toward 0, collapsing σ to the floor — a spuriously
+    # over-confident fit, the exact Kelly-blowup the pooling ladder exists to prevent. Blend
+    # the MAGNITUDES instead (|c|, |d| are equivalent representations of the same variance).
     return StratumFit(
         city=stratum.city,
         model=stratum.model,
@@ -241,8 +251,8 @@ def fit_stratum_pooled(
         month=stratum.month,
         a=w * own.a + (1.0 - w) * parent.a,
         b=w * own.b + (1.0 - w) * parent.b,
-        c=w * own.c + (1.0 - w) * parent.c,
-        d=w * own.d + (1.0 - w) * parent.d,
+        c=w * abs(own.c) + (1.0 - w) * abs(parent.c),
+        d=w * abs(own.d) + (1.0 - w) * abs(parent.d),
         sigma_floor=SIGMA_FLOOR_F,
         n_train=stratum.n,
         pool_level=f"shrunk:{rung}",
@@ -300,6 +310,7 @@ def assemble_pairs_from_rows(
                 model=model,
                 lead=int(lead),
                 month=int(target_date.month),  # D-07
+                target_date=target_date,  # the real verifying day — for the temporal split (D-10)
                 m=float(arr.mean()),
                 s2=float(arr.var()),  # population variance over members; 0 for one member
                 y=y,
