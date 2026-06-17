@@ -32,6 +32,7 @@ from weatherquant.calibrate.strata import (
     SIGMA_FLOOR_F,
     StratumFit,
     StratumSamples,
+    fit_pooled_month_strata,
     fit_stratum_pooled,
     kelvin_to_fahrenheit,
 )
@@ -201,3 +202,62 @@ def test_assemble_aggregates_members_in_python() -> None:
     assert p.month == 6  # derived from target_date (D-07)
     assert p.target_date == target  # the real verifying day is carried, not just its month (D-10)
     assert p.model == "gefs"
+
+
+def _pairs(
+    *, month: int, n: int, a: float, b: float, c: float, d: float, seed: int
+) -> list[strata.TrainingPair]:
+    """Build n aligned TrainingPairs for one month, drawn from the true predictive law."""
+    rng = np.random.default_rng(seed)
+    m = rng.normal(0.0, 8.0, n)
+    s2 = rng.uniform(1.0, 16.0, n)
+    sig = np.sqrt(np.maximum(SIGMA_FLOOR_F**2, c**2 + d**2 * s2))
+    y = rng.normal(a + b * m, sig)
+    base = dt.date(2024, month, 1)
+    return [
+        strata.TrainingPair(
+            city="NYC",
+            model="gfs",
+            lead=1,
+            month=month,
+            target_date=base + dt.timedelta(days=i),
+            m=float(m[i]),
+            s2=float(s2[i]),
+            y=float(y[i]),
+        )
+        for i in range(n)
+    ]
+
+
+def test_fit_pooled_month_strata_wires_shrink_and_parent_fallback() -> None:
+    """CR-01: the production path pools each month toward its season parent — the n>=N_MIN
+    shrink blend and the n<N_MIN parent fallback both fire (they were dead before)."""
+    # Two months in the SAME season (JJA): a data-rich June and a sparse July.
+    rich = _pairs(month=6, n=200, a=5.0, b=1.0, c=2.0, d=0.5, seed=1)
+    sparse = _pairs(month=7, n=N_MIN - 1, a=99.0, b=2.0, c=8.0, d=3.0, seed=2)
+
+    results = fit_pooled_month_strata(rich + sparse, city="NYC", model="gfs", lead=1)
+    by_month = {samples.month: (samples, dates, fit) for samples, dates, fit in results}
+
+    assert set(by_month) == {6, 7}
+    # Rich month (n >= N_MIN): own fit shrunk toward the season parent.
+    _, june_dates, june_fit = by_month[6]
+    assert june_fit.pool_level == "shrunk:season"
+    assert june_fit.n_train == 200
+    assert len(june_dates) == 200  # target_dates returned for the OOS audit
+    # Sparse month (n < N_MIN): parent params used entirely.
+    _, _, july_fit = by_month[7]
+    assert july_fit.pool_level == "parent:season"
+    assert july_fit.n_train == N_MIN - 1
+
+
+def test_fit_pooled_month_strata_skips_sparse_season() -> None:
+    """CR-01 escape hatch: a season too sparse to anchor a trustworthy parent persists nothing
+    for its months (a logged absence) rather than a degenerate over-confident fit."""
+    healthy = _pairs(month=6, n=200, a=5.0, b=1.0, c=2.0, d=0.5, seed=3)
+    lonely = _pairs(month=1, n=5, a=5.0, b=1.0, c=2.0, d=0.5, seed=4)  # DJF total = 5 < N_MIN
+
+    results = fit_pooled_month_strata(healthy + lonely, city="NYC", model="gfs", lead=1)
+    months = {samples.month for samples, _, _ in results}
+
+    assert months == {6}  # the lonely sub-N_MIN-season month is skipped entirely

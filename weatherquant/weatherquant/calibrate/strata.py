@@ -62,12 +62,14 @@ from weatherquant.db import queries
 
 __all__ = [
     "kelvin_to_fahrenheit",
+    "season_of",
     "N_MIN",
     "KAPPA",
     "SIGMA_FLOOR_F",
     "StratumSamples",
     "StratumFit",
     "fit_stratum_pooled",
+    "fit_pooled_month_strata",
     "assemble_pairs_from_rows",
     "assemble_training_pairs",
     "OBS_SOURCE",
@@ -85,6 +87,20 @@ SIGMA_FLOOR_F: float = 0.5
 
 # The ground-truth observation source (ASOS); 'afd' rows are AFD text, never a label (D-07/D-16).
 OBS_SOURCE: str = "asos"
+
+# Meteorological seasons (D-08 pooling ladder, rung 1): DJF / MAM / JJA / SON. A data-starved
+# month stratum coarsens to its season parent before any finer-grained own-fit is trusted.
+_SEASON_BY_MONTH: dict[int, int] = {
+    12: 0, 1: 0, 2: 0,  # DJF
+    3: 1, 4: 1, 5: 1,  # MAM
+    6: 2, 7: 2, 8: 2,  # JJA
+    9: 3, 10: 3, 11: 3,  # SON
+}
+
+
+def season_of(month: int) -> int:
+    """Meteorological season index (0=DJF, 1=MAM, 2=JJA, 3=SON) for the pooling ladder (D-08)."""
+    return _SEASON_BY_MONTH[month]
 
 # Absolute-zero offset and the °F scale — used ONLY inside the single K→°F seam below.
 _KELVIN_TO_CELSIUS_OFFSET = 273.15
@@ -257,6 +273,83 @@ def fit_stratum_pooled(
         n_train=stratum.n,
         pool_level=f"shrunk:{rung}",
     )
+
+
+def _samples_from_pairs(
+    pairs: Sequence[TrainingPair], *, city: str, model: str, lead: int, month: int
+) -> StratumSamples:
+    """Collapse aligned :class:`TrainingPair` rows into one :class:`StratumSamples` (m, s2, y)."""
+    return StratumSamples(
+        city=city,
+        model=model,
+        lead=lead,
+        month=month,
+        m=np.array([p.m for p in pairs], dtype=float),
+        s2=np.array([p.s2 for p in pairs], dtype=float),
+        y=np.array([p.y for p in pairs], dtype=float),
+    )
+
+
+def fit_pooled_month_strata(
+    pairs: Sequence[TrainingPair], *, city: str, model: str, lead: int
+) -> list[tuple[StratumSamples, list[date], StratumFit]]:
+    """Fit every month stratum for one ``(city, model, lead)``, pooling toward season (CR-01/D-08).
+
+    The production pooling path. The CLI previously called :func:`fit_stratum_pooled` with no
+    parent, so the ``n < N_MIN`` parent-fallback and the shrinkage blend never fired outside
+    tests — a data-starved month was persisted as its own degenerate over-confident fit. Here
+    every month stratum shrinks toward its meteorological-season parent (rung 1 of the D-08
+    ladder), so a sparse month borrows the season's spread instead of inventing a false-sharp one.
+
+    A season whose own pooled sample count is below ``N_MIN`` cannot anchor a trustworthy parent,
+    so its months are SKIPPED (a logged absence, not a degenerate fit) — the explicit fail-safe
+    the review's CR-01 step 5 calls for. Phase-6 lead-neighbor coarsening (rung 2) is not wired
+    yet; until it is, those sparse-season city-months simply have no calibration row.
+
+    Returns one ``(month_samples, target_dates, fit)`` per RETAINED month so the caller can run
+    the OOS audit and persist using the month's own samples.
+    """
+    by_month: dict[int, list[TrainingPair]] = {}
+    by_season: dict[int, list[TrainingPair]] = {}
+    for p in pairs:
+        by_month.setdefault(p.month, []).append(p)
+        by_season.setdefault(season_of(p.month), []).append(p)
+
+    # Fit each season parent once (reused by every month in the season). A season below N_MIN is
+    # left out of the map so its months fall through to the skip branch below.
+    season_parents: dict[int, tuple[StratumSamples, StratumFit]] = {}
+    for season, season_pairs in by_season.items():
+        if len(season_pairs) < N_MIN:
+            continue
+        parent_samples = _samples_from_pairs(
+            season_pairs, city=city, model=model, lead=lead, month=season_pairs[0].month
+        )
+        season_parents[season] = (parent_samples, _fit_own(parent_samples, pool_level="season"))
+
+    out: list[tuple[StratumSamples, list[date], StratumFit]] = []
+    for month, month_pairs in sorted(by_month.items()):
+        parent = season_parents.get(season_of(month))
+        if parent is None:
+            logger.warning(
+                "calibrate skip city=%s model=%s lead=%d month=%d: season parent n<%d — "
+                "too sparse for a trustworthy fit (D-08), persisting nothing",
+                city,
+                model,
+                lead,
+                month,
+                N_MIN,
+            )
+            continue
+        parent_samples, parent_fit = parent
+        month_samples = _samples_from_pairs(
+            month_pairs, city=city, model=model, lead=lead, month=month
+        )
+        fit = fit_stratum_pooled(
+            month_samples, samples=parent_samples, parent_fit=parent_fit, rung="season"
+        )
+        target_dates = [p.target_date for p in month_pairs]
+        out.append((month_samples, target_dates, fit))
+    return out
 
 
 def assemble_pairs_from_rows(

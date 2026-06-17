@@ -277,9 +277,7 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
     # Imported lazily so the ingest path (and `--help`) never pays the calibration imports.
     import math
 
-    import numpy as np
-
-    from weatherquant.calibrate import evaluate, persist, strata
+    from weatherquant.calibrate import crps, evaluate, link, persist, strata
 
     models = _resolve_models(args)
     cities = _resolve_cities(args)
@@ -297,38 +295,39 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
                 for p in strata.assemble_training_pairs(bind, city=city, model=model)
                 if p.lead == lead
             ]
-            # Group the aggregated pairs into (lead, month) strata.
-            by_month: dict[int, list[strata.TrainingPair]] = {}
-            for pair in pairs:
-                by_month.setdefault(pair.month, []).append(pair)
 
             count = 0
-            for month, month_pairs in sorted(by_month.items()):
-                m = np.array([p.m for p in month_pairs], dtype=float)
-                s2 = np.array([p.s2 for p in month_pairs], dtype=float)
-                y = np.array([p.y for p in month_pairs], dtype=float)
-                target_dates = [p.target_date for p in month_pairs]  # real verifying days (D-10)
+            # Each month stratum is fit pooled toward its season parent (CR-01 / D-08): the
+            # n<N_MIN parent fallback and the shrinkage blend now fire on the production path,
+            # and a sparse-season month is skipped rather than persisted as a degenerate fit.
+            for month_samples, target_dates, fit in strata.fit_pooled_month_strata(
+                pairs, city=city, model=model, lead=lead
+            ):
+                m, s2, y = month_samples.m, month_samples.s2, month_samples.y
 
-                samples = strata.StratumSamples(
-                    city=city, model=model, lead=lead, month=month, m=m, s2=s2, y=y
+                # crps_train must describe the PERSISTED (pooled) params: their in-sample mean
+                # CRPS over the month's own rows (WR-01). Taking it from the OOS train-slice fit
+                # instead would store a metric for a different fit on ~0.7·N different samples.
+                mu_is, sig_is = link.predict(
+                    (fit.a, fit.b, fit.c, fit.d, fit.sigma_floor), m, s2
                 )
-                fit = strata.fit_stratum_pooled(samples)
+                crps_train = float(crps.crps_norm(mu_is, sig_is, y).mean())
 
                 # OOS audit metrics on a genuine TEMPORAL split (D-10): order the stratum's real
                 # target dates and hold out the latest oos_fraction. This requires >= 2 DISTINCT
                 # dates — with fewer the split would be positional (look-ahead leakage), so we
                 # leave the metrics NaN (absence = absence) rather than persist a leaky number.
-                # The audit fit feeds the REAL ensemble variance s2 (sqrt(s2) is the raw-ensemble
-                # baseline spread); the deterministic-collapse pseudo-member bug is gone.
-                # The persisted params come from the FULL-stratum fit, so their data cutoff is the
-                # latest target date — independent of the diagnostic OOS split.
-                crps_train = crps_oos = crps_baseline_oos = math.nan
+                # The persisted params' data cutoff is the latest target date — independent of
+                # the diagnostic OOS split.
+                # WR-05: these two come from an UNPOOLED re-fit on the OOS train slice, so on a
+                # pooled/parent-fallback row they describe a different fit than crps_train above —
+                # a generic "does EMOS generalize?" diagnostic, not the persisted fit's OOS score.
+                crps_oos = crps_baseline_oos = math.nan
                 trained_through = max(target_dates)  # persisted fit's data cutoff (D-13)
                 if len(set(target_dates)) >= 2:
                     oos = evaluate.evaluate_stratum_oos_aggregated(
                         target_dates, m, s2, y, oos_fraction=oos_fraction
                     )
-                    crps_train = oos.crps_train
                     crps_oos = oos.crps_oos
                     crps_baseline_oos = oos.crps_baseline_oos
 
