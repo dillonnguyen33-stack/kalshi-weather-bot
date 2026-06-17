@@ -23,7 +23,9 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+from dataclasses import dataclass
 
+import numpy as np
 import pytest
 
 # Load DATABASE_URL (and any other vars) from a local .env so `uv run pytest` works
@@ -162,6 +164,75 @@ def grib_fixture():
         return path
 
     return _load
+
+
+@dataclass(frozen=True)
+class SyntheticStratum:
+    """A synthetic single-stratum draw with KNOWN EMOS/NGR params (Phase 3 calibration).
+
+    The observations ``y`` are drawn from the TRUE predictive law under the D-02 link
+    (``mu = a + b*m``, ``sigma^2 = max(sigma_floor^2, c^2 + d^2*s2)``), so a correct fitter
+    must recover ``(a, b, |c|, |d|)`` (the signs of c, d are free — only c^2, d^2 enter).
+    ``s2`` is the per-sample ensemble variance: a positive constant for an ensemble model,
+    or all-zeros for a deterministic model (then ``d`` is inactive, D-02 — expected).
+    """
+
+    a: float
+    b: float
+    c: float
+    d: float
+    sigma_floor: float
+    m: np.ndarray  # forecast ensemble mean (°F)
+    s2: np.ndarray  # forecast ensemble variance
+    y: np.ndarray  # verifying obs (°F), drawn from the true predictive law
+
+
+def _draw_stratum(
+    *,
+    seed: int,
+    n: int,
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+    sigma_floor: float,
+    deterministic: bool,
+) -> SyntheticStratum:
+    rng = np.random.default_rng(seed)
+    m = rng.normal(70.0, 8.0, n)
+    s2 = np.zeros(n) if deterministic else np.full(n, 4.0)
+    mu_t = a + b * m
+    sig_t = np.sqrt(np.maximum(sigma_floor**2, c**2 + d**2 * s2))
+    y = rng.normal(mu_t, sig_t)
+    return SyntheticStratum(
+        a=a, b=b, c=c, d=d, sigma_floor=sigma_floor, m=m, s2=s2, y=y
+    )
+
+
+@pytest.fixture
+def synthetic_stratum() -> SyntheticStratum:
+    """A well-sampled ENSEMBLE stratum with known ``(a, b, c, d)`` for fit-recovery tests.
+
+    n=5000 draws under the true predictive law; ``s2 = 4.0`` constant so the spread param
+    ``d`` is genuinely identifiable. Reused by 03's fit-recovery and OOS plans.
+    """
+    return _draw_stratum(
+        seed=1, n=5000, a=1.0, b=0.95, c=1.5, d=0.8,
+        sigma_floor=0.5, deterministic=False,
+    )
+
+
+@pytest.fixture
+def synthetic_stratum_deterministic() -> SyntheticStratum:
+    """A DETERMINISTIC stratum (``s2 == 0``) — ``sigma^2 = c^2`` constant, ``d`` inactive.
+
+    Used to assert the fit still recovers ``(a, b, c)`` while ``d`` stays at init (D-02 /
+    RESEARCH Pitfall 2 — expected, not a bug).
+    """
+    return _draw_stratum(
+        seed=2, n=5000, a=2.0, b=1.02, c=2.5, d=0.0,
+        sigma_floor=0.5, deterministic=True,
+    )
 
 
 @pytest.fixture(scope="session")

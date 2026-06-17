@@ -63,10 +63,22 @@ class AvailabilityError(CorrectnessError, ValueError):
     """
 
 
+class CalibrationError(CorrectnessError, ValueError):
+    """A calibration fit produced numbers that must not be priced on (CR-02).
+
+    Raised when the EMOS/NGR fit returns non-finite params, hits a non-finite CRPS loss, or is
+    handed an empty stratum — anything that, if persisted, would silently corrupt every
+    downstream price (``mu = a + b*m`` → NaN). A money-path correctness alarm: fail loud here,
+    never write a corrupt ``calibration_params`` row. Lives in the shared ``CorrectnessError``
+    family so one fail-loud contract covers both the ingestion spine and the calibration path.
+    """
+
+
 __all__ = [
     "CorrectnessError",
     "UnitError",
     "SanityError",
     "TargetDateError",
     "AvailabilityError",
+    "CalibrationError",
 ]

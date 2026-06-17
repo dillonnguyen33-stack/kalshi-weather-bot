@@ -129,6 +129,16 @@ observations = sa.Table(
 )
 
 # --- calibration_params: natural key = city, model, lead, month --------------------
+# Phase-3 (03-02, D-13) extends this table with the EMOS/NGR payload columns, all in °F
+# space (D-03) and all ``nullable=True`` so the column-add is non-breaking. The natural
+# key (city, model, lead, month) is UNCHANGED — members collapse into the (mean, spread)
+# predictor, so calibration carries no member axis (D-07). The interpretable params are
+# ``mean_intercept``/``mean_slope`` (a, b: μ = a + b·m) and ``var_intercept``/``var_slope``
+# (c, d: σ² = max(σ_floor², c² + d²·s²)); ``sigma_floor`` is the °F σ-clamp (D-09);
+# ``n_train`` the samples used; ``pool_level`` the pooling-fallback provenance (D-08);
+# ``crps_train``/``crps_oos``/``crps_baseline_oos`` the audit metrics (D-11); and
+# ``trained_through`` the data cutoff so Phase 6 can re-derive any historical fit (D-13).
+# Types mirror the 0003 migration EXACTLY so metadata.create_all == the migrated schema.
 calibration_params = sa.Table(
     "calibration_params",
     metadata,
@@ -137,6 +147,17 @@ calibration_params = sa.Table(
     sa.Column("model", sa.Text, nullable=False),
     sa.Column("lead", sa.Integer, nullable=False),
     sa.Column("month", sa.Integer, nullable=False),
+    sa.Column("mean_intercept", sa.Float, nullable=True),
+    sa.Column("mean_slope", sa.Float, nullable=True),
+    sa.Column("var_intercept", sa.Float, nullable=True),
+    sa.Column("var_slope", sa.Float, nullable=True),
+    sa.Column("sigma_floor", sa.Float, nullable=True),
+    sa.Column("n_train", sa.Integer, nullable=True),
+    sa.Column("pool_level", sa.Text, nullable=True),
+    sa.Column("crps_train", sa.Float, nullable=True),
+    sa.Column("crps_oos", sa.Float, nullable=True),
+    sa.Column("crps_baseline_oos", sa.Float, nullable=True),
+    sa.Column("trained_through", sa.Date, nullable=True),
     _available_at_column(),
     sa.Index(
         "ix_calibration_params_latest",
