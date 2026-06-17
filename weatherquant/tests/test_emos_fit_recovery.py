@@ -33,9 +33,12 @@ predictive σ stays ``>= sigma_floor`` on every Adam step.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
+import weatherquant.calibrate.emos as emos_mod
 from weatherquant.calibrate.emos import D0_INIT, fit_stratum
 from weatherquant.calibrate.link import predict
+from weatherquant.ingest.errors import CalibrationError
 
 
 def test_emos_fit_recovers_known_params() -> None:
@@ -98,3 +101,29 @@ def test_sigma_floor_convergence_does_not_diverge() -> None:
     # The σ-floor clamp inside predict() guarantees this; assert it explicitly so a
     # regression that bypassed the floor would fail loudly.
     assert np.all(sigma >= sigma_floor - 1e-12)
+
+
+def test_empty_stratum_fails_loud() -> None:
+    """An empty stratum has no fit — raise rather than return NaN params (CR-02 / IN-02)."""
+    empty = np.array([], dtype=float)
+    with pytest.raises(CalibrationError, match="empty stratum"):
+        fit_stratum(empty, empty, empty, sigma_floor=0.5)
+
+
+@pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning")
+def test_diverged_fit_fails_loud_not_nan(monkeypatch) -> None:
+    """A diverged fit (non-finite loss) raises instead of persisting NaN params (CR-02).
+
+    An infinite gradient drives ``theta`` — and the CRPS loss — non-finite. Without the guard
+    the ``abs(prev_loss - loss) < tol`` break never fires on NaN, so the loop would burn every
+    iteration and return NaN ``(a, b, c, d)`` straight into ``calibration_params``.
+    """
+    rng = np.random.default_rng(3)
+    n = 100
+    m = rng.normal(0.0, 8.0, n)
+    s2 = rng.uniform(1.0, 16.0, n)
+    y = rng.normal(m, 2.0)
+    monkeypatch.setattr(emos_mod, "param_grads", lambda *a, **k: np.full(4, np.inf))
+
+    with pytest.raises(CalibrationError):
+        fit_stratum(m, s2, y, sigma_floor=0.5)

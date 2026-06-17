@@ -22,7 +22,12 @@ The fit is deliberately small and near-convex, so no scipy/sklearn is needed (th
    loss / convergence check. The σ-floor clamp and the variance-param gradient mask both live
    inside ``predict`` / ``param_grads`` (Pitfall 1), so each step's σ is guaranteed
    ``>= sigma_floor`` and a floor-active step never moves ``c`` / ``d`` phantomly.
-3. **Convergence.** Break when ``abs(prev_loss - loss) < tol`` or after ``iters`` steps.
+3. **Convergence.** Break when ``abs(prev_loss - loss) < tol`` or after ``iters`` steps,
+   returning the BEST-loss ``theta`` seen (not the last — a late Adam overshoot must never
+   ship a worse-than-warm-start fit, WR-02).
+4. **Fail loud (CR-02).** A non-finite loss or non-finite returned params raises
+   :class:`weatherquant.ingest.errors.CalibrationError` rather than handing NaN/inf params to
+   ``persist`` — a persisted NaN ``(a, b, c, d)`` would silently corrupt every downstream price.
 
 **Deterministic models (s2 == 0).** ``d``'s gradient is identically 0 (no ensemble spread to
 explain), so ``d`` stays at its init ``D0_INIT`` and ``sigma^2 = c^2`` becomes a fitted
@@ -40,12 +45,14 @@ Pure NumPy + ``math`` (via crps.py / link.py) only — no scipy/sklearn.
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
 from numpy.typing import NDArray
 
 from weatherquant.calibrate.crps import crps_norm
 from weatherquant.calibrate.link import param_grads, predict
+from weatherquant.ingest.errors import CalibrationError
 
 __all__ = [
     "fit_stratum",
@@ -114,6 +121,12 @@ def fit_stratum(
     s2 = np.asarray(s2, dtype=float)
     y = np.asarray(y, dtype=float)
 
+    # An empty stratum has no fit — the CRPS mean is over zero samples (0/0). Fail loud rather
+    # than return NaN params (IN-02): once the pooling ladder assembles strata programmatically
+    # an empty group is easy to introduce, and a NaN fit must never reach persist.
+    if len(y) == 0:
+        raise CalibrationError("cannot fit an empty stratum (n=0)")
+
     # 1. lstsq warm-start for the mean params (D-06): regress y on [1, m]. SVD-based, stable,
     #    explicitly allowed (np.linalg.lstsq is not scipy/sklearn).
     design = np.column_stack([np.ones_like(m), m])
@@ -127,10 +140,13 @@ def fit_stratum(
 
     theta = np.array([a0, b0, c0, d0], dtype=float)
 
-    # 2. Pure-NumPy Adam on the mean-CRPS objective.
+    # 2. Pure-NumPy Adam on the mean-CRPS objective. Track the BEST-loss theta so a late
+    #    overshoot never ships a worse fit than an earlier (or the warm-start) step (WR-02).
     mt = np.zeros(4, dtype=float)
     vt = np.zeros(4, dtype=float)
     prev_loss = np.inf
+    best_loss = np.inf
+    best_theta = theta.copy()
 
     for t in range(1, iters + 1):
         a, b, c, d = theta
@@ -148,10 +164,24 @@ def fit_stratum(
         mu, sigma = predict((a, b, c, d, sigma_floor), m, s2)
         loss = float(crps_norm(mu, sigma, y).mean())
 
+        # Fail loud on a diverged step (CR-02): a non-finite loss never satisfies the tol break,
+        # so without this the loop would burn every iteration and return NaN params to persist.
+        if not math.isfinite(loss):
+            raise CalibrationError(f"non-finite CRPS loss at iter {t} — diverged fit")
+
+        if loss < best_loss:
+            best_loss = loss
+            best_theta = theta.copy()
+
         if abs(prev_loss - loss) < tol:
             logger.debug("fit_stratum converged at iter %d (loss=%.6g)", t, loss)
             break
         prev_loss = loss
 
-    a, b, c, d = (float(v) for v in theta)
+    a, b, c, d = (float(v) for v in best_theta)
+    # Belt-and-suspenders (CR-02): best_theta is finite by construction (only updated on a finite
+    # loss), but the warm-start itself could be non-finite if iters==0 or the very first step
+    # diverged — never return NaN/inf params to the money path.
+    if not all(math.isfinite(v) for v in (a, b, c, d)):
+        raise CalibrationError(f"non-finite EMOS fit params ({a}, {b}, {c}, {d})")
     return a, b, c, d
