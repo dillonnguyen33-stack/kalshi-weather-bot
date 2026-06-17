@@ -20,7 +20,6 @@ import pytest
 from weatherquant.price.blend import accuracy_weights, blend_gaussians
 
 
-@pytest.mark.xfail(reason="Wave 1 (04-02) implements blend_gaussians", strict=False)
 def test_blend_recovers_known_gaussian(synthetic_gaussians):
     mu_blend, sigma_blend = blend_gaussians(
         synthetic_gaussians.mus,
@@ -31,7 +30,6 @@ def test_blend_recovers_known_gaussian(synthetic_gaussians):
     assert sigma_blend == pytest.approx(synthetic_gaussians.sigma_blend)
 
 
-@pytest.mark.xfail(reason="Wave 1 (04-02) implements blend_gaussians", strict=False)
 def test_blend_sigma_monotonicity_invariant(synthetic_gaussians):
     # σ_blend = Σwᵢσᵢ (weighted mean) ⇒ σ_blend ≤ max(σᵢ) BY CONSTRUCTION (Vincentization).
     _, sigma_blend = blend_gaussians(
@@ -42,7 +40,6 @@ def test_blend_sigma_monotonicity_invariant(synthetic_gaussians):
     assert sigma_blend <= float(np.max(synthetic_gaussians.sigmas)) + 1e-12
 
 
-@pytest.mark.xfail(reason="Wave 1 (04-02) implements blend_gaussians", strict=False)
 def test_blend_pit_not_u_shaped(synthetic_gaussians):
     # Draw from the analytic blend N(mu_blend, sigma_blend) and PIT through that same blend;
     # a correct (non-overdispersed) blend gives an approximately uniform PIT — the central

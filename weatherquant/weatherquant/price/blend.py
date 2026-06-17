@@ -122,10 +122,52 @@ def blend_gaussians(
     sigmas: NDArray[np.float64],
     weights: NDArray[np.float64],
 ) -> tuple[float, float]:
-    """Vincentization closed form ``N(Σwᵢμᵢ, (Σwᵢσᵢ)²)`` (D-01 — implemented in Wave 1).
+    """Vincentization closed form ``N(Σwᵢμᵢ, (Σwᵢσᵢ)²)`` (D-01, RESEARCH Pattern 1).
 
-    ``mus``/``sigmas``/``weights`` are 1-D arrays over the models present; ``weights`` are
-    renormalized internally (handles dropped models, D-03). Returns ``(μ_blend, σ_blend)``
-    with ``σ_blend = Σwᵢσᵢ`` (weighted MEAN of σ), so ``σ_blend ≤ max(σᵢ)`` by construction.
+    Quantile-average the per-model predictive Gaussians into ONE Gaussian. The quantile
+    function of ``N(μ, σ)`` is ``μ + σ·Φ⁻¹(p)``; a weighted average of quantile functions is
+    ``(Σwᵢμᵢ) + (Σwᵢσᵢ)·Φ⁻¹(p)`` — the quantile function of ``N(Σwᵢμᵢ, (Σwᵢσᵢ)²)``. So this
+    is QUANTILE AVERAGING (Vincentization), NOT a linear mixture of the densities.
+
+    ``mu_blend = Σwᵢμᵢ`` and ``sigma_blend = Σwᵢσᵢ`` — the WEIGHTED MEAN of the component
+    std-devs. A weighted mean of values is ``≤`` their max, so ``σ_blend ≤ max(σᵢ)`` holds by
+    construction (the σ-monotonicity invariant guarded by ``-k monoton``; threat T-04-05).
+    The FORBIDDEN alternative ``sqrt(Σwᵢσᵢ²)`` (and the full linear-mixture variance, which is
+    even larger) overdisperses the blend — it can exceed ``max(σᵢ)`` and produces a ∩/U-shaped
+    PIT — and would silently violate PRC-01 (RESEARCH Pitfall 2 / Anti-Patterns). This module
+    therefore never takes a square root of a weighted sum of squares.
+
+    ``weights`` are renormalized internally (``w = weights / weights.sum()``), so dropped
+    models — already absent from ``mus``/``sigmas``/``weights`` — leave a valid simplex
+    (D-03, threat T-04-06). The component ``(μᵢ, σᵢ)`` are obtained by the caller from
+    :func:`weatherquant.calibrate.link.predict` reused verbatim (D-14/D-15); this function
+    never re-derives ``μ = a + b·m``.
+
+    Parameters
+    ----------
+    mus, sigmas, weights:
+        1-D arrays over the models present (``sigmas > 0``). ``weights`` need not pre-sum to 1.
+
+    Returns
+    -------
+    tuple[float, float]
+        ``(mu_blend, sigma_blend)`` with ``sigma_blend = Σwᵢσᵢ``.
     """
-    raise NotImplementedError("blend_gaussians is implemented in Wave 1 (04-02).")
+    mu_arr = np.asarray(mus, dtype=np.float64).ravel()
+    sigma_arr = np.asarray(sigmas, dtype=np.float64).ravel()
+    w_raw = np.asarray(weights, dtype=np.float64).ravel()
+    if mu_arr.shape != sigma_arr.shape or mu_arr.shape != w_raw.shape:
+        raise ValueError("mus, sigmas, weights must have matching shape.")
+    if mu_arr.size == 0:
+        raise ValueError("blend_gaussians requires at least one present model.")
+    if not np.all(np.isfinite(mu_arr)) or not np.all(np.isfinite(sigma_arr)):
+        raise ValueError("mus and sigmas must be finite.")
+
+    total = w_raw.sum()
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("weights must be finite and sum to a positive value.")
+    w = w_raw / total  # renormalize — dropped models already excluded (D-03)
+
+    mu_blend = float(np.dot(w, mu_arr))
+    sigma_blend = float(np.dot(w, sigma_arr))  # weighted MEAN of σ — NOT sqrt(Σwσ²)
+    return mu_blend, sigma_blend
