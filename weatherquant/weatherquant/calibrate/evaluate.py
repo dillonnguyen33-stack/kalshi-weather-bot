@@ -54,6 +54,7 @@ __all__ = [
     "baseline_gaussian",
     "temporal_split",
     "evaluate_stratum_oos",
+    "evaluate_stratum_oos_aggregated",
     "OOSResult",
 ]
 
@@ -267,3 +268,74 @@ def evaluate_stratum_oos(
         result.n_oos,
     )
     return result
+
+
+def evaluate_stratum_oos_aggregated(
+    target_dates: Sequence[date],
+    m: NDArray[np.float64],
+    s2: NDArray[np.float64],
+    y: NDArray[np.float64],
+    *,
+    oos_fraction: float = 0.3,
+    sigma_floor: float = SIGMA_FLOOR_F,
+) -> OOSResult:
+    """Criterion-4 OOS evaluation from PRE-AGGREGATED ``(m, s2)`` predictors (D-10/D-11).
+
+    The CLI assembles the ledger to one ``(m = ensemble mean, s2 = ensemble variance)`` row per
+    ``(city, model, lead, target_date)`` — the individual members are already gone. This is the
+    aggregated twin of :func:`evaluate_stratum_oos` (which takes raw members): the SAME temporal
+    split and the SAME calibrated train fit, but the raw-ensemble BASELINE spread is ``sqrt(s2)``
+    (the ensemble's own dispersion, consistent with the population-variance ``s2`` the fit
+    consumes) rather than a per-date member sample std. A genuinely deterministic stratum
+    (``s2 == 0`` everywhere) falls back to the TRAIN forecast-minus-obs residual std — computed
+    from train only so the baseline never peeks at OOS labels (anti-leakage, D-12) — never a
+    degenerate ``σ = 0``.
+
+    Args mirror :func:`evaluate_stratum_oos`, with ``ens_members_f`` replaced by the aligned
+    ``m``/``s2`` predictor arrays. Raises ``ValueError`` for ``< 2`` samples (via
+    :func:`temporal_split`); the caller must pass ``>= 2`` distinct target dates for the split
+    to be genuinely temporal rather than positional.
+    """
+    m = np.asarray(m, dtype=float)
+    s2 = np.asarray(s2, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    train_idx, oos_idx = temporal_split(target_dates, oos_fraction=oos_fraction)
+    m_tr, s2_tr, y_tr = m[train_idx], s2[train_idx], y[train_idx]
+    m_oos, s2_oos, y_oos = m[oos_idx], s2[oos_idx], y[oos_idx]
+
+    # 3. Fit the calibrated link on the TRAIN slice only (no OOS leakage).
+    a, b, c, d = fit_stratum(m_tr, s2_tr, y_tr, sigma_floor)
+    params = (a, b, c, d, sigma_floor)
+
+    # 4. Calibrated CRPS, in-sample (train) and held-out (OOS), via the shared link.
+    mu_tr, sig_tr = predict(params, m_tr, s2_tr)
+    crps_train = float(crps_norm(mu_tr, sig_tr, y_tr).mean())
+    mu_oos, sig_oos = predict(params, m_oos, s2_oos)
+    crps_oos = float(crps_norm(mu_oos, sig_oos, y_oos).mean())
+
+    # 5. Raw-ensemble baseline on the OOS slice: μ = m, σ = sqrt(s2) (the ensemble's own spread),
+    #    clamped to the σ-floor. A fully deterministic stratum (no ensemble spread anywhere) uses
+    #    the TRAIN residual std instead — train-only, so the baseline never peeks at OOS labels
+    #    (anti-leakage, D-12). Never σ = 0.
+    if bool(np.all(s2 <= 0.0)):
+        resid_tr = y_tr - m_tr
+        residual_std = max(
+            float(resid_tr.std(ddof=1)) if len(resid_tr) > 1 else 0.0, sigma_floor
+        )
+        base_sigma = np.full(m_oos.shape, residual_std)
+    else:
+        base_sigma = np.maximum(np.sqrt(np.maximum(s2_oos, 0.0)), sigma_floor)
+    crps_baseline_oos = float(crps_norm(m_oos, base_sigma, y_oos).mean())
+
+    train_dates = [target_dates[i] for i in train_idx]
+    oos_dates = [target_dates[i] for i in oos_idx]
+    return OOSResult(
+        crps_train=crps_train,
+        crps_oos=crps_oos,
+        crps_baseline_oos=crps_baseline_oos,
+        trained_through=max(train_dates),
+        oos_from=min(oos_dates),
+        n_train=len(train_idx),
+        n_oos=len(oos_idx),
+    )

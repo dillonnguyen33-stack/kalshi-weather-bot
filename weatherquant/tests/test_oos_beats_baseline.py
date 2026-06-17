@@ -21,12 +21,16 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import numpy as np
+import pytest
 
+from weatherquant.calibrate.crps import crps_norm
 from weatherquant.calibrate.evaluate import (
     baseline_gaussian,
     evaluate_stratum_oos,
+    evaluate_stratum_oos_aggregated,
     temporal_split,
 )
+from weatherquant.calibrate.strata import SIGMA_FLOOR_F
 
 
 def _synthetic_misspecified_stratum(
@@ -145,3 +149,43 @@ def test_evaluate_stratum_split_is_temporal():
     # trained_through is the LAST train date (the data cutoff Phase 6 re-derives from, D-13).
     assert result.n_train > 0 and result.n_oos > 0
     assert result.n_train + result.n_oos == len(y)
+
+
+def test_aggregated_oos_beats_baseline_on_real_variance():
+    """The CLI's aggregated (m, s2) path (CR-01): calibrated OOS CRPS beats a sqrt(s2) raw-ensemble
+    baseline on a TEMPORAL split. Feeding the real ensemble variance — not a collapsed single
+    pseudo-member that forces s2=0 — is what makes this a meaningful, non-deterministic baseline."""
+    dates, members, y = _synthetic_misspecified_stratum(seed=7, n=2000, n_members=20)
+    m = members.mean(axis=1)
+    s2 = members.var(axis=1)  # population variance — matches strata.assemble_pairs_from_rows
+    assert np.all(s2 > 0.0), "ensemble must be genuinely dispersed (not the collapsed pseudo-member)"
+
+    result = evaluate_stratum_oos_aggregated(dates, m, s2, y, oos_fraction=0.3)
+
+    assert result.crps_oos <= result.crps_baseline_oos
+    assert result.crps_oos < result.crps_baseline_oos * 0.95  # meaningful skill, not a tautology
+    for v in (result.crps_train, result.crps_oos, result.crps_baseline_oos):
+        assert np.isfinite(v) and v > 0.0
+    # Real distinct dates ⇒ a genuine temporal split, not a positional one (CR-02 / D-10).
+    assert result.trained_through < result.oos_from
+    assert result.n_train + result.n_oos == len(y)
+
+
+def test_aggregated_baseline_uses_sqrt_s2_not_deterministic_collapse():
+    """Pinpoint CR-01: the aggregated baseline spread is sqrt(s2) (the real ensemble dispersion),
+    proving the CLI no longer collapses every stratum to a single pseudo-member (which forced
+    s2=0 and the deterministic residual-std branch for everyone)."""
+    dates = [date(2024, 1, d) for d in (1, 2, 3, 4)]
+    m = np.array([70.0, 71.0, 69.0, 72.0])
+    s2 = np.array([9.0, 9.0, 9.0, 9.0])  # ensemble variance 9 ⇒ baseline σ = 3 (≫ σ-floor)
+    y = np.array([71.0, 70.0, 70.0, 73.0])
+
+    result = evaluate_stratum_oos_aggregated(dates, m, s2, y, oos_fraction=0.5)
+
+    # Recompute the expected baseline CRPS directly from μ = m_oos, σ = max(sqrt(s2_oos), floor).
+    _, oos_idx = temporal_split(dates, oos_fraction=0.5)
+    base_sigma = np.maximum(np.sqrt(s2[oos_idx]), SIGMA_FLOOR_F)
+    expected = float(crps_norm(m[oos_idx], base_sigma, y[oos_idx]).mean())
+    assert result.crps_baseline_oos == pytest.approx(expected)
+    # The σ=3 baseline is well above the floor — it is NOT the degenerate deterministic fallback.
+    assert base_sigma[0] == pytest.approx(3.0)

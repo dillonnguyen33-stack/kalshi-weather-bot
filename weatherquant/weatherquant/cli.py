@@ -260,12 +260,12 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
     2. groups the pairs into ``(city, model, lead, month)`` strata;
     3. fits each stratum (``strata.fit_stratum_pooled`` — the pooling/shrinkage ladder records
        ``pool_level``);
-    4. computes the OOS audit metrics on a TEMPORAL split (``evaluate.evaluate_stratum_oos``)
-       when the stratum has enough samples for a split (else leaves the OOS metrics as NaN —
-       absence is absence, never a fabricated number);
+    4. computes the OOS audit metrics on a TEMPORAL split over the strata's real target dates
+       (``evaluate.evaluate_stratum_oos_aggregated``) when the stratum has >= 2 distinct dates
+       (else leaves the OOS metrics as NaN — absence is absence, never a leaky/fabricated number);
     5. persists each stratum APPEND-ONLY via ``persist.store_calibration_params`` with
        ``available_at = now`` (the training-run completion instant, D-13) and ``trained_through``
-       = the max train ``target_date`` used.
+       = the latest ``target_date`` the persisted full-stratum fit trained through.
 
     Cities/models were already validated by the argparse ``type=``/``choices=`` validators
     (unknown city / unknown model rejected BEFORE this runs — ASVS V5 / T-03-05). Calibration is
@@ -307,31 +307,30 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
                 m = np.array([p.m for p in month_pairs], dtype=float)
                 s2 = np.array([p.s2 for p in month_pairs], dtype=float)
                 y = np.array([p.y for p in month_pairs], dtype=float)
-                target_dates = [date(2000, month, 1) for _ in month_pairs]  # month-only key
+                target_dates = [p.target_date for p in month_pairs]  # real verifying days (D-10)
 
                 samples = strata.StratumSamples(
                     city=city, model=model, lead=lead, month=month, m=m, s2=s2, y=y
                 )
                 fit = strata.fit_stratum_pooled(samples)
 
-                # OOS audit metrics on a temporal split — only when there are enough samples to
-                # split (>=2 distinct dates). The synthetic month-only key collapses dates, so a
-                # real backfill (per-target-date dates) is what makes this a genuine temporal
-                # split; here we guard and leave NaN when a split is not meaningful.
+                # OOS audit metrics on a genuine TEMPORAL split (D-10): order the stratum's real
+                # target dates and hold out the latest oos_fraction. This requires >= 2 DISTINCT
+                # dates — with fewer the split would be positional (look-ahead leakage), so we
+                # leave the metrics NaN (absence = absence) rather than persist a leaky number.
+                # The audit fit feeds the REAL ensemble variance s2 (sqrt(s2) is the raw-ensemble
+                # baseline spread); the deterministic-collapse pseudo-member bug is gone.
+                # The persisted params come from the FULL-stratum fit, so their data cutoff is the
+                # latest target date — independent of the diagnostic OOS split.
                 crps_train = crps_oos = crps_baseline_oos = math.nan
-                trained_through = date(2000, month, 1)  # month-only cutoff (synthetic key)
-                if fit.n_train >= 2:
-                    members = m[:, None]  # aggregated mean as a single pseudo-member
-                    try:
-                        oos = evaluate.evaluate_stratum_oos(
-                            target_dates, members, y, oos_fraction=oos_fraction
-                        )
-                        crps_train = oos.crps_train
-                        crps_oos = oos.crps_oos
-                        crps_baseline_oos = oos.crps_baseline_oos
-                        trained_through = oos.trained_through
-                    except ValueError:
-                        pass  # too few samples for a split — leave metrics NaN (absence=absence)
+                trained_through = max(target_dates)  # persisted fit's data cutoff (D-13)
+                if len(set(target_dates)) >= 2:
+                    oos = evaluate.evaluate_stratum_oos_aggregated(
+                        target_dates, m, s2, y, oos_fraction=oos_fraction
+                    )
+                    crps_train = oos.crps_train
+                    crps_oos = oos.crps_oos
+                    crps_baseline_oos = oos.crps_baseline_oos
 
                 persist.store_calibration_params(
                     bind,
