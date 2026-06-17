@@ -12,8 +12,17 @@ distribution is continuous, so each integer degree ``k`` owns the half-open cont
 interval ``[k − _HALF, k + _HALF)`` and a bucket's mass sums ``Φ(k+_HALF) − Φ(k−_HALF)`` over
 the integers it covers (D-05, RESEARCH Pitfall 1). The half-degree offset lives in ONE place
 (``_HALF``) and the inclusive-integer coverage in ONE helper (``integers_in_bucket``); the
-exact coverage of a label is LOW-confidence and is gated behind a ``checkpoint:human-verify``
-against a live ``KXHIGH`` market before the offset is locked.
+exact coverage of a label is LOW-confidence and was gated behind the 04-06
+``checkpoint:human-verify`` against a live ``KXHIGH`` market.
+
+That live cross-check was DEFERRED to Phase 5 by user decision (2026-06-17): no Kalshi API
+key / client is configured this session (the ``KXHIGH`` ingest is itself Phase-5 work), so the
+principled ``[k − _HALF, k + _HALF)`` mapping is RETAINED as-is and locked in Phase 5 when the
+live market record is available. The ``tests/test_buckets.py -k real_ladder`` case exercises a
+representative integer ``KXHIGH``-shaped ladder (open tails included) under this coverage:
+it tiles to ~1 and keeps the modal bucket on the blended μ (Pitfall 1's warning sign — a
+one-degree shift — is asserted absent). This remains a Phase-5 deferred item, NOT a value
+confirmed against a live market.
 
 ``parse_ticker`` is a pure string→edges parser (no I/O, D-06): it fails loud on a malformed
 ticker (raise, never silently default an edge — ASVS V5) and prefers the structured
@@ -37,9 +46,10 @@ __all__ = ["integers_in_bucket", "bucket_prob", "bucket_probs", "parse_ticker"]
 
 # The single half-degree bucket-edge offset (D-05 / RESEARCH Pitfall 1): integer degree ``k``
 # owns the continuous interval ``[k − _HALF, k + _HALF)``. Centralized here so a one-place
-# change (after the live-market human-verify checkpoint) re-maps every bucket consistently.
-# LOW-confidence value: the exact inclusive-integer coverage of a label is locked only by the
-# 04-06 ``checkpoint:human-verify`` against a live ``KXHIGH`` market — do not treat it as final.
+# change (when the live-market cross-check lands) re-maps every bucket consistently.
+# LOW-confidence value: the exact inclusive-integer coverage of a label is to be locked by the
+# live ``KXHIGH`` cross-check, DEFERRED to Phase 5 (no Kalshi API this session, user decision
+# 2026-06-17). Retained as the principled default — do not treat it as confirmed-against-live.
 _HALF = 0.5
 
 

@@ -7,6 +7,11 @@ Covers the two bucket behaviors from the VALIDATION map:
   malformed input.
 * ``-k sum`` — a full integer ladder's bucket probabilities (incl. open tails) sum to ~1,
   via CDF differencing over the centralized ``_HALF`` half-degree offset.
+* ``-k real_ladder`` — a representative ``KXHIGH``-shaped integer ladder built end-to-end
+  through the public seam (``parse_ticker`` structured strikes → ``integers_in_bucket`` →
+  ``bucket_probs``) tiles to ~1 AND keeps the modal bucket on the blended μ (Pitfall 1's two
+  warning signs absent). The LIVE ``KXHIGH`` cross-check is deferred to Phase 5 (no Kalshi API
+  this session, user decision 2026-06-17); this guards the principled mapping in the meantime.
 
 Flipped GREEN by Wave 1 (04-03); the test names keep the ``-k`` selectors in
 04-VALIDATION.md so no renaming is needed.
@@ -69,6 +74,51 @@ def test_buckets_ladder_sum_to_one():
     ladder.append((85.5, math.inf, False, True))  # open upper tail (≥ 86)
     probs = bucket_probs(mu, sigma, ladder)
     assert probs.sum() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_buckets_real_ladder_sums_to_one_and_modal_bucket_on_mu():
+    # A representative KXHIGH-shaped integer ladder (single-degree buckets between two open
+    # tails), built end-to-end through the PUBLIC seam — parse_ticker (structured Kalshi
+    # strikes) → integers_in_bucket → bucket_probs — under the deferred (Phase-5-locked)
+    # [k − _HALF, k + _HALF) coverage. The live KXHIGH cross-check is deferred to Phase 5
+    # (no Kalshi API this session); this asserts the two Pitfall-1 warning signs are absent:
+    #   1. the full ladder tiles the line ⇒ probabilities sum to ~1 (no gap/overlap), and
+    #   2. the modal bucket sits ON the blended μ, not one degree off (silent ±1° mass bias).
+    mu, sigma = 70.0, 4.0
+    lo_deg, hi_deg = 55, 85  # closed single-degree buckets KXHIGH{55..85}, open tails outside
+
+    ladder: list[tuple[float, float, bool, bool]] = []
+    bucket_centers: list[float | None] = []
+
+    # Open lower tail: "≤ (lo_deg − 1)" via the structured 'less' strike.
+    lo, hi, open_lo, open_hi = parse_ticker(cap_strike=lo_deg - 1, strike_type="less")
+    ladder.append((*integers_in_bucket(lo, hi, open_lo, open_hi), open_lo, open_hi))
+    bucket_centers.append(None)  # tail has no finite center
+
+    # Closed single-degree buckets, each built from the structured between-strikes the live
+    # Kalshi market record supplies (floor_strike == cap_strike == k for a 1°F bucket).
+    for k in range(lo_deg, hi_deg + 1):
+        lo, hi, open_lo, open_hi = parse_ticker(
+            floor_strike=k, cap_strike=k, strike_type="between"
+        )
+        assert (lo, hi, open_lo, open_hi) == (k, k, False, False)
+        ladder.append((*integers_in_bucket(lo, hi, open_lo, open_hi), open_lo, open_hi))
+        bucket_centers.append(float(k))
+
+    # Open upper tail: "≥ (hi_deg + 1)" via the structured 'greater' strike.
+    lo, hi, open_lo, open_hi = parse_ticker(floor_strike=hi_deg + 1, strike_type="greater")
+    ladder.append((*integers_in_bucket(lo, hi, open_lo, open_hi), open_lo, open_hi))
+    bucket_centers.append(None)
+
+    probs = bucket_probs(mu, sigma, ladder)
+
+    # 1. Sum-to-one within 1e-9 (no gap/overlap across the real-shaped ladder).
+    assert probs.sum() == pytest.approx(1.0, abs=1e-9)
+
+    # 2. Modal bucket sits exactly on the blended μ (no one-degree shift). With μ an integer
+    #    and symmetric Gaussian mass, the densest closed bucket must be centered on μ itself.
+    modal_idx = int(np.argmax(probs))
+    assert bucket_centers[modal_idx] == pytest.approx(mu)
 
 
 def test_buckets_bucket_prob_open_tails_use_one_sided_limits():
