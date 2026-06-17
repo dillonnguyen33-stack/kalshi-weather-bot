@@ -510,11 +510,32 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     )
     afd_flag = bool(afd_rows)
 
-    # Resolve the calibration n_train/pool_level for sufficiency (use the highest-weight model
-    # actually used — a representative of the blend's data sufficiency).
-    lead_cal = cal_by_model[used_models[int(np.argmax(weights))]]
-    n_train = int(lead_cal["n_train"] or 0)
-    pool_level = str(lead_cal["pool_level"] or "")
+    # Resolve the calibration n_train/pool_level for sufficiency. The sufficiency ramp haircuts
+    # the WHOLE blend off one representative model, so pick it deterministically and
+    # conservatively (WR-05): the used model with the SMALLEST sufficiency ramp, ties broken by
+    # model name. argmax(weights) was non-deterministic under the equal-weight (all-NULL-CRPS)
+    # and floored-weight tie cases — it returned the first dict-insertion-order model, letting a
+    # thin/pooled component silently set or escape the haircut. Taking the minimum ramp ensures a
+    # thin/pooled component can never be hidden by iteration order.
+    # Fail loud on missing sufficiency provenance (WR-02): a NULL n_train would flow into
+    # sufficiency_ramp(0, ...) → shrink 0 → stake silently 0, indistinguishable from "no edge".
+    # The rest of price/ fails loud on bad input (bucket_prob/exact_fee); match that discipline.
+    def _suff_for(model: str) -> tuple[float, str]:
+        cal = cal_by_model[model]
+        raw_n = cal["n_train"]
+        if raw_n is None:
+            raise SystemExit(
+                f"price: calibration row for model={model} has NULL n_train — "
+                f"cannot size (would silently zero the stake)."
+            )
+        pool = str(cal["pool_level"] or "")
+        return pricing.sufficiency_ramp(int(raw_n), pool), model
+
+    # min over (ramp, model_name): smallest ramp wins; the model-name tiebreak is deterministic.
+    _, rep_model = min(_suff_for(m) for m in used_models)
+    rep_cal = cal_by_model[rep_model]
+    n_train = int(rep_cal["n_train"])
+    pool_level = str(rep_cal["pool_level"] or "")
 
     logger.info(
         "price city=%s date=%s lead=%s models=%s mu_blend=%.2f sigma_blend=%.2f afd=%s",
