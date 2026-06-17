@@ -25,7 +25,6 @@ import pytest
 
 from weatherquant.calibrate.crps import crps_norm
 from weatherquant.calibrate.evaluate import (
-    baseline_gaussian,
     evaluate_stratum_oos,
     evaluate_stratum_oos_aggregated,
     temporal_split,
@@ -47,7 +46,7 @@ def _synthetic_misspecified_stratum(
 
     The TRUE daily-high law is ``y ~ N(true_mu, true_sigma)`` with ``true_mu = a + b*m``
     where ``m`` is the ensemble mean. The raw ENSEMBLE members, however, are centered at a
-    biased ``m`` (so ``baseline_gaussian``'s mean is off by the bias) and under-dispersed
+    biased ``m`` (so the raw-ensemble baseline mean is off by the bias) and under-dispersed
     (members cluster tighter than the true σ), so the raw-ensemble Gaussian is mis-calibrated.
     EMOS recovers the debias ``(a, b)`` and the spread inflation ``(c, d)`` — genuine skill.
     """
@@ -88,33 +87,6 @@ def test_temporal_split_orders_by_date_no_shuffle():
     assert sorted([*train_idx, *oos_idx]) == list(range(10))
     # The values carried by the indices are untouched (no shuffle of the payload).
     assert np.array_equal(values[train_idx], np.array([values[i] for i in train_idx]))
-
-
-def test_baseline_gaussian_ensemble_uses_sample_std():
-    """For an ensemble, the baseline is ``(member mean, member sample std, ddof=1)`` (D-11)."""
-    members = np.array([[68.0, 70.0, 72.0]])  # one date, 3 members
-    mu, sigma = baseline_gaussian(members)
-    assert mu.shape == (1,)
-    assert np.isclose(mu[0], 70.0)
-    # Sample std (ddof=1) of {68,70,72} = 2.0 exactly.
-    assert np.isclose(sigma[0], np.std([68.0, 70.0, 72.0], ddof=1))
-    assert np.isclose(sigma[0], 2.0)
-
-
-def test_baseline_gaussian_deterministic_uses_residual_std():
-    """A single-member (deterministic) stratum gets a residual-std spread (Open Q#2 / D-11).
-
-    With one member per date the ensemble sample std is undefined/zero, so the baseline spread
-    falls back to the forecast-minus-obs residual std supplied by the caller — never σ=0
-    (degenerate over-confidence).
-    """
-    members = np.array([[70.0], [72.0], [74.0]])  # one member per date — deterministic
-    resid_std = 4.0
-    mu, sigma = baseline_gaussian(members, residual_std=resid_std)
-    assert np.allclose(mu, [70.0, 72.0, 74.0])
-    # All spreads equal the residual std (no per-date member dispersion to use).
-    assert np.allclose(sigma, resid_std)
-    assert np.all(sigma > 0.0)
 
 
 def test_calibrated_oos_beats_raw_ensemble_baseline():
@@ -189,3 +161,41 @@ def test_aggregated_baseline_uses_sqrt_s2_not_deterministic_collapse():
     assert result.crps_baseline_oos == pytest.approx(expected)
     # The σ=3 baseline is well above the floor — it is NOT the degenerate deterministic fallback.
     assert base_sigma[0] == pytest.approx(3.0)
+
+
+def test_aggregated_deterministic_stratum_uses_train_residual_std():
+    """A fully deterministic stratum (s2==0 everywhere) falls back to the TRAIN residual std for
+    the baseline spread — never σ=0, and train-only so the baseline never peeks at OOS labels
+    (D-11/D-12). This is the single deterministic-baseline path now that the raw-member
+    baseline_gaussian is gone (WR-03/WR-04)."""
+    dates = [date(2024, 1, d) for d in (1, 2, 3, 4)]
+    m = np.array([70.0, 71.0, 72.0, 73.0])
+    s2 = np.zeros(4)  # deterministic — no ensemble dispersion anywhere
+    y = np.array([72.0, 70.0, 75.0, 71.0])
+
+    result = evaluate_stratum_oos_aggregated(dates, m, s2, y, oos_fraction=0.5)
+
+    train_idx, oos_idx = temporal_split(dates, oos_fraction=0.5)
+    resid_tr = y[train_idx] - m[train_idx]
+    expected_sigma = max(float(resid_tr.std(ddof=1)), SIGMA_FLOOR_F)
+    expected = float(
+        crps_norm(m[oos_idx], np.full(oos_idx.shape, expected_sigma), y[oos_idx]).mean()
+    )
+    assert result.crps_baseline_oos == pytest.approx(expected)
+    # Residual std (≈2.12) dominates the floor here — proving the fallback fired, not the clamp.
+    assert expected_sigma > SIGMA_FLOOR_F
+
+
+def test_member_wrapper_collapses_to_aggregated_deterministic():
+    """The raw-member wrapper collapses a single-member ensemble to s2=0 and delegates to the
+    aggregated deterministic path — proving the two paths cannot drift (WR-03)."""
+    dates = [date(2024, 1, d) for d in (1, 2, 3, 4)]
+    members = np.array([[70.0], [71.0], [72.0], [73.0]])  # one member per date — deterministic
+    y = np.array([72.0, 70.0, 75.0, 71.0])
+
+    via_members = evaluate_stratum_oos(dates, members, y, oos_fraction=0.5)
+    via_aggregated = evaluate_stratum_oos_aggregated(
+        dates, members[:, 0], np.zeros(4), y, oos_fraction=0.5
+    )
+    assert via_members.crps_baseline_oos == pytest.approx(via_aggregated.crps_baseline_oos)
+    assert via_members.crps_oos == pytest.approx(via_aggregated.crps_oos)
