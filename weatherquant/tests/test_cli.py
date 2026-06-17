@@ -147,3 +147,37 @@ def test_scheduler_is_asyncio_3x_not_4x():
     from weatherquant.scheduler import build_scheduler
 
     assert isinstance(build_scheduler(), AsyncIOScheduler)
+
+
+# --- price subcommand (04-05 Task 2) — parse-level contract, no DB needed -----------------
+
+
+def test_price_subcommand_parses_valid_city_and_date():
+    """A valid `price` invocation parses to the price command with city/date/lead/mid.
+
+    This is the parse-level contract only (the orchestration in run_price reads the DB and is
+    exercised offline elsewhere) — argparse validation runs BEFORE any DB call (ASVS V5).
+    """
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        ["price", "--city", "NYC", "--date", "2026-06-12", "--ticker", "KXHIGHNY-62-63"]
+    )
+    assert args.command == "price"
+    assert args.city == "NYC"
+    assert args.date == date(2026, 6, 12)
+    assert args.lead == 0  # default
+    assert args.market_mid == 0.5  # mocked midpoint default (D-16 — no market fetch)
+    assert args.ticker == "KXHIGHNY-62-63"
+
+
+def test_price_unknown_city_is_rejected_by_argparse(capsys: pytest.CaptureFixture):
+    """An unknown `price --city` is rejected by argparse via _city_type — ASVS V5 / T-04-15.
+
+    The rejection happens at the arg edge, BEFORE any DB read in run_price.
+    """
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["price", "--city", "ZZZ", "--date", "2026-06-12"])
+    assert excinfo.value.code != 0  # argparse exits non-zero on a bad arg
+    err = capsys.readouterr().err
+    assert "ZZZ" in err  # the clear error names the bad code

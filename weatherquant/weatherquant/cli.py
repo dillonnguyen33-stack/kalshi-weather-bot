@@ -21,8 +21,9 @@ import argparse
 import asyncio
 import logging
 from datetime import date, datetime, timezone
+from typing import Any
 
-from weatherquant.db.engine import get_engine
+from weatherquant.db.engine import get_engine, get_settings
 from weatherquant.ingest import orchestrator
 from weatherquant.registry import CITIES, get_city
 
@@ -175,6 +176,49 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.3,
         help="Fraction of date-sorted samples held out for OOS validation (default 0.3).",
+    )
+
+    # --- price: OPTIONAL smoke command — latest→predict→blend→bucket/EV/Kelly (D-15/D-16) ----
+    # The I/O-edge orchestration analog of run_calibrate: it pulls the latest calibration
+    # params / forecasts / AFD flag, blends, and prints bucket probs / EV / Kelly stake with
+    # the MARKET MIDPOINT MOCKED (D-16 — Phase 4 does NO market fetch; Phase 5 owns the book).
+    # All pure math stays in weatherquant.price; the CLI is the edge only. The same _city_type
+    # validator rejects an unknown city BEFORE any DB read (ASVS V5 / T-04-15).
+    price = sub.add_parser(
+        "price",
+        help="Smoke-price a (city, date): blend latest calibration + forecasts, print "
+        "bucket probs / EV / Kelly (market midpoint mocked, no market fetch).",
+    )
+    price.add_argument(
+        "--city",
+        type=_city_type,
+        required=True,
+        help=f"A single Kalshi city code (one of: {', '.join(sorted(CITIES))}).",
+    )
+    price.add_argument(
+        "--date",
+        type=_parse_date,
+        required=True,
+        help="The LST settlement date to price (YYYY-MM-DD).",
+    )
+    price.add_argument(
+        "--lead",
+        type=int,
+        default=0,
+        help="Forecast lead hours to price (default 0).",
+    )
+    price.add_argument(
+        "--ticker",
+        type=str,
+        default=None,
+        help="A single KXHIGH range ticker to price (e.g. KXHIGHNY-62-63); optional.",
+    )
+    price.add_argument(
+        "--market-mid",
+        type=float,
+        default=0.5,
+        help="MOCKED market midpoint price in [0,1] (D-16 — no live market fetch; Phase 5 "
+        "supplies the real (best_bid+best_ask)/2). Default 0.5.",
     )
     return parser
 
@@ -358,6 +402,161 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
     return persisted
 
 
+def run_price(args: argparse.Namespace) -> dict[str, Any]:
+    """Smoke-price one (city, date): latest→predict→blend→bucket/EV/Kelly (D-15/D-16).
+
+    The I/O-edge orchestration analog of :func:`run_calibrate`. For the validated
+    ``(city, date, lead)`` this:
+
+    1. reads the latest ``calibration_params`` per model and the latest ``forecasts`` members
+       for the target date via ``queries.latest`` (full natural key — no under-specified read);
+    2. aggregates each model's members to ``(mean_f, var_f)`` in °F using
+       ``strata.kelvin_to_fahrenheit`` at the boundary (D-15 — the ONE K→°F seam, never
+       re-derived) and reconstructs ``(μ_i, σ_i)`` via ``link.predict`` reused verbatim;
+    3. computes accuracy weights from the persisted ``crps_oos`` (``price.accuracy_weights``)
+       and blends to ``(μ_blend, σ_blend)`` via Vincentization (``price.blend_gaussians``);
+    4. reads the AFD disagreement flag from the latest ``observations`` ``source='afd'`` row;
+    5. prices the requested bucket(s): bucket probability (``price.bucket_prob`` after
+       ``price.parse_ticker`` + ``price.integers_in_bucket``), fee-corrected EV
+       (``price.bucket_ev``) and the capped fractional-Kelly stake (``price.stake_fraction``)
+       — all with the MARKET MIDPOINT MOCKED from ``--market-mid`` (D-16: no market fetch).
+
+    The city was already validated by the argparse ``type=_city_type`` (unknown city rejected
+    BEFORE this runs — ASVS V5 / T-04-15). All pure math lives in :mod:`weatherquant.price`;
+    this function is the offline-untestable I/O edge only and returns a small result dict.
+    """
+    # Imported lazily so the ingest/calibrate paths (and `--help`) never pay these imports.
+    import numpy as np
+
+    from weatherquant import price as pricing
+    from weatherquant.calibrate import link, strata
+    from weatherquant.db import queries
+
+    city = args.city
+    target = args.date
+    lead = args.lead
+    market_mid = args.market_mid
+    if not (0.0 <= market_mid <= 1.0):  # mocked midpoint still validated (ASVS V5)
+        raise SystemExit(f"price: --market-mid must be in [0, 1], got {market_mid}")
+
+    bind = get_engine()
+    cap = get_settings().max_position_fraction  # position cap from typed config (D-13)
+
+    month = target.month
+    forecasts = queries.latest(
+        bind, "forecasts", where={"city": city, "target_date": target, "lead": lead}
+    )
+    cal_rows = queries.latest(
+        bind, "calibration_params", where={"city": city, "lead": lead, "month": month}
+    )
+    cal_by_model = {r["model"]: r for r in cal_rows}
+
+    # Aggregate forecast members per model to (mean_f, var_f) in °F at the K→°F seam (D-15).
+    members_by_model: dict[str, list[float]] = {}
+    for row in forecasts:
+        if row["temp_kelvin"] is None:
+            continue
+        members_by_model.setdefault(row["model"], []).append(
+            strata.kelvin_to_fahrenheit(float(row["temp_kelvin"]))
+        )
+
+    mus: list[float] = []
+    sigmas: list[float] = []
+    crps_oos: list[float] = []
+    used_models: list[str] = []
+    for model, vals in members_by_model.items():
+        cal = cal_by_model.get(model)
+        if cal is None or not vals:  # no calibration for this model → it drops out (D-03)
+            continue
+        arr = np.asarray(vals, dtype=np.float64)
+        mean_f = float(arr.mean())
+        var_f = float(arr.var()) if arr.size > 1 else 0.0  # deterministic model → var 0
+        params = (
+            cal["mean_intercept"],
+            cal["mean_slope"],
+            cal["var_intercept"],
+            cal["var_slope"],
+            cal["sigma_floor"],
+        )
+        mu_i, sigma_i = link.predict(
+            params, np.array([mean_f]), np.array([var_f])
+        )
+        mus.append(float(mu_i[0]))
+        sigmas.append(float(sigma_i[0]))
+        crps_oos.append(
+            float(cal["crps_oos"]) if cal["crps_oos"] is not None else float("nan")
+        )
+        used_models.append(model)
+
+    if not used_models:
+        raise SystemExit(
+            f"price: no model has BOTH latest forecasts and calibration for "
+            f"city={city} date={target} lead={lead} month={month}."
+        )
+
+    weights = pricing.accuracy_weights(np.asarray(crps_oos, dtype=np.float64))
+    mu_blend, sigma_blend = pricing.blend_gaussians(
+        np.asarray(mus), np.asarray(sigmas), weights
+    )
+
+    # AFD disagreement flag from the latest observations source='afd' row (soft, D-12).
+    afd_rows = queries.latest(
+        bind, "observations", where={"city": city, "target_date": target, "source": "afd"}
+    )
+    afd_flag = bool(afd_rows)
+
+    # Resolve the calibration n_train/pool_level for sufficiency (use the highest-weight model
+    # actually used — a representative of the blend's data sufficiency).
+    lead_cal = cal_by_model[used_models[int(np.argmax(weights))]]
+    n_train = int(lead_cal["n_train"] or 0)
+    pool_level = str(lead_cal["pool_level"] or "")
+
+    logger.info(
+        "price city=%s date=%s lead=%s models=%s mu_blend=%.2f sigma_blend=%.2f afd=%s",
+        city, target, lead, used_models, mu_blend, sigma_blend, afd_flag,
+    )
+
+    result: dict[str, Any] = {
+        "city": city,
+        "date": target.isoformat(),
+        "lead": lead,
+        "models": used_models,
+        "mu_blend": mu_blend,
+        "sigma_blend": sigma_blend,
+        "afd_flag": afd_flag,
+        "market_mid": market_mid,
+        "buckets": [],
+    }
+
+    if args.ticker is not None:
+        lo, hi, open_lo, open_hi = pricing.parse_ticker(args.ticker)
+        c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
+        prob = pricing.bucket_prob(
+            mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi
+        )
+        ev = pricing.bucket_ev(prob, market_mid, market_mid)
+        stake = pricing.stake_fraction(
+            prob, market_mid, pricing.exact_fee(1, market_mid),
+            sigma_blend, n_train, pool_level, afd_flag, cap=cap,
+        )
+        bucket = {
+            "ticker": args.ticker, "prob": prob, "ev": ev, "stake_fraction": stake,
+        }
+        result["buckets"].append(bucket)
+        print(
+            f"price {city} {target} {args.ticker}: P={prob:.4f} EV={ev:+.4f} "
+            f"stake={stake:.4f} (mocked mid={market_mid})"
+        )
+    else:
+        print(
+            f"price {city} {target} lead={lead}: blend N(mu={mu_blend:.2f}, "
+            f"sigma={sigma_blend:.2f}) over models={used_models} afd={afd_flag} "
+            f"(no --ticker → distribution only; market mid mocked={market_mid})"
+        )
+
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console-script entry point (``[project.scripts] weatherquant = weatherquant.cli:main``).
 
@@ -377,6 +576,9 @@ def main(argv: list[str] | None = None) -> int:
         persisted = run_calibrate(args)
         total = sum(persisted.values())
         print(f"calibrate complete: {total} stratum row(s) persisted ({persisted})")
+        return 0
+    if args.command == "price":
+        run_price(args)  # prints the blend/bucket/EV/Kelly smoke line(s) itself (D-16)
         return 0
     parser.error(f"unknown command: {args.command}")
     return 2  # unreachable — parser.error exits
