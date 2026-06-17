@@ -1,4 +1,4 @@
-"""Fractional-Kelly sizing tests (PRC-04/05, D-10–D-13) — RED until Wave 2 (04-06).
+"""Fractional-Kelly sizing tests (PRC-04/05, D-10–D-13) — GREEN as of 04-05.
 
 Covers the four sizing behaviors from the VALIDATION map:
 
@@ -7,23 +7,25 @@ Covers the four sizing behaviors from the VALIDATION map:
 * ``-k zero`` — a non-positive-EV side sizes to 0.
 * ``-k afd`` — the AFD flag reduces the stake but NEVER zeroes it (soft haircut, PRC-05).
 
-All ``xfail`` (the stubs raise ``NotImplementedError``) so Wave 2 flips them GREEN without
-renaming — the test names match the ``-k`` selectors in 04-VALIDATION.md.
+These were RED ``xfail`` stubs in Wave 0; 04-05 implements ``stake_fraction`` and flips them
+GREEN without renaming — the test names still match the ``-k`` selectors in 04-VALIDATION.md.
 """
 
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from weatherquant.price.kelly import kelly_fraction, stake_fraction
 
-# A comfortably positive-EV base case for the shrink/cap/afd tests.
-_P, _PRICE, _FEE = 0.75, 0.50, 0.02
+# A positive-EV base case for the shrink/cap/afd tests. The edge is kept MILD on purpose
+# (p just above price): a strong edge would push λ·f_kelly above the cap so EVERY shrink
+# factor clips to the cap and the σ/AFD monotonicity these tests assert becomes invisible
+# (both wide and narrow saturate at cap). With p=0.55, price=0.50, λ·f_kelly≈0.020 < the
+# 0.025 cap, so the whole sub-cap shrink region is exercised and monotonicity is observable.
+_P, _PRICE, _FEE = 0.55, 0.50, 0.02
 _BASE = dict(n_train=500, pool_level="own:city", afd_flag=False)
 
 
-@pytest.mark.xfail(reason="Wave 2 (04-06) implements stake_fraction", strict=False)
 def test_kelly_no_position_exceeds_cap():
     cap = 0.025
     rng = np.random.default_rng(11)
@@ -39,7 +41,6 @@ def test_kelly_no_position_exceeds_cap():
         assert 0.0 <= stake <= cap + 1e-12
 
 
-@pytest.mark.xfail(reason="Wave 2 (04-06) implements stake_fraction", strict=False)
 def test_kelly_shrink_with_sigma_and_thin_data():
     wide = stake_fraction(_P, _PRICE, _FEE, sigma_blend=12.0, **_BASE)
     narrow = stake_fraction(_P, _PRICE, _FEE, sigma_blend=1.0, **_BASE)
@@ -56,7 +57,6 @@ def test_kelly_shrink_with_sigma_and_thin_data():
     assert thin < thick  # thinner n_train ⇒ smaller bet (D-11)
 
 
-@pytest.mark.xfail(reason="Wave 2 (04-06) implements kelly/stake", strict=False)
 def test_kelly_non_positive_ev_is_zero():
     # A side whose fee-aware edge is non-positive sizes to exactly 0.
     assert kelly_fraction(0.2, 0.80, 0.02) == 0.0
@@ -66,7 +66,6 @@ def test_kelly_non_positive_ev_is_zero():
     assert stake == 0.0
 
 
-@pytest.mark.xfail(reason="Wave 2 (04-06) implements stake_fraction", strict=False)
 def test_kelly_afd_reduces_but_never_zeroes():
     with_afd = stake_fraction(
         _P, _PRICE, _FEE, sigma_blend=3.0,

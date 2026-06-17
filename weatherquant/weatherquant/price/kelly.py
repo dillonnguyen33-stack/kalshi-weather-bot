@@ -20,6 +20,8 @@ Pure NumPy + stdlib ``math`` only — no scipy/sklearn (the AST guard enforces i
 
 from __future__ import annotations
 
+from weatherquant.price.fee import exact_fee  # fee-aware Kelly reuses the exact integer-cent fee
+
 __all__ = ["KELLY_LAMBDA", "SIGMA0_F", "AFD_HAIRCUT", "N_REF",
            "kelly_fraction", "sufficiency_ramp", "stake_fraction"]
 
@@ -40,14 +42,26 @@ AFD_HAIRCUT = 0.6
 N_REF = 30
 
 
-def kelly_fraction(p: float, price: float, fee: float) -> float:
-    """Fee-aware Kelly fraction on one side; 0 on non-positive edge (D-10 — Wave 2).
+def kelly_fraction(p: float, price: float, fee: float | None = None) -> float:
+    """Fee-aware Kelly fraction on one side; 0 on non-positive edge (D-10).
 
     ``win = (1 − price) − fee``; if ``win ≤ 0`` returns 0. Otherwise
-    ``max(0, (p·win − (1 − p)·price) / win)``. Recomputed with the EXACT taker fee.
-    ``tests/test_kelly.py -k zero`` asserts a non-positive-EV side returns 0.
+    ``max(0, (p·win − (1 − p)·price) / win)``. ``tests/test_kelly.py -k zero`` asserts a
+    non-positive-EV side returns 0.
+
+    ``fee`` is the EXACT taker fee for the marginal contract. When omitted it is resolved
+    here via :func:`weatherquant.price.fee.exact_fee` (the per-contract marginal
+    ``exact_fee(1, price)``, Open Question 3) so the sizing path is fee-aware through the ONE
+    fee source of truth and never re-implements the fee (D-09); a caller that already has the
+    fee (e.g. the EV path) passes it in to avoid recomputing.
     """
-    raise NotImplementedError("kelly_fraction is implemented in Wave 2 (04-06).")
+    if fee is None:
+        fee = exact_fee(1, price)  # per-contract marginal taker fee via the one fee seam (D-09)
+    win = (1.0 - price) - fee
+    if win <= 0.0:  # no net upside after fee → non-positive-EV side sizes to 0 (D-10)
+        return 0.0
+    edge = p * win - (1.0 - p) * price
+    return max(0.0, edge / win)
 
 
 def sufficiency_ramp(n_train: int, pool_level: str) -> float:
@@ -57,7 +71,12 @@ def sufficiency_ramp(n_train: int, pool_level: str) -> float:
     (a parent-pooled fit is less trustworthy than an own-stratum fit). Thinner/pooled data
     ⇒ smaller stake (D-11); ``tests/test_kelly.py -k shrink`` guards monotonicity.
     """
-    raise NotImplementedError("sufficiency_ramp is implemented in Wave 2 (04-06).")
+    ramp = min(1.0, max(0.0, n_train / N_REF))
+    if pool_level.startswith("parent:"):
+        # A parent-pooled fit is less trustworthy than an own-stratum fit — an extra haircut
+        # (D-11, RESEARCH Operational Defaults) so a pure-parent stratum bets more cautiously.
+        ramp *= 0.7
+    return ramp
 
 
 def stake_fraction(
@@ -81,5 +100,19 @@ def stake_fraction(
     (afd_haircut if afd_flag else 1.0)``. The AFD haircut is soft (never zeroes — PRC-05);
     the final ``cap`` is a hard invariant (no position exceeds it — D-13), asserted by
     ``tests/test_kelly.py -k cap`` / ``-k afd``.
+
+    The ``cap`` is the position-cap fraction the caller threads through from
+    ``Settings.max_position_fraction`` (bounds-validated to ``[0.02, 0.05]`` in 04-01); it
+    defaults to ``0.025`` (that field's default) only when no caller supplies it. The final
+    ``min(max(..., 0.0), cap)`` is the LAST operation and the tested hard invariant: no sized
+    position ever exceeds ``cap`` for any input (D-13, threat T-04-13).
     """
-    raise NotImplementedError("stake_fraction is implemented in Wave 2 (04-06).")
+    f = kelly_fraction(p, price, fee)
+    s_sigma = 1.0 / (1.0 + sigma_blend / sigma0)  # vaguer blend (wider σ) ⇒ smaller bet (D-11)
+    s_suff = sufficiency_ramp(n_train, pool_level)  # thin/pooled data ⇒ smaller bet (D-11)
+    # AFD is a SOFT multiplicative haircut < 1 — it strictly reduces the stake but NEVER
+    # zeroes it (D-12, PRC-05); a hard gate here would violate the requirement (threat T-04-14).
+    s_afd = afd_haircut if afd_flag else 1.0
+    shrink = s_sigma * s_suff * s_afd
+    # Hard cap is the final clip (D-13): the last operation, asserted for arbitrary inputs.
+    return min(max(lam * f * shrink, 0.0), cap)
