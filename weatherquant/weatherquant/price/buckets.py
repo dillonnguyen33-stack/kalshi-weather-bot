@@ -24,30 +24,65 @@ Pure NumPy + stdlib ``math`` only — no scipy/sklearn (the AST guard enforces i
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
+
 import numpy as np
 from numpy.typing import NDArray
+
+from weatherquant.calibrate.crps import normal_cdf
 
 __all__ = ["integers_in_bucket", "bucket_prob", "bucket_probs", "parse_ticker"]
 
 # The single half-degree bucket-edge offset (D-05 / RESEARCH Pitfall 1): integer degree ``k``
 # owns the continuous interval ``[k − _HALF, k + _HALF)``. Centralized here so a one-place
 # change (after the live-market human-verify checkpoint) re-maps every bucket consistently.
+# LOW-confidence value: the exact inclusive-integer coverage of a label is locked only by the
+# 04-06 ``checkpoint:human-verify`` against a live ``KXHIGH`` market — do not treat it as final.
 _HALF = 0.5
 
 
 def integers_in_bucket(
-    lo: int,
-    hi: int,
+    lo: int | None,
+    hi: int | None,
     open_lo: bool = False,
     open_hi: bool = False,
-) -> NDArray[np.float64]:
-    """Continuous ``[k − _HALF, k + _HALF)`` edges for a labeled bucket (D-05 — Wave 1).
+) -> tuple[float, float]:
+    """Continuous ``[k − _HALF, k + _HALF)`` span for a labeled bucket (D-05, Pitfall 1).
 
-    Maps the inclusive integer degrees a bucket label covers (``lo``..``hi``) to the
-    continuous half-degree interval used for CDF differencing. ``open_lo``/``open_hi`` mark
-    open-ended tail buckets (``≤X`` / ``≥Y``).
+    Maps the inclusive integer degrees a bucket label covers (``lo``..``hi``) to the single
+    continuous interval used for CDF differencing: the lowest integer ``lo`` contributes its
+    lower edge ``lo − _HALF`` and the highest integer ``hi`` its upper edge ``hi + _HALF``, so
+    the whole label spans ``[lo − _HALF, hi + _HALF)``. Summing per-integer
+    ``[k − _HALF, k + _HALF)`` intervals over ``lo..hi`` collapses to exactly this span
+    because the integers are contiguous, which is what makes a full ladder tile the line
+    without gaps or overlaps.
+
+    ``open_lo`` / ``open_hi`` mark open-ended tail buckets (``≤X`` / ``≥Y``): the open end uses
+    the ∓∞ sentinel and only the closed end carries a ``±_HALF`` offset.
+
+    The edge offset lives in exactly one place (``_HALF``); see the module docstring on the
+    04-06 human-verify lock.
     """
-    raise NotImplementedError("integers_in_bucket is implemented in Wave 1 (04-03).")
+    if open_lo:
+        if hi is None:
+            raise ValueError("integers_in_bucket: open_lo requires a finite upper integer hi.")
+        return (-math.inf, float(hi) + _HALF)
+    if open_hi:
+        if lo is None:
+            raise ValueError("integers_in_bucket: open_hi requires a finite lower integer lo.")
+        return (float(lo) - _HALF, math.inf)
+
+    if lo is None or hi is None:
+        raise ValueError("integers_in_bucket: a closed bucket needs both integer edges lo, hi.")
+    if hi < lo:
+        raise ValueError(f"integers_in_bucket: inverted bucket (lo={lo} > hi={hi}).")
+    return (float(lo) - _HALF, float(hi) + _HALF)
+
+
+def _normal_cdf_scalar(z: float) -> float:
+    """Scalar standard-normal CDF via the one promoted erf source of truth (D-04, Pitfall 6)."""
+    return float(normal_cdf(np.array([z], dtype=np.float64))[0])
 
 
 def bucket_prob(
@@ -58,27 +93,48 @@ def bucket_prob(
     open_lo: bool = False,
     open_hi: bool = False,
 ) -> float:
-    """Probability mass in one continuous bucket by CDF differencing (D-04 — Wave 1).
+    """Probability mass in one continuous bucket by CDF differencing (D-04, Pattern 2).
 
-    ``Φ_blend(hi) − Φ_blend(lo)`` using the erf-based ``normal_cdf`` from
-    :mod:`weatherquant.calibrate.crps`. ``open_lo``/``open_hi`` collapse the respective edge
-    to the 0/1 tail for open-ended buckets.
+    Returns ``Φ_blend(hi) − Φ_blend(lo)`` with ``Φ_blend`` the blended-Gaussian CDF, computed
+    via the erf-based ``normal_cdf`` promoted public in :mod:`weatherquant.calibrate.crps`
+    (never a second erf — Pitfall 6). ``lo``/``hi`` are the CONTINUOUS edges already offset by
+    ``±_HALF`` (see :func:`integers_in_bucket`).
+
+    ``open_hi=True`` collapses the upper edge to the ``1.0`` tail (mass up to ``+∞``);
+    ``open_lo=True`` collapses the lower edge to the ``0.0`` tail (mass from ``−∞``).
+
+    Fails loud (ASVS V5 / threat T-04-09, mirroring commit ``93202d8``): ``sigma`` must be
+    strictly positive and finite, and ``mu`` finite — a non-finite or non-positive input
+    raises rather than silently returning a NaN probability.
     """
-    raise NotImplementedError("bucket_prob is implemented in Wave 1 (04-03).")
+    if not math.isfinite(mu):
+        raise ValueError(f"bucket_prob: mu must be finite, got {mu!r}.")
+    if not math.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError(f"bucket_prob: sigma must be finite and > 0, got {sigma!r}.")
+
+    upper = 1.0 if open_hi else _normal_cdf_scalar((hi - mu) / sigma)
+    lower = 0.0 if open_lo else _normal_cdf_scalar((lo - mu) / sigma)
+    return upper - lower
 
 
 def bucket_probs(
     mu: float,
     sigma: float,
-    ladder: object,
+    ladder: Sequence[tuple[float, float, bool, bool]],
 ) -> NDArray[np.float64]:
-    """Probabilities across a full bucket ladder, summing to ~1 (D-04 — Wave 1).
+    """Probabilities across a full bucket ladder, summing to ~1 (D-04, Pattern 2).
 
-    ``ladder`` is a sequence of ``(lo, hi, open_lo, open_hi)`` buckets tiling the line
-    (incl. open tails); returns one probability per bucket. The ladder is asserted to sum to
-    ~1 by ``tests/test_buckets.py -k sum``.
+    ``ladder`` is a sequence of ``(lo, hi, open_lo, open_hi)`` continuous buckets tiling the
+    line (including the open ``≤X`` / ``≥Y`` tails). Returns one probability per bucket as a
+    float array. When the ladder tiles ``(−∞, ∞)`` with no gaps or overlaps — the property
+    :func:`integers_in_bucket` guarantees — the array sums to ~1 (asserted by
+    ``tests/test_buckets.py -k sum`` within 1e-9). ``mu``/``sigma`` are guarded by
+    :func:`bucket_prob` per bucket (fail loud on non-finite / σ≤0).
     """
-    raise NotImplementedError("bucket_probs is implemented in Wave 1 (04-03).")
+    return np.array(
+        [bucket_prob(mu, sigma, lo, hi, open_lo, open_hi) for lo, hi, open_lo, open_hi in ladder],
+        dtype=np.float64,
+    )
 
 
 def parse_ticker(ticker: str) -> tuple[int, int]:
