@@ -20,6 +20,9 @@ Pure NumPy + stdlib ``math`` only — no scipy/sklearn (the AST guard enforces i
 
 from __future__ import annotations
 
+import math
+
+from weatherquant.price.ev import _require_prob  # one prob/price validator for the whole money path
 from weatherquant.price.fee import exact_fee  # fee-aware Kelly reuses the exact integer-cent fee
 
 __all__ = ["KELLY_LAMBDA", "SIGMA0_F", "AFD_HAIRCUT", "N_REF",
@@ -55,8 +58,14 @@ def kelly_fraction(p: float, price: float, fee: float | None = None) -> float:
     fee source of truth and never re-implements the fee (D-09); a caller that already has the
     fee (e.g. the EV path) passes it in to avoid recomputing.
     """
+    # Fail-loud guards (WR-03): match the rest of price/ (bucket_prob/exact_fee/p_used). Without
+    # these, p>1 makes (1−p) negative and silently inflates the edge — a latent money-path footgun.
+    _require_prob("p", p)
+    _require_prob("price", price)
     if fee is None:
         fee = exact_fee(1, price)  # per-contract marginal taker fee via the one fee seam (D-09)
+    if not math.isfinite(fee):
+        raise ValueError(f"fee must be finite, got {fee!r}.")
     win = (1.0 - price) - fee
     if win <= 0.0:  # no net upside after fee → non-positive-EV side sizes to 0 (D-10)
         return 0.0
@@ -107,6 +116,12 @@ def stake_fraction(
     ``min(max(..., 0.0), cap)`` is the LAST operation and the tested hard invariant: no sized
     position ever exceeds ``cap`` for any input (D-13, threat T-04-13).
     """
+    # Fail-loud on a degenerate σ (WR-03): sigma_blend ≤ 0 (e.g. −sigma0) divides by zero or
+    # turns s_sigma into a large pre-cap amplifier; a real blend σ from blend_gaussians is > 0.
+    if not math.isfinite(sigma_blend):
+        raise ValueError(f"sigma_blend must be finite, got {sigma_blend!r}.")
+    if sigma_blend <= 0.0:
+        raise ValueError(f"sigma_blend must be > 0, got {sigma_blend!r}.")
     f = kelly_fraction(p, price, fee)
     s_sigma = 1.0 / (1.0 + sigma_blend / sigma0)  # vaguer blend (wider σ) ⇒ smaller bet (D-11)
     s_suff = sufficiency_ramp(n_train, pool_level)  # thin/pooled data ⇒ smaller bet (D-11)

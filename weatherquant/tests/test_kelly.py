@@ -14,6 +14,7 @@ GREEN without renaming — the test names still match the ``-k`` selectors in 04
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from weatherquant.price.kelly import kelly_fraction, stake_fraction
 
@@ -77,3 +78,25 @@ def test_kelly_afd_reduces_but_never_zeroes():
     )
     assert with_afd < without_afd  # soft haircut reduces the stake (D-12)
     assert with_afd > 0.0  # but NEVER zeroes a positive-EV bet (PRC-05)
+
+
+# --- Fail-loud input guards (WR-03): match the rest of price/'s discipline ---
+
+
+@pytest.mark.parametrize("bad_p", [-0.01, 1.01, float("inf"), float("nan")])
+def test_kelly_fraction_rejects_out_of_range_prob(bad_p):
+    with pytest.raises(ValueError):
+        kelly_fraction(bad_p, 0.5, 0.02)
+
+
+@pytest.mark.parametrize("bad_price", [-0.01, 1.01, float("nan")])
+def test_kelly_fraction_rejects_out_of_range_price(bad_price):
+    with pytest.raises(ValueError):
+        kelly_fraction(0.5, bad_price, 0.02)
+
+
+@pytest.mark.parametrize("bad_sigma", [0.0, -5.0, -4.9, float("nan"), float("inf")])
+def test_stake_fraction_rejects_nonpositive_sigma(bad_sigma):
+    # sigma_blend ≤ 0 would divide by zero at −sigma0 or amplify the pre-cap stake; fail loud.
+    with pytest.raises(ValueError):
+        stake_fraction(_P, _PRICE, _FEE, sigma_blend=bad_sigma, **_BASE)
