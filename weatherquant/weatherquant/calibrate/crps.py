@@ -85,9 +85,10 @@ def crps_norm_grad(
     """Exact analytic CRPS gradient ``(d/dmu, d/dsigma)``, elementwise (D-05).
 
     ``d CRPS / d mu = 1 - 2*Phi(z)`` and ``d CRPS / d sigma = 2*phi(z) - 1/sqrt(pi)`` with
-    ``z = (y - mu) / sigma``. Verified against central differences to ~1e-8 by the linchpin
-    gradient-check test (``tests/test_crps_gradient.py``, D-05). Chain-ruled onto the EMOS
-    params ``(a, b, c, d)`` by :func:`weatherquant.calibrate.link.param_grads`.
+    ``z = (y - mu) / sigma``. Verified against central differences to the finite-difference
+    truncation floor by the linchpin gradient-check test (``tests/test_crps_gradient.py`` asserts
+    ``< 1e-5``, D-05). Chain-ruled onto the EMOS params ``(a, b, c, d)`` by
+    :func:`weatherquant.calibrate.link.param_grads`.
     """
     z = (y - mu) / sigma
     d_mu = 1.0 - 2.0 * _Phi(z)

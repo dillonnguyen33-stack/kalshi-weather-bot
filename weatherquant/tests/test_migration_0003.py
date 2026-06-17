@@ -21,7 +21,7 @@ f-string-interpolated into SQL (T-03-05 / ASVS V5).
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
 import pytest
 import sqlalchemy as sa

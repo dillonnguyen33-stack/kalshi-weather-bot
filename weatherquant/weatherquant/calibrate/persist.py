@@ -85,7 +85,13 @@ def store_calibration_params(
         n_train: number of training samples used for the fit.
         pool_level: pooling-ladder provenance (``"month"`` / ``"shrunk:<rung>"`` / ``"parent:<rung>"``).
         crps_train, crps_oos, crps_baseline_oos: audit metrics (in-sample / OOS calibrated /
-            OOS raw-ensemble baseline, D-11).
+            OOS raw-ensemble baseline, D-11). NOTE (WR-05): ``crps_train`` is the in-sample CRPS
+            of the params on THIS row (the persisted, possibly season-pooled fit), but
+            ``crps_oos``/``crps_baseline_oos`` are produced by ``evaluate_stratum_oos_aggregated``,
+            which re-fits UNPOOLED on the OOS train slice. So the held-out pair describes a
+            different fit than ``crps_train`` — a "does EMOS-on-this-stratum generalize?"
+            diagnostic, NOT the persisted pooled fit's OOS score. Treat the train↔OOS gap on a
+            persisted row accordingly; a true pooled-fit OOS score lands with the Phase-6 harness.
         trained_through: the DATA cutoff — the last train ``target_date`` (D-13).
         available_at: the training-run completion instant (point-in-time of knowledge, D-13);
             supplied by the caller, NEVER ``now()``-ed inside this function.
