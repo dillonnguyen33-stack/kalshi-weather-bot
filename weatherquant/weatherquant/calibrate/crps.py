@@ -32,6 +32,7 @@ stratum's residuals are scored in one vectorized pass.
 from __future__ import annotations
 
 import math
+from typing import cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -53,12 +54,12 @@ _erf = np.vectorize(math.erf)
 
 def _Phi(x: NDArray[np.float64]) -> NDArray[np.float64]:
     """Standard-normal CDF via stdlib ``math.erf`` (D-04): ``0.5*(1 + erf(x/sqrt(2)))``."""
-    return 0.5 * (1.0 + _erf(x * _INV_SQRT_2))
+    return cast(NDArray[np.float64], 0.5 * (1.0 + _erf(x * _INV_SQRT_2)))
 
 
 def _phi(x: NDArray[np.float64]) -> NDArray[np.float64]:
     """Standard-normal pdf: ``exp(-x^2/2) / sqrt(2*pi)``."""
-    return np.exp(-0.5 * x * x) * _INV_SQRT_2PI
+    return cast(NDArray[np.float64], np.exp(-0.5 * x * x) * _INV_SQRT_2PI)
 
 
 def crps_norm(
@@ -72,7 +73,10 @@ def crps_norm(
     :func:`weatherquant.calibrate.link.predict` guarantees this upstream).
     """
     z = (y - mu) / sigma
-    return sigma * (z * (2.0 * _Phi(z) - 1.0) + 2.0 * _phi(z) - _INV_SQRT_PI)
+    return cast(
+        NDArray[np.float64],
+        sigma * (z * (2.0 * _Phi(z) - 1.0) + 2.0 * _phi(z) - _INV_SQRT_PI),
+    )
 
 
 def crps_norm_grad(
