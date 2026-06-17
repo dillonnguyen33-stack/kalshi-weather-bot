@@ -560,9 +560,13 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
         prob = pricing.bucket_prob(
             mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi
         )
+        # EV and the sized stake MUST share one decision basis (WR-01). bucket_ev shrinks the
+        # model prob toward the market mid internally (D-08, p_used); size Kelly on that SAME
+        # shrunk belief so the printed edge and the stake agree in sign near the boundary.
+        pu = pricing.p_used(prob, market_mid)
         ev = pricing.bucket_ev(prob, market_mid, market_mid)
         stake = pricing.stake_fraction(
-            prob, market_mid, pricing.exact_fee(1, market_mid),
+            pu, market_mid, pricing.exact_fee(1, market_mid),
             sigma_blend, n_train, pool_level, afd_flag, cap=cap,
         )
         bucket = {
