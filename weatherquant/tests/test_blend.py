@@ -63,7 +63,6 @@ def test_blend_pit_not_u_shaped(synthetic_gaussians):
     assert freq[4] + freq[5] > freq[0] + freq[9] - 0.05
 
 
-@pytest.mark.xfail(reason="Wave 1 (04-02) implements accuracy_weights", strict=False)
 def test_blend_weight_renorm_and_null_crps_fallback():
     # Dropped-model renormalization: surviving weights still sum to 1 (D-03).
     w = accuracy_weights(np.array([0.5, 1.0, 2.0]))
