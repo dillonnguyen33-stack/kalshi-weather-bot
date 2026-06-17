@@ -19,6 +19,13 @@ from sqlalchemy import Engine, create_engine
 # The one required SQLAlchemy dialect — psycopg v3, never the legacy psycopg2 (D-09).
 _REQUIRED_SCHEME = "postgresql+psycopg"
 
+# The locked single-position cap band (PROJECT.md risk constraint / D-13): the configured
+# max_position_fraction MUST land in [2%, 5%] of bankroll. The field validator rejects any
+# value outside this inclusive band at construction so the hard cap can never be configured
+# looser than policy (threat T-04-02).
+_MIN_POSITION_FRACTION = 0.02
+_MAX_POSITION_FRACTION = 0.05
+
 
 def require_psycopg3_scheme(url: str) -> None:
     """Raise ``ValueError`` unless ``url``'s dialect is exactly ``postgresql+psycopg``.
@@ -59,6 +66,12 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     wethr_api_key: str | None = None
 
+    # Phase-4 money-path config (D-13). NOT secrets — these are policy numbers that may
+    # appear in a normal repr; they are deliberately NOT added to the redacted ``__repr__``
+    # below (that fixed string only hides credentials, ASVS V14).
+    bankroll_usd: float = 500.0  # PROJECT.md constraint: the $500 paper-trading bankroll.
+    max_position_fraction: float = 0.025  # D-13: conservative end of locked [0.02, 0.05].
+
     @field_validator("database_url")
     @classmethod
     def _validate_psycopg3_scheme(cls, value: str) -> str:
@@ -69,6 +82,24 @@ class Settings(BaseSettings):
         / D-09). A bare ``postgresql://`` or ``postgresql+psycopg2://`` URL is rejected.
         """
         require_psycopg3_scheme(value)
+        return value
+
+    @field_validator("max_position_fraction")
+    @classmethod
+    def _validate_position_cap_band(cls, value: float) -> float:
+        """Reject any single-position cap outside the locked ``[0.02, 0.05]`` band (D-13).
+
+        Mirrors :meth:`_validate_psycopg3_scheme`'s fail-loud-at-construction shape. The cap
+        is the hard money-path invariant (PROJECT.md risk constraint): an out-of-range value
+        that silently raised position size is a money-path risk (threat T-04-02), so the cap
+        can never be configured looser than policy. ``0.02`` and ``0.05`` are accepted.
+        """
+        if not (_MIN_POSITION_FRACTION <= value <= _MAX_POSITION_FRACTION):
+            raise ValueError(
+                f"max_position_fraction must be within the locked "
+                f"[{_MIN_POSITION_FRACTION}, {_MAX_POSITION_FRACTION}] band (D-13). "
+                f"Got: {value}"
+            )
         return value
 
     def __repr__(self) -> str:  # never leak credential-bearing fields (ASVS V14)
