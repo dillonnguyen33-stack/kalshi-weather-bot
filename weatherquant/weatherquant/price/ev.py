@@ -20,7 +20,19 @@ Pure NumPy + stdlib ``math`` only — no scipy/sklearn (the AST guard enforces i
 
 from __future__ import annotations
 
+import math
+
+from weatherquant.price.fee import FEE_COEFF, exact_fee
+
 __all__ = ["MARKET_SHRINK_ALPHA", "p_used", "bucket_ev"]
+
+
+def _require_prob(name: str, value: float) -> None:
+    """Fail loud on a probability/price outside ``[0, 1]`` or non-finite (ASVS V5, D-08)."""
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite, got {value!r}.")
+    if not (0.0 <= value <= 1.0):
+        raise ValueError(f"{name} must be in [0, 1], got {value!r}.")
 
 # Linear market-shrink weight toward the market midpoint (D-08, RESEARCH Operational
 # Defaults, α≈0.2 — LOW confidence, co-tuned with Kelly λ via Phase 6, never stacked blindly).
@@ -38,20 +50,30 @@ def p_used(
     ``alpha=1`` defers entirely to the market. ``tests/test_ev.py -k shrink`` asserts the
     result moves toward ``p_market_mid`` as ``alpha`` rises. Guards probabilities ∈ [0, 1].
     """
-    raise NotImplementedError("p_used is implemented in Wave 2 (04-05).")
+    _require_prob("p_model", p_model)
+    _require_prob("p_market_mid", p_market_mid)
+    if not math.isfinite(alpha):
+        raise ValueError(f"alpha must be finite, got {alpha!r}.")
+    return (1.0 - alpha) * p_model + alpha * p_market_mid
 
 
 def bucket_ev(
     p_model: float,
     p_market_mid: float,
     price: float,
+    *,
     alpha: float = MARKET_SHRINK_ALPHA,
+    coeff: float = FEE_COEFF,
 ) -> float:
     """Fee-corrected per-contract EV on the taker price (D-08 — Wave 2).
 
     ``EV = p_used·((1 − price) − fee) − (1 − p_used)·price`` with the exact taker fee
-    ``exact_fee(1, price)`` and ``p_used`` shrunk toward ``p_market_mid``. Matches v3's
+    ``exact_fee(1, price, coeff)`` (per-contract marginal, Open Question 3) and ``p_used``
+    shrunk toward the passed-in ``p_market_mid`` (D-16 — no market I/O here). Matches v3's
     ``t_ev`` intent (parity-tested) but with the exact integer-cent fee. Guards
-    ``price ∈ [0, 1]``, probabilities finite (ASVS V5).
+    ``price ∈ [0, 1]`` and the probabilities finite (ASVS V5).
     """
-    raise NotImplementedError("bucket_ev is implemented in Wave 2 (04-05).")
+    _require_prob("price", price)  # p_model / p_market_mid validated inside p_used
+    pu = p_used(p_model, p_market_mid, alpha)
+    fee = exact_fee(1, price, coeff)  # per-contract marginal taker fee (Open Question 3)
+    return pu * ((1.0 - price) - fee) - (1.0 - pu) * price
