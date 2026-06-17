@@ -249,3 +249,47 @@ def cli_fixture() -> dict:
     if not fixtures:
         pytest.skip("No CLI fixtures found under tests/fixtures/cli/")
     return fixtures
+
+
+@dataclass(frozen=True)
+class SyntheticGaussians:
+    """A set of known per-model Gaussians + their analytic Vincentization blend (Phase 4).
+
+    For Gaussians, quantile-averaging (Vincentization, D-01) has the exact closed form
+    ``N(μ_blend = Σwᵢμᵢ, σ_blend = Σwᵢσᵢ)`` — ``σ_blend`` is the weighted MEAN of the σ's,
+    NOT ``sqrt(Σwᵢσᵢ²)``. The fixture carries the component ``(mus, sigmas, weights)`` (with
+    ``weights`` already summing to 1) and the analytic ``(mu_blend, sigma_blend)`` so the
+    blend-recovery test asserts ``blend_gaussians`` reproduces them and the σ-monotonicity
+    test asserts ``sigma_blend <= max(sigmas)`` (true by construction).
+    """
+
+    mus: np.ndarray  # per-model predictive means (°F)
+    sigmas: np.ndarray  # per-model predictive std-devs (°F), all > 0
+    weights: np.ndarray  # accuracy weights over the models present (sum to 1)
+    mu_blend: float  # analytic Σwᵢμᵢ
+    sigma_blend: float  # analytic Σwᵢσᵢ (weighted MEAN of σ — Vincentization, NOT RMS)
+
+
+@pytest.fixture
+def synthetic_gaussians() -> SyntheticGaussians:
+    """Known per-model Gaussians + the analytic Vincentization blend (D-01 blend-recovery).
+
+    Seeded via ``np.random.default_rng`` (mirroring the ``_draw_stratum`` style): draw a few
+    positive σ's and means, attach random positive weights renormalized to sum to 1, and
+    precompute the closed-form blend ``(Σwᵢμᵢ, Σwᵢσᵢ)``. Consumed by ``test_blend.py`` for
+    blend-recovery and the σ-monotonicity invariant.
+    """
+    rng = np.random.default_rng(404)
+    mus = rng.normal(70.0, 8.0, 4)
+    sigmas = rng.uniform(1.0, 6.0, 4)
+    raw_w = rng.uniform(0.1, 1.0, 4)
+    weights = raw_w / raw_w.sum()
+    mu_blend = float(np.dot(weights, mus))
+    sigma_blend = float(np.dot(weights, sigmas))
+    return SyntheticGaussians(
+        mus=mus,
+        sigmas=sigmas,
+        weights=weights,
+        mu_blend=mu_blend,
+        sigma_blend=sigma_blend,
+    )
