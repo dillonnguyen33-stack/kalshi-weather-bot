@@ -173,13 +173,28 @@ calibration_params = sa.Table(
 # ``snapshot_for`` is the market time-bucket key. It is typed ``Text`` (a stable string
 # key, e.g. an ISO instant or market period label) rather than ``timestamptz`` so the
 # natural key stays a simple, comparable identifier; the point-in-time-of-knowledge axis
-# is ``available_at`` (D-12). Phase-5/6 may refine the encoding via a migration.
+# is ``available_at`` (D-12).
+#
+# Phase-5 (05-00, D-11) adds the Kalshi orderbook payload columns — all ``nullable=True`` so
+# the column-add is non-breaking. ``best_yes_bid``/``best_no_bid`` are the top-of-book bids in
+# integer cents (the only side Kalshi quotes — the ask side is reflected as ``100 - opposite
+# bid`` in market/reflect.py, PAP-02); ``mid`` is the derived midpoint (Float, the real market
+# midpoint fed into the Phase-4 EV/Kelly path, closing the D-08/D-16 loop); ``seq`` is the WS
+# orderbook_delta sequence number (BigInteger — a gap triggers a resnapshot, PAP-01); and
+# ``detail`` (JSONB) carries the raw book payload, mirroring ``observations.detail``. The
+# natural key (ticker, snapshot_for) is UNCHANGED so ix_market_snapshots_latest is intact.
+# Types mirror the 0004 migration EXACTLY so metadata.create_all == the migrated schema.
 market_snapshots = sa.Table(
     "market_snapshots",
     metadata,
     _id_column(),
     sa.Column("ticker", sa.Text, nullable=False),
     sa.Column("snapshot_for", sa.Text, nullable=False),
+    sa.Column("best_yes_bid", sa.Integer, nullable=True),
+    sa.Column("best_no_bid", sa.Integer, nullable=True),
+    sa.Column("mid", sa.Float, nullable=True),
+    sa.Column("seq", sa.BigInteger, nullable=True),
+    sa.Column("detail", postgresql.JSONB, nullable=True),
     _available_at_column(),
     sa.Index(
         "ix_market_snapshots_latest",
@@ -190,12 +205,32 @@ market_snapshots = sa.Table(
 )
 
 # --- fills: natural key = ticker, trade_id (order/leg identity) --------------------
+# Phase-5 (05-00, D-11) adds the simulated-fill payload columns — all ``nullable=True``. The
+# execution payload: ``side`` (Text, yes/no), ``price`` (Integer cents), ``count`` (Integer
+# contracts), ``fee`` (Integer cents — the exact_fee per order), ``is_maker`` (Boolean —
+# maker queue vs taker sweep, PAP-02/PAP-03), and ``event_time`` (timestamptz — the REAL WS
+# event time the fill occurred at, never now()/back-dated, D-08, PAP-03). The intent linkage
+# back to the Phase-4 money path: ``bucket_prob``/``ev``/``kelly_stake`` (Float) record the
+# model probability, expected value, and Kelly stake that motivated the order, so each fill is
+# auditable against the forecast that produced it. ``detail`` (JSONB) carries the raw trade
+# payload, mirroring ``observations.detail``. The natural key (ticker, trade_id) is UNCHANGED
+# so ix_fills_latest is intact. Types mirror 0004 EXACTLY (metadata.create_all == migrated).
 fills = sa.Table(
     "fills",
     metadata,
     _id_column(),
     sa.Column("ticker", sa.Text, nullable=False),
     sa.Column("trade_id", sa.Text, nullable=False),
+    sa.Column("side", sa.Text, nullable=True),
+    sa.Column("price", sa.Integer, nullable=True),
+    sa.Column("count", sa.Integer, nullable=True),
+    sa.Column("fee", sa.Integer, nullable=True),
+    sa.Column("is_maker", sa.Boolean, nullable=True),
+    sa.Column("event_time", sa.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("bucket_prob", sa.Float, nullable=True),
+    sa.Column("ev", sa.Float, nullable=True),
+    sa.Column("kelly_stake", sa.Float, nullable=True),
+    sa.Column("detail", postgresql.JSONB, nullable=True),
     _available_at_column(),
     sa.Index(
         "ix_fills_latest",

@@ -32,6 +32,16 @@ _MAX_POSITION_FRACTION = 0.05
 # never drift apart (WR-A1). Any configured override still passes the band validator above.
 DEFAULT_POSITION_FRACTION = 0.025
 
+# The locked set of allowed execution modes (D-15). ``execution_mode`` gates whether any
+# (future, Gate-2) live order path is reachable; defaulting to ``paper`` and rejecting any
+# out-of-policy value at construction means a typo or an injected value can never silently
+# unlock a live path (threat T-05-02). The structural no-order-path guard lands in 05-03.
+_ALLOWED_EXECUTION_MODES = frozenset({"paper", "live"})
+
+# The default execution mode (D-15): paper-trading only this milestone (Gate 1). The
+# operator never sets ``live`` until the Gate-1 statistical proof passes (Gate 2).
+DEFAULT_EXECUTION_MODE = "paper"
+
 
 def require_psycopg3_scheme(url: str) -> None:
     """Raise ``ValueError`` unless ``url``'s dialect is exactly ``postgresql+psycopg``.
@@ -78,6 +88,19 @@ class Settings(BaseSettings):
     bankroll_usd: float = 500.0  # PROJECT.md constraint: the $500 paper-trading bankroll.
     max_position_fraction: float = DEFAULT_POSITION_FRACTION  # D-13: see DEFAULT_POSITION_FRACTION.
 
+    # Phase-5 Kalshi credentials (D-14). Both are SECRETS and nullable so the suite/config
+    # construct cleanly without a live key (the operator supplies them out-of-band before the
+    # live checkpoints in 05-02 / 05-05). ``kalshi_private_key_path`` is a filesystem PATH to
+    # the RSA private key OUTSIDE the repo — never the key material in ``.env``/repo (the loss
+    # is irrecoverable, the leak is account-level). Both are added to the redacted ``__repr__``
+    # below so neither can ever leak in a log line (ASVS V14, threat T-05-01).
+    kalshi_key_id: str | None = None
+    kalshi_private_key_path: str | None = None
+    # D-15: execution policy. NOT a secret (kept out of the redacted repr, like bankroll_usd)
+    # but validated to the locked {paper, live} set below so it can never silently unlock a
+    # live order path. Defaults to paper this milestone (Gate 1).
+    execution_mode: str = DEFAULT_EXECUTION_MODE
+
     @field_validator("database_url")
     @classmethod
     def _validate_psycopg3_scheme(cls, value: str) -> str:
@@ -108,12 +131,33 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("execution_mode")
+    @classmethod
+    def _validate_execution_mode(cls, value: str) -> str:
+        """Reject any ``execution_mode`` not in the locked ``{paper, live}`` set (D-15).
+
+        Mirrors :meth:`_validate_position_cap_band`'s fail-loud-at-construction shape. The
+        mode gates whether any (future, Gate-2) live order path is reachable, so an out-of-
+        policy value (a typo like ``"live2"`` or an injected string) must never construct —
+        it could silently unlock a live path (threat T-05-02). ``"paper"``/``"live"`` pass;
+        the default is ``"paper"`` (this milestone never sets ``live``).
+        """
+        if value not in _ALLOWED_EXECUTION_MODES:
+            allowed = ", ".join(sorted(_ALLOWED_EXECUTION_MODES))
+            raise ValueError(
+                f"execution_mode must be one of {{{allowed}}} (D-15). Got: {value!r}"
+            )
+        return value
+
     def __repr__(self) -> str:  # never leak credential-bearing fields (ASVS V14)
         # Fixed string: no field VALUE is ever interpolated, so neither the URL nor the
-        # API keys can leak through an accidental log/repr (threat T-02-01).
+        # API keys / Kalshi credentials can leak through an accidental log/repr (threats
+        # T-02-01, T-05-01). execution_mode is policy (not a secret) so it stays OUT, like
+        # bankroll_usd / max_position_fraction.
         return (
             "Settings(database_url=<redacted>, anthropic_api_key=<redacted>, "
-            "wethr_api_key=<redacted>)"
+            "wethr_api_key=<redacted>, kalshi_key_id=<redacted>, "
+            "kalshi_private_key_path=<redacted>)"
         )
 
     __str__ = __repr__
