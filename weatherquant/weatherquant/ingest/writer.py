@@ -27,7 +27,7 @@ from datetime import date, datetime
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
 
-from weatherquant.db.models import forecasts, observations
+from weatherquant.db.models import fills, forecasts, market_snapshots, observations
 from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.ingest.idempotency import row_exists
 
@@ -168,4 +168,106 @@ def insert_observation(
     return _insert_row(bind, observations, natural_key, content, available_at)
 
 
-__all__ = ["insert_forecast", "insert_observation", "WriteIntegrityError"]
+def insert_market_snapshot(
+    bind: Engine | Connection,
+    *,
+    ticker: str,
+    snapshot_for: str,
+    best_yes_bid: int | None = None,
+    best_no_bid: int | None = None,
+    mid: float | None = None,
+    seq: int | None = None,
+    detail: Mapping[str, object] | None = None,
+    available_at: datetime,
+) -> int:
+    """Insert one market-snapshot row through the SAME audited path (D-10/D-11/D-13).
+
+    Natural key: ``(ticker, snapshot_for)`` — ``snapshot_for`` is the stable market
+    time-bucket key (a string, e.g. an ISO instant; see ``db/models.py``). Content: the
+    load-bearing top-of-book fields (``best_yes_bid``/``best_no_bid`` in integer cents, the
+    only side Kalshi quotes — the ask is reflected as ``100 - opposite bid`` in
+    ``market/reflect.py``), the derived ``mid`` (the real market midpoint fed into the
+    Phase-4 EV/Kelly path), the WS ``seq``, and the raw book payload ``detail`` (JSONB,
+    mirroring ``observations.detail``). Re-inserting an identical snapshot is a no-op
+    (returns 0); a changed payload appends a fresh row (returns 1). NO UPDATE/upsert — the
+    append-only trigger would raise; a correction is a later-``available_at`` INSERT.
+
+    ``available_at`` is ALWAYS a caller param — the REAL WS event time the snapshot was
+    observed at (D-08), NEVER ``now()`` inside the writer.
+
+    Returns:
+        ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
+    """
+    natural_key = {
+        "ticker": ticker,
+        "snapshot_for": snapshot_for,
+    }
+    content = {
+        "best_yes_bid": best_yes_bid,
+        "best_no_bid": best_no_bid,
+        "mid": mid,
+        "seq": seq,
+        "detail": detail,
+    }
+    return _insert_row(bind, market_snapshots, natural_key, content, available_at)
+
+
+def insert_fill(
+    bind: Engine | Connection,
+    *,
+    ticker: str,
+    trade_id: str,
+    side: str | None = None,
+    price: int | None = None,
+    count: int | None = None,
+    fee: int | None = None,
+    is_maker: bool | None = None,
+    event_time: datetime | None = None,
+    bucket_prob: float | None = None,
+    ev: float | None = None,
+    kelly_stake: float | None = None,
+    detail: Mapping[str, object] | None = None,
+    available_at: datetime,
+) -> int:
+    """Insert one simulated-fill row through the SAME audited path (D-10/D-11/D-13).
+
+    Natural key: ``(ticker, trade_id)``. Content: the execution payload (``side`` yes/no,
+    ``price`` integer cents, ``count`` contracts, ``fee`` integer cents, ``is_maker`` maker
+    vs taker, ``event_time`` the REAL WS event time the fill occurred at), the intent
+    linkage back to the Phase-4 money path (``bucket_prob``/``ev``/``kelly_stake``), and the
+    raw trade payload ``detail`` (JSONB). Re-inserting an identical fill is a no-op
+    (returns 0); a changed payload appends a fresh row (returns 1). NO UPDATE/upsert.
+
+    ``available_at`` is ALWAYS a caller param (the real WS event time, D-08), NEVER ``now()``
+    inside the writer. ``event_time`` is the fill's own observed instant carried in the
+    content payload (also never back-dated by the writer).
+
+    Returns:
+        ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
+    """
+    natural_key = {
+        "ticker": ticker,
+        "trade_id": trade_id,
+    }
+    content = {
+        "side": side,
+        "price": price,
+        "count": count,
+        "fee": fee,
+        "is_maker": is_maker,
+        "event_time": event_time,
+        "bucket_prob": bucket_prob,
+        "ev": ev,
+        "kelly_stake": kelly_stake,
+        "detail": detail,
+    }
+    return _insert_row(bind, fills, natural_key, content, available_at)
+
+
+__all__ = [
+    "insert_forecast",
+    "insert_observation",
+    "insert_market_snapshot",
+    "insert_fill",
+    "WriteIntegrityError",
+]

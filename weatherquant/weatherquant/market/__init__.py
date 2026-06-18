@@ -19,6 +19,9 @@ Public surface (grows over 05-02..05-04):
 * ``client`` — :func:`run_feed`, :func:`fetch_snapshot`: the signed WS connect + auto-
   reconnect loop (re-subscribe AND REST re-snapshot on every reconnection) and the signed
   REST orderbook snapshot resync anchor (PAP-01).
+* ``persist`` — :func:`persist_snapshot`, :func:`persist_fill`, :func:`latest_snapshots`:
+  the THIN snapshot/fill write+read adapter over the one audited append-only writer path and
+  ``queries.latest`` (no Core insert here — D-13, threat T-05-15).
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ from __future__ import annotations
 from weatherquant.market.auth import KalshiSigner, load_key, sign
 from weatherquant.market.book import OrderBook, SeqGap, apply
 from weatherquant.market.client import fetch_snapshot, run_feed
+from weatherquant.market.persist import latest_snapshots, persist_fill, persist_snapshot
 from weatherquant.market.reflect import no_ask_levels, yes_ask_levels
 
 __all__ = [
@@ -39,4 +43,7 @@ __all__ = [
     "apply",
     "run_feed",
     "fetch_snapshot",
+    "persist_snapshot",
+    "persist_fill",
+    "latest_snapshots",
 ]
