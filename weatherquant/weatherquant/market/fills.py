@@ -37,6 +37,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Literal, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,4 +138,153 @@ def taker_sweep(
     )
 
 
-__all__ = ["Fill", "taker_sweep"]
+# A book-change event kind on our resting level. ``trade`` is a genuine trade-through that
+# consumes size (and, when it crosses our level, fills us); ``cancel`` is size removed WITHOUT
+# a crossing trade — pessimistically it does NOT advance our queue position (D-06, Pitfall 3).
+BookEventKind = Literal["trade", "cancel"]
+
+
+@dataclass(frozen=True, slots=True)
+class BookEvent:
+    """One change observed at our maker level, carrying its real WS event time.
+
+    Attributes:
+        kind: ``"trade"`` (a genuine trade-through) or ``"cancel"`` (size removed without a
+            crossing trade). Only a trade can consume size-ahead AND fill us; a cancel never
+            advances the queue (the pessimistic D-06 default for the undocumented A3 mapping).
+        size: the contract size of the change (``>= 0``).
+        crosses_our_level: ``True`` when a trade prints at/through our resting price (a taker
+            crossed our level). Required, in addition to consuming size-ahead, before any of
+            our size fills. Cancels never cross.
+        event_time: the real WS event time of this change (D-08), stamped onto any fill.
+    """
+
+    kind: BookEventKind
+    size: int
+    crosses_our_level: bool
+    event_time: datetime
+
+
+def maker_queue_fill(
+    size_ahead: int,
+    our_size: int,
+    events: Sequence[BookEvent],
+) -> Fill | None:
+    """Conservative maker queue fill: cancels-ahead never advance us (D-06, Pitfall 3).
+
+    We join BEHIND ``size_ahead`` contracts resting at our level at submit time. Walking the
+    ``events`` stream of changes at our level:
+
+    * a ``cancel`` removes size-ahead from the book but does NOT advance our queue position —
+      counting it as progress over-credits maker fills in thin books (the pessimistic default
+      for the undocumented trade-vs-cancel mapping, A3);
+    * a ``trade`` consumes size-ahead first; only once size-ahead is exhausted AND the trade
+      ``crosses_our_level`` (a taker crossed our resting price) does the crossing remainder
+      fill OUR size, up to ``our_size``.
+
+    A market with NO trades (only cancels, or nothing) credits ZERO maker fills → ``None``
+    (never the over-credit failure). The produced :class:`Fill` is ``is_maker=True`` and is
+    stamped with the WS event time of the crossing trade that filled us (D-08).
+
+    Args:
+        size_ahead: contracts resting ahead of us at submit time (``>= 0``).
+        our_size: our resting order size (``> 0``).
+        events: the ordered stream of changes at our level (trades and cancels).
+
+    Returns:
+        A maker :class:`Fill` for the crossed size (partial allowed), or ``None`` if no
+        crossing trade ever reached us.
+
+    Raises:
+        ValueError: if ``our_size`` is not positive or ``size_ahead`` is negative.
+    """
+    if our_size <= 0:
+        raise ValueError(f"our_size must be positive; got {our_size}")
+    if size_ahead < 0:
+        raise ValueError(f"size_ahead must be non-negative; got {size_ahead}")
+
+    remaining_ahead = size_ahead
+    our_filled = 0
+    fill_event_time: datetime | None = None
+
+    for event in events:
+        if event.size < 0:
+            raise ValueError(f"event size must be non-negative; got {event.size}")
+        if event.kind == "cancel":
+            # Pessimistic D-06: a cancel removes size from the book but does NOT advance our
+            # queue position. We deliberately do NOT decrement remaining_ahead here — counting
+            # cancels as progress is the Pitfall-3 over-credit.
+            continue
+        # A trade consumes size-ahead first.
+        consumed_ahead = min(remaining_ahead, event.size)
+        remaining_ahead -= consumed_ahead
+        crossing_size = event.size - consumed_ahead
+        # We fill ONLY when size-ahead is exhausted AND a taker crossed our level.
+        if crossing_size > 0 and event.crosses_our_level:
+            take = min(crossing_size, our_size - our_filled)
+            if take > 0:
+                our_filled += take
+                fill_event_time = event.event_time
+            if our_filled == our_size:
+                break
+
+    if our_filled == 0 or fill_event_time is None:
+        # No crossing trade ever reached us — absence is absence (D-08), no maker fill row.
+        return None
+
+    return Fill(
+        count=our_filled,
+        # A maker rests AT its level, so every filled contract clears at our resting price;
+        # the caller supplies that price out of band (the queue model proves the COUNT, the
+        # conservative shadow accounting — taker is the credited Gate-1 path, D-05).
+        avg_price_cents=0.0,
+        partial=our_filled < our_size,
+        shortfall=our_size - our_filled,
+        is_maker=True,
+        event_time=fill_event_time,
+    )
+
+
+@runtime_checkable
+class _ExecutionModeSettings(Protocol):
+    """Structural type for any object carrying a validated ``execution_mode`` (D-15)."""
+
+    execution_mode: str
+
+
+def assert_paper_mode(settings: _ExecutionModeSettings) -> None:
+    """Structural EXECUTION_MODE no-live-orders guard (D-15) — fail loud outside ``live``.
+
+    This is the fence that guards any (future, Gate-2) order-submission path: it is a no-op
+    only when ``execution_mode == 'live'`` and RAISES loudly for anything else (``paper`` this
+    milestone). Combined with the structural fact that NO REST order-submission code exists
+    anywhere under ``market/`` this phase (asserted by ``tests/test_no_live_orders.py``), an
+    accidental live order in paper mode is structurally unreachable (threat T-05-14).
+
+    The guard is intentionally fail-CLOSED: it raises for ``paper`` (and any non-``live``
+    value) so that wiring an order path without first flipping to validated ``live`` mode is a
+    loud error, never a silent live submission. ``execution_mode`` itself is validated to the
+    locked ``{paper, live}`` set at Settings construction (``db/engine.py``).
+
+    Args:
+        settings: any object exposing a validated ``execution_mode`` string.
+
+    Raises:
+        RuntimeError: if ``execution_mode != 'live'`` — i.e. an order path was reached while
+            not in validated live mode.
+    """
+    if settings.execution_mode != "live":
+        raise RuntimeError(
+            "refusing to enter an order-submission path with execution_mode="
+            f"{settings.execution_mode!r}: live orders are unreachable until validated "
+            "'live' mode (D-15, Gate 2). No order path exists this milestone."
+        )
+
+
+__all__ = [
+    "Fill",
+    "BookEvent",
+    "taker_sweep",
+    "maker_queue_fill",
+    "assert_paper_mode",
+]
