@@ -293,3 +293,99 @@ def synthetic_gaussians() -> SyntheticGaussians:
         mu_blend=mu_blend,
         sigma_blend=sigma_blend,
     )
+
+
+# --- Phase-5 paper-fill-simulator synthetic fixtures (05-00 Wave-0 scaffold) --------
+# Plain-dict orderbook/stream fixtures mirroring the Kalshi ``orderbook_snapshot`` /
+# ``orderbook_delta`` WS message shape (RESEARCH Pattern 2): ``type`` / ``seq`` / per-side
+# ``yes`` / ``no`` bid level lists of ``[price_cents, size]``, and deltas carry a single
+# ``side`` / ``price`` / ``delta`` change. Prices are integer CENTS (Kalshi quotes the BID
+# side of each outcome; the ask is reflected as ``100 - opposite bid`` in market/reflect.py).
+# These are import-light (no websockets/cryptography import here) so the no-leak boundary is
+# never crossed by the test fixtures themselves. Later waves (05-02 book, 05-03 fills) flip
+# their RED stubs GREEN against these fixed contracts.
+
+
+@pytest.fixture
+def orderbook_snapshot() -> dict:
+    """A Kalshi-shaped ``orderbook_snapshot`` message with known top-of-book.
+
+    Bid levels are ``[price_cents, size]`` sorted best-first. The best yes bid is 47¢ (size
+    120) and the best no bid is 49¢ (size 80) — so the reflected yes-ask is ``100 - 49 =
+    51¢`` and the implied mid is ``(47 + 51) / 2 = 49¢`` (a 4¢ spread). ``seq`` anchors the
+    delta stream below.
+    """
+    return {
+        "type": "orderbook_snapshot",
+        "seq": 100,
+        "ticker": "KXHIGHNY-26JUN18-T72",
+        "yes": [[47, 120], [46, 200], [45, 350]],
+        "no": [[49, 80], [48, 150], [47, 260]],
+    }
+
+
+@pytest.fixture
+def orderbook_delta_stream() -> list[dict]:
+    """A CONTIGUOUS ``orderbook_delta`` stream (seq 101, 102, 103) over the snapshot.
+
+    Each delta is a single-level change: ``delta`` is the signed size change at
+    ``(side, price)``. Applied in order onto :func:`orderbook_snapshot` they keep the book
+    consistent (no gap), so the book module must accept them without resnapshotting.
+    """
+    return [
+        {"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20},
+        {"type": "orderbook_delta", "seq": 102, "side": "no", "price": 50, "delta": 60},
+        {"type": "orderbook_delta", "seq": 103, "side": "yes", "price": 48, "delta": 40},
+    ]
+
+
+@pytest.fixture
+def orderbook_delta_stream_with_gap() -> list[dict]:
+    """A delta stream with an INJECTED seq gap (101 then 104 — 102/103 missing).
+
+    The book module must detect the discontinuity (next seq != last seq + 1) and raise the
+    ``SeqGap`` correctness error (05-02) rather than silently applying the out-of-order delta
+    — a gap means the local book is unknown and must be resnapshotted (PAP-01, D-02).
+    """
+    return [
+        {"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20},
+        {"type": "orderbook_delta", "seq": 104, "side": "no", "price": 49, "delta": -30},
+    ]
+
+
+@pytest.fixture
+def scripted_book() -> dict:
+    """A scripted resting book with KNOWN size-ahead for queue/partial-fill credit.
+
+    ``yes`` / ``no`` are bid level lists ``[price_cents, size]`` best-first. ``size_ahead``
+    records, per (side, price), the resting size sitting AHEAD of a hypothetical maker order
+    joining that level — the maker queue must not advance on cancels-ahead, only on
+    trade-through (05-02/05-03, PAP-02). A taker sweep against the yes bids walks 50¢×100 then
+    49¢×60: a 130-contract taker sell fills 100@50 + 30@49, a size-weighted avg of
+    ``(100*50 + 30*49) / 130 = 49.77¢``; a 200-contract order partial-fills the 160 available
+    (PAP-03).
+    """
+    return {
+        "ticker": "KXHIGHNY-26JUN18-T72",
+        "yes": [[50, 100], [49, 60]],
+        "no": [[48, 90], [47, 140]],
+        "size_ahead": {("yes", 50): 100, ("yes", 49): 60, ("no", 48): 90},
+    }
+
+
+@pytest.fixture
+def closing_window_snapshots() -> list[dict]:
+    """A golden closing-window snapshot series with a KNOWN volume-weighted mid (PAP-04).
+
+    Each row is ``market_snapshots``-shaped: ``mid`` (cents) + ``volume`` over the closing
+    window. The volume-weighted closing mid is
+    ``(50*100 + 52*300 + 51*100) / (100+300+100) = (5000+15600+5100)/500 = 51.4¢``.
+    A fill at 48¢ (better than the 51.4¢ closing mid, for a yes BUY) yields POSITIVE CLV;
+    a fill at 55¢ yields NEGATIVE CLV. The window itself is anchored on
+    ``time.settlement_window(...).end_utc`` (the half-open EXCLUSIVE end), never re-derived.
+    """
+    return [
+        {"snapshot_for": "2026-06-18T19:55Z", "mid": 50.0, "volume": 100},
+        {"snapshot_for": "2026-06-18T19:57Z", "mid": 52.0, "volume": 300},
+        {"snapshot_for": "2026-06-18T19:59Z", "mid": 51.0, "volume": 100},
+    ]
