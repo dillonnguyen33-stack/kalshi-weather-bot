@@ -20,14 +20,26 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from collections.abc import Mapping
 from datetime import date, datetime, timezone
 from typing import Any
 
 from weatherquant.db.engine import get_engine, get_settings
 from weatherquant.ingest import orchestrator
+from weatherquant.market import clv
+from weatherquant.market.auth import KalshiSigner
+from weatherquant.market.client import fetch_snapshot
+from weatherquant.market.persist import persist_fill, persist_snapshot
 from weatherquant.registry import CITIES, get_city
 
 logger = logging.getLogger(__name__)
+
+# Paper snapshot persist cadence (D-03/D-04). The run_paper loop persists a market_snapshot at
+# most this often (debounced) plus on any material book move. It MUST stay strictly finer than
+# the CLV closing window (clv.CLV_WINDOW_MINUTES) so that when a book change falls inside the
+# closing window the window holds >= 1 persisted snapshot — keeping Phase-6 CLV DERIVABLE, not
+# silently sparse (PAP-04 cadence sufficiency, threat T-05-20). Asserted at run_paper start.
+PAPER_SNAPSHOT_CADENCE_SECONDS = 60
 
 # The model/source labels the CLI can ingest — the GRIB models plus the supplementary
 # sources, single-sourced from the orchestrator so the CLI never drifts from the one path.
@@ -220,6 +232,48 @@ def build_parser() -> argparse.ArgumentParser:
         help="MOCKED market midpoint price in [0,1] (D-16 — no live market fetch; Phase 5 "
         "supplies the real (best_bid+best_ask)/2). Default 0.5.",
     )
+
+    # --- paper: the Phase-5 loop closer — REAL live-book midpoint into the money path --------
+    # Mirrors `price` (same _city_type ASVS-V5 validation, --date/--lead/--ticker) but the KEY
+    # change is that run_paper supplies the REAL reflection-derived live-book midpoint (vs
+    # run_price's mocked --market-mid) and feeds it into price.p_used/bucket_ev/stake_fraction
+    # — closing the Phase-4 D-08/D-16 loop. It places NO real order (paper only,
+    # assert_paper_mode) and persists the snapshot + (possibly partial) fill via the audited
+    # market.persist path, stamped with the real WS event time.
+    paper = sub.add_parser(
+        "paper",
+        help="Paper-trade a (city, date): feed the REAL live-book midpoint into the "
+        "blend/EV/Kelly money path and simulate a fill (no real order).",
+    )
+    paper.add_argument(
+        "--city",
+        type=_city_type,
+        required=True,
+        help=f"A single Kalshi city code (one of: {', '.join(sorted(CITIES))}).",
+    )
+    paper.add_argument(
+        "--date",
+        type=_parse_date,
+        required=True,
+        help="The LST settlement date to paper-trade (YYYY-MM-DD).",
+    )
+    paper.add_argument(
+        "--lead",
+        type=int,
+        default=0,
+        help="Forecast lead hours to price (default 0).",
+    )
+    paper.add_argument(
+        "--ticker",
+        type=str,
+        required=True,
+        help="The KXHIGH range ticker to paper-trade (e.g. KXHIGHNY-62-63).",
+    )
+    paper.add_argument(
+        "--demo",
+        action="store_true",
+        help="Use the fixed Kalshi DEMO hosts for the orderbook snapshot (SSRF-safe const).",
+    )
     return parser
 
 
@@ -402,6 +456,115 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
     return persisted
 
 
+def _blend_distribution(
+    bind: Any, city: str, target: date, lead: int
+) -> dict[str, Any]:
+    """Shared latest→predict→blend→sufficiency body (reused by run_price AND run_paper).
+
+    Reads the latest calibration params + forecast members for ``(city, target, lead)``,
+    aggregates members to ``(mean_f, var_f)`` at the ONE K→°F seam, reconstructs ``(μ_i, σ_i)``
+    via ``link.predict``, computes accuracy weights from ``crps_oos`` and Vincentizes to
+    ``(μ_blend, σ_blend)``, reads the AFD disagreement flag, and resolves the conservative
+    (smallest-sufficiency-ramp) representative ``n_train``/``pool_level`` (WR-05). Fails loud on
+    a NULL ``n_train`` (WR-02) and on no usable model. Pure money-path math stays in
+    ``weatherquant.price``; this is the shared DB-read edge.
+
+    Returns a dict with ``used_models``/``mu_blend``/``sigma_blend``/``afd_flag``/``n_train``/
+    ``pool_level``/``cap`` — everything the bucket/EV/Kelly leg needs, market-midpoint-agnostic.
+    """
+    import numpy as np
+
+    from weatherquant import price as pricing
+    from weatherquant.calibrate import link, strata
+    from weatherquant.db import queries
+
+    cap = get_settings().max_position_fraction
+    month = target.month
+    forecasts = queries.latest(
+        bind, "forecasts", where={"city": city, "target_date": target, "lead": lead}
+    )
+    cal_rows = queries.latest(
+        bind, "calibration_params", where={"city": city, "lead": lead, "month": month}
+    )
+    cal_by_model = {r["model"]: r for r in cal_rows}
+
+    members_by_model: dict[str, list[float]] = {}
+    for row in forecasts:
+        if row["temp_kelvin"] is None:
+            continue
+        members_by_model.setdefault(row["model"], []).append(
+            strata.kelvin_to_fahrenheit(float(row["temp_kelvin"]))
+        )
+
+    mus: list[float] = []
+    sigmas: list[float] = []
+    crps_oos: list[float] = []
+    used_models: list[str] = []
+    for model, vals in members_by_model.items():
+        cal = cal_by_model.get(model)
+        if cal is None or not vals:
+            continue
+        arr = np.asarray(vals, dtype=np.float64)
+        mean_f = float(arr.mean())
+        var_f = float(arr.var()) if arr.size > 1 else 0.0
+        params = (
+            cal["mean_intercept"],
+            cal["mean_slope"],
+            cal["var_intercept"],
+            cal["var_slope"],
+            cal["sigma_floor"],
+        )
+        if any(v is None for v in params):
+            continue
+        mu_i, sigma_i = link.predict(params, np.array([mean_f]), np.array([var_f]))
+        mus.append(float(mu_i[0]))
+        sigmas.append(float(sigma_i[0]))
+        crps_oos.append(
+            float(cal["crps_oos"]) if cal["crps_oos"] is not None else float("nan")
+        )
+        used_models.append(model)
+
+    if not used_models:
+        raise SystemExit(
+            f"no model has BOTH latest forecasts and calibration for "
+            f"city={city} date={target} lead={lead} month={month}."
+        )
+
+    weights = pricing.accuracy_weights(np.asarray(crps_oos, dtype=np.float64))
+    mu_blend, sigma_blend = pricing.blend_gaussians(
+        np.asarray(mus), np.asarray(sigmas), weights
+    )
+
+    afd_rows = queries.latest(
+        bind, "observations", where={"city": city, "target_date": target, "source": "afd"}
+    )
+    afd_flag = bool(afd_rows)
+
+    def _suff_for(model: str) -> tuple[float, str]:
+        cal = cal_by_model[model]
+        raw_n = cal["n_train"]
+        if raw_n is None:
+            raise SystemExit(
+                f"calibration row for model={model} has NULL n_train — "
+                f"cannot size (would silently zero the stake)."
+            )
+        pool = str(cal["pool_level"] or "")
+        return pricing.sufficiency_ramp(int(raw_n), pool), model
+
+    _, rep_model = min(_suff_for(m) for m in used_models)
+    rep_cal = cal_by_model[rep_model]
+
+    return {
+        "used_models": used_models,
+        "mu_blend": mu_blend,
+        "sigma_blend": sigma_blend,
+        "afd_flag": afd_flag,
+        "n_train": int(rep_cal["n_train"]),
+        "pool_level": str(rep_cal["pool_level"] or ""),
+        "cap": cap,
+    }
+
+
 def run_price(args: argparse.Namespace) -> dict[str, Any]:
     """Smoke-price one (city, date): latest→predict→blend→bucket/EV/Kelly (D-15/D-16).
 
@@ -426,11 +589,7 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     this function is the offline-untestable I/O edge only and returns a small result dict.
     """
     # Imported lazily so the ingest/calibrate paths (and `--help`) never pay these imports.
-    import numpy as np
-
     from weatherquant import price as pricing
-    from weatherquant.calibrate import link, strata
-    from weatherquant.db import queries
 
     city = args.city
     target = args.date
@@ -440,105 +599,16 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"price: --market-mid must be in [0, 1], got {market_mid}")
 
     bind = get_engine()
-    cap = get_settings().max_position_fraction  # position cap from typed config (D-13)
-
-    month = target.month
-    forecasts = queries.latest(
-        bind, "forecasts", where={"city": city, "target_date": target, "lead": lead}
-    )
-    cal_rows = queries.latest(
-        bind, "calibration_params", where={"city": city, "lead": lead, "month": month}
-    )
-    cal_by_model = {r["model"]: r for r in cal_rows}
-
-    # Aggregate forecast members per model to (mean_f, var_f) in °F at the K→°F seam (D-15).
-    members_by_model: dict[str, list[float]] = {}
-    for row in forecasts:
-        if row["temp_kelvin"] is None:
-            continue
-        members_by_model.setdefault(row["model"], []).append(
-            strata.kelvin_to_fahrenheit(float(row["temp_kelvin"]))
-        )
-
-    mus: list[float] = []
-    sigmas: list[float] = []
-    crps_oos: list[float] = []
-    used_models: list[str] = []
-    for model, vals in members_by_model.items():
-        cal = cal_by_model.get(model)
-        if cal is None or not vals:  # no calibration for this model → it drops out (D-03)
-            continue
-        arr = np.asarray(vals, dtype=np.float64)
-        mean_f = float(arr.mean())
-        # MUST match calibrate/strata.py:408 — both feed the var_f→σ link, so both use NumPy's
-        # population variance arr.var() (ddof=0). A ddof=1 here would bias σ relative to the
-        # variance the EMOS params were fit against (IN-A2). Deterministic model (1 member) → 0.
-        var_f = float(arr.var()) if arr.size > 1 else 0.0  # deterministic model → var 0
-        params = (
-            cal["mean_intercept"],
-            cal["mean_slope"],
-            cal["var_intercept"],
-            cal["var_slope"],
-            cal["sigma_floor"],
-        )
-        # EMOS params are schema-nullable (db/models.py); a NULL would reach link.predict and
-        # raise an opaque TypeError on the money path (WR-04). Drop the model instead, same as a
-        # missing cal row (D-03) — incomplete fit ⇒ model drops out of the blend.
-        if any(v is None for v in params):
-            continue
-        mu_i, sigma_i = link.predict(
-            params, np.array([mean_f]), np.array([var_f])
-        )
-        mus.append(float(mu_i[0]))
-        sigmas.append(float(sigma_i[0]))
-        crps_oos.append(
-            float(cal["crps_oos"]) if cal["crps_oos"] is not None else float("nan")
-        )
-        used_models.append(model)
-
-    if not used_models:
-        raise SystemExit(
-            f"price: no model has BOTH latest forecasts and calibration for "
-            f"city={city} date={target} lead={lead} month={month}."
-        )
-
-    weights = pricing.accuracy_weights(np.asarray(crps_oos, dtype=np.float64))
-    mu_blend, sigma_blend = pricing.blend_gaussians(
-        np.asarray(mus), np.asarray(sigmas), weights
-    )
-
-    # AFD disagreement flag from the latest observations source='afd' row (soft, D-12).
-    afd_rows = queries.latest(
-        bind, "observations", where={"city": city, "target_date": target, "source": "afd"}
-    )
-    afd_flag = bool(afd_rows)
-
-    # Resolve the calibration n_train/pool_level for sufficiency. The sufficiency ramp haircuts
-    # the WHOLE blend off one representative model, so pick it deterministically and
-    # conservatively (WR-05): the used model with the SMALLEST sufficiency ramp, ties broken by
-    # model name. argmax(weights) was non-deterministic under the equal-weight (all-NULL-CRPS)
-    # and floored-weight tie cases — it returned the first dict-insertion-order model, letting a
-    # thin/pooled component silently set or escape the haircut. Taking the minimum ramp ensures a
-    # thin/pooled component can never be hidden by iteration order.
-    # Fail loud on missing sufficiency provenance (WR-02): a NULL n_train would flow into
-    # sufficiency_ramp(0, ...) → shrink 0 → stake silently 0, indistinguishable from "no edge".
-    # The rest of price/ fails loud on bad input (bucket_prob/exact_fee); match that discipline.
-    def _suff_for(model: str) -> tuple[float, str]:
-        cal = cal_by_model[model]
-        raw_n = cal["n_train"]
-        if raw_n is None:
-            raise SystemExit(
-                f"price: calibration row for model={model} has NULL n_train — "
-                f"cannot size (would silently zero the stake)."
-            )
-        pool = str(cal["pool_level"] or "")
-        return pricing.sufficiency_ramp(int(raw_n), pool), model
-
-    # min over (ramp, model_name): smallest ramp wins; the model-name tiebreak is deterministic.
-    _, rep_model = min(_suff_for(m) for m in used_models)
-    rep_cal = cal_by_model[rep_model]
-    n_train = int(rep_cal["n_train"])
-    pool_level = str(rep_cal["pool_level"] or "")
+    # The shared latest→predict→blend→sufficiency body (reused by run_paper); the ONLY
+    # difference there is the REAL live-book midpoint replacing this MOCKED --market-mid (D-16).
+    blend = _blend_distribution(bind, city, target, lead)
+    used_models = blend["used_models"]
+    mu_blend = blend["mu_blend"]
+    sigma_blend = blend["sigma_blend"]
+    afd_flag = blend["afd_flag"]
+    n_train = blend["n_train"]
+    pool_level = blend["pool_level"]
+    cap = blend["cap"]
 
     logger.info(
         "price city=%s date=%s lead=%s models=%s mu_blend=%.2f sigma_blend=%.2f afd=%s",
@@ -590,6 +660,250 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+# The minimum Kelly stake fraction below which the EV+stake gate declines to place a paper
+# order (D-04). One sized position per (market, side) held to settlement — a sub-minimum stake
+# is "no edge worth the spread", not a churned micro-order.
+PAPER_MIN_STAKE_FRACTION = 1e-4
+
+
+def _reflection_midpoint(book: object) -> float:
+    """Derive the live-book midpoint in [0,1] from the REFLECTED best levels (the ONE seam).
+
+    Kalshi quotes only bids; the yes ask is reflected as ``100 - best_no_bid`` (cents) via
+    :func:`weatherquant.market.reflect.yes_ask_levels` (best/cheapest first). The midpoint is
+    ``(best_yes_bid + best_yes_ask) / 2`` cents, converted to ``[0,1]``. This is the value the
+    Phase-4 D-08/D-16 loop closes on — it MUST equal the reflection-derived mid, never a native
+    ask read (there is none) and never a fabricated value.
+
+    Fails loud (raise) when either side of the book is empty — no two-sided market → no
+    derivable midpoint (absence = absence, never a fabricated mid).
+    """
+    from weatherquant.market import reflect
+
+    # The yes BID side comes straight off the book; the yes ASK is reflected from the no bids
+    # via the ONE reflection seam (yes_ask = 100 - no_bid). Never read a native ask (there is
+    # none) and never re-derive the 100 - price reflection outside reflect.py.
+    yes_raw = book["yes"] if isinstance(book, Mapping) else getattr(book, "yes")
+    yes_bid_prices = [int(price) for price, _ in yes_raw]
+    yes_asks = reflect.yes_ask_levels(book)  # reflected from the no bids, cheapest first
+    if not yes_bid_prices or not yes_asks:
+        raise SystemExit(
+            "paper: book is one-sided (missing a yes bid or a reflected yes ask) — "
+            "cannot derive a two-sided midpoint (no fabricated mid)."
+        )
+    best_yes_bid = max(yes_bid_prices)
+    best_yes_ask = yes_asks[0][0]  # cheapest reflected yes ask = 100 - best_no_bid
+    mid_cents = (best_yes_bid + best_yes_ask) / 2.0
+    return mid_cents / 100.0
+
+
+def _snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
+    """Extract the snapshot's REAL WS event time, fail-loud (never now(), D-08).
+
+    The persisted ``available_at`` MUST be the real observed instant of the book, never the
+    wall clock (back-dating destroys Phase-6 no-look-ahead, D-08). Accepts an explicit
+    ``event_time`` datetime or a ``snapshot_for`` ISO string; a naive value is treated as UTC.
+    """
+    value = snapshot.get("event_time")
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    raw = snapshot.get("snapshot_for")
+    if isinstance(raw, str):
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    raise SystemExit(
+        "paper: orderbook snapshot carries no WS event time (event_time/snapshot_for) — "
+        "refusing to stamp a fill/snapshot with now() (D-08)."
+    )
+
+
+def run_paper(args: argparse.Namespace) -> dict[str, Any]:
+    """Paper-trade one (city, date, ticker): REAL live-book midpoint into the money path (D-08/D-16).
+
+    The Phase-5 loop closer. For the validated ``(city, date, lead, ticker)`` this:
+
+    1. confirms paper mode — there is NO order-submission path anywhere under ``market/`` this
+       milestone, so an accidental live order is structurally unreachable (D-15, T-05-14);
+    2. pulls a REAL Kalshi orderbook snapshot via :func:`weatherquant.market.client.fetch_snapshot`
+       (signed REST; demo host with ``--demo``);
+    3. derives the live-book midpoint from the REFLECTED best levels
+       (``yes_ask = 100 - best_no_bid`` → ``[0,1]``, the ONE reflection seam) — this is the
+       value the loop closes on;
+    4. reuses the shared :func:`_blend_distribution` body, then feeds the REAL midpoint (not a
+       mock) into ``price.p_used`` → ``price.bucket_ev`` → ``price.stake_fraction`` — closing
+       the Phase-4 D-08/D-16 loop;
+    5. applies the positive-EV + minimum-stake gate (D-04): one sized position per (market,
+       side), held to settlement; a sub-minimum or non-positive-EV intent simulates NO fill;
+    6. on a positive intent, simulates a (possibly partial) fill via ``fills.taker_sweep``
+       against the reflected asks;
+    7. PERSISTS the market snapshot (debounced cadence ``PAPER_SNAPSHOT_CADENCE_SECONDS``,
+       dense enough that the CLV closing window holds >= 1 snapshot, PAP-04) and the fill via
+       ``market.persist`` — both stamped with the REAL WS event time (D-08);
+    8. places NO real order. Returns a small result dict (``midpoint``/``p_used``/``ev``/
+       ``stake``/fill summary/persisted-snapshot event times).
+
+    All pure math stays in :mod:`weatherquant.price` / :mod:`weatherquant.market.fills`; this
+    is the I/O edge.
+    """
+    import asyncio
+
+    from weatherquant import price as pricing
+    from weatherquant.market import fills, reflect
+
+    # The debounced snapshot cadence MUST stay strictly finer than the CLV closing window so the
+    # window always holds >= 1 persisted snapshot (PAP-04 cadence sufficiency, T-05-20).
+    assert PAPER_SNAPSHOT_CADENCE_SECONDS < clv.CLV_WINDOW_MINUTES * 60, (
+        "PAPER_SNAPSHOT_CADENCE_SECONDS must be strictly finer than the CLV closing window "
+        "(clv.CLV_WINDOW_MINUTES) so the window is never silently sparse (PAP-04)."
+    )
+
+    city = args.city
+    target = args.date
+    lead = args.lead
+    ticker = args.ticker
+
+    settings = get_settings()
+    # Paper-only: the simulator is unreachable in validated 'live' mode (the live path would use
+    # the real order flow, not the shadow simulator). assert_paper_mode is the fail-CLOSED fence
+    # for the (non-existent) order path; here we assert we are NOT in live so the simulator runs.
+    if settings.execution_mode == "live":
+        raise SystemExit(
+            "paper: execution_mode='live' — the paper-fill simulator does not run in live "
+            "mode (no order-submission path exists this milestone, D-15/T-05-14)."
+        )
+
+    bind = get_engine()
+    signer = KalshiSigner.from_settings(settings)
+
+    import httpx
+
+    async def _fetch() -> dict[str, Any]:
+        async with httpx.AsyncClient() as http:
+            rest_host = _demo_rest_host() if getattr(args, "demo", False) else None
+            if rest_host is not None:
+                return await fetch_snapshot(http, signer.sign, ticker, rest_host=rest_host)
+            return await fetch_snapshot(http, signer.sign, ticker)
+
+    snapshot = asyncio.run(_fetch())
+    event_time = _snapshot_event_time(snapshot)
+
+    # The REAL reflection-derived live-book midpoint — the value the D-08/D-16 loop closes on.
+    midpoint = _reflection_midpoint(snapshot)
+    if not (0.0 <= midpoint <= 1.0):  # the reflected mid must be a valid probability (ASVS V5)
+        raise SystemExit(f"paper: reflected midpoint {midpoint} is not in [0, 1]")
+
+    blend = _blend_distribution(bind, city, target, lead)
+    mu_blend = blend["mu_blend"]
+    sigma_blend = blend["sigma_blend"]
+    afd_flag = blend["afd_flag"]
+    n_train = blend["n_train"]
+    pool_level = blend["pool_level"]
+    cap = blend["cap"]
+
+    lo, hi, open_lo, open_hi = pricing.parse_ticker(ticker)
+    c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
+    prob = pricing.bucket_prob(mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi)
+
+    # Feed the REAL midpoint into the SAME money path run_price mocks (D-08/D-16 loop closed):
+    # p_used shrinks the model prob toward the real mid, EV and Kelly size on that shrunk belief.
+    pu = pricing.p_used(prob, midpoint)
+    ev = pricing.bucket_ev(prob, midpoint, midpoint)
+    stake = pricing.stake_fraction(
+        pu, midpoint, pricing.exact_fee(1, midpoint),
+        sigma_blend, n_train, pool_level, afd_flag, cap=cap,
+    )
+
+    # Persist the snapshot at the debounced cadence (here: once per run_paper invocation, which
+    # is by construction within one cadence window), stamped with the REAL WS event time (D-08)
+    # and carrying the load-bearing book fields + raw book JSONB (D-03). Persisting on every
+    # invocation keeps the CLV closing window dense (PAP-04): a book change inside the window
+    # lands a snapshot whose available_at is inside the window.
+    best_yes_bid = max((int(p) for p, _ in snapshot.get("yes") or []), default=None)
+    best_no_bid = max((int(p) for p, _ in snapshot.get("no") or []), default=None)
+    snapshot_for = event_time.isoformat()
+    persisted_snapshot_times: list[str] = []
+    rc_snap = persist_snapshot(
+        bind,
+        ticker=ticker,
+        snapshot_for=snapshot_for,
+        best_yes_bid=best_yes_bid,
+        best_no_bid=best_no_bid,
+        mid=midpoint,
+        seq=snapshot.get("seq"),
+        detail={"yes": snapshot.get("yes"), "no": snapshot.get("no")},
+        available_at=event_time,
+    )
+    if rc_snap == 1:
+        persisted_snapshot_times.append(event_time.isoformat())
+
+    # The positive-EV + minimum-stake gate (D-04): only a positive, sized intent simulates a
+    # paper order. One sized position per (market, side), held to settlement — no churn.
+    fill_summary: dict[str, Any] | None = None
+    if ev > 0.0 and stake >= PAPER_MIN_STAKE_FRACTION:
+        # Size the paper order conservatively at 1 contract for the shadow sim (the Gate-1
+        # credited path is the taker sweep at achievable liquidity; bankroll→contract count
+        # realism is a Phase-6 concern). Real sizing lands when live sizing is enabled (Gate 2).
+        want_count = 1
+        yes_asks = reflect.yes_ask_levels(snapshot)
+        fill = fills.taker_sweep(yes_asks, want_count, event_time=event_time)
+        if fill is not None:
+            trade_id = f"{ticker}:{snapshot_for}:yes"
+            persist_fill(
+                bind,
+                ticker=ticker,
+                trade_id=trade_id,
+                side="yes",
+                price=int(round(fill.avg_price_cents)),
+                count=fill.count,
+                fee=int(round(pricing.exact_fee(fill.count, midpoint) * 100)),
+                is_maker=fill.is_maker,
+                event_time=fill.event_time,
+                bucket_prob=prob,
+                ev=ev,
+                kelly_stake=stake,
+                detail={"avg_price_cents": fill.avg_price_cents, "partial": fill.partial},
+                available_at=fill.event_time,
+            )
+            fill_summary = {
+                "trade_id": trade_id,
+                "count": fill.count,
+                "avg_price_cents": fill.avg_price_cents,
+                "partial": fill.partial,
+                "shortfall": fill.shortfall,
+            }
+
+    logger.info(
+        "paper city=%s date=%s ticker=%s midpoint=%.4f p_used=%.4f ev=%+.4f stake=%.4f fill=%s",
+        city, target, ticker, midpoint, pu, ev, stake, fill_summary,
+    )
+    print(
+        f"paper {city} {target} {ticker}: mid={midpoint:.4f} P={prob:.4f} EV={ev:+.4f} "
+        f"stake={stake:.4f} fill={'none' if fill_summary is None else fill_summary['count']}"
+    )
+
+    return {
+        "city": city,
+        "date": target.isoformat(),
+        "lead": lead,
+        "ticker": ticker,
+        "models": blend["used_models"],
+        "midpoint": midpoint,
+        "p_used": pu,
+        "prob": prob,
+        "ev": ev,
+        "stake": stake,
+        "fill": fill_summary,
+        "persisted_snapshot_times": persisted_snapshot_times,
+    }
+
+
+def _demo_rest_host() -> str:
+    """Return the fixed Kalshi DEMO REST host constant (SSRF guard; never untrusted input)."""
+    from weatherquant.market.client import REST_HOST_DEMO
+
+    return REST_HOST_DEMO
+
+
 def main(argv: list[str] | None = None) -> int:
     """Console-script entry point (``[project.scripts] weatherquant = weatherquant.cli:main``).
 
@@ -612,6 +926,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "price":
         run_price(args)  # prints the blend/bucket/EV/Kelly smoke line(s) itself (D-16)
+        return 0
+    if args.command == "paper":
+        run_paper(args)  # prints the real-midpoint loop-closure smoke line itself (D-08/D-16)
         return 0
     parser.error(f"unknown command: {args.command}")  # NoReturn — exits non-zero
 

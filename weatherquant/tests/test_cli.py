@@ -339,3 +339,214 @@ def test_run_price_min_ramp_model_chosen_deterministically(
         pu, 0.1, pricing.exact_fee(1, 0.1), 1.0, 15, "own:city", False, cap=0.025
     )
     assert stake_fwd == pytest.approx(expected)
+
+
+# --- paper subcommand (05-04) — the REAL live-book midpoint loop closer ----------------------
+#
+# run_paper feeds the REAL reflection-derived live-book midpoint into the Phase-4 money path
+# (closing the D-08/D-16 loop) and persists the snapshot + (possibly partial) fill via the
+# audited path — paper only, no real order. The WS/REST snapshot is MOCKED with a scripted book;
+# the DB + settings + signer are mocked so run_paper runs offline.
+
+from datetime import datetime, timedelta  # noqa: E402
+
+from weatherquant.registry import get_city  # noqa: E402
+from weatherquant.time import settlement_window  # noqa: E402
+
+_PAPER_DATE = date(2026, 6, 18)
+_PAPER_TICKER = "KXHIGHNY-62-63"
+
+
+def _scripted_paper_book(event_time: datetime) -> dict:
+    """A scripted two-sided book: yes bid 40¢, no bid 56¢ → yes ask 44¢ → mid 42¢ (0.42)."""
+    return {
+        "type": "orderbook_snapshot",
+        "seq": 7,
+        "ticker": _PAPER_TICKER,
+        "yes": [[40, 200]],
+        "no": [[56, 200]],
+        "event_time": event_time,
+    }
+
+
+def _expected_reflection_mid(book: dict) -> float:
+    """Independently recompute the reflection-derived mid the loop MUST close on (T-05-19)."""
+    from weatherquant.market import reflect
+
+    best_yes_bid = max(int(p) for p, _ in book["yes"])
+    best_yes_ask = reflect.yes_ask_levels(book)[0][0]  # 100 - best_no_bid
+    return ((best_yes_bid + best_yes_ask) / 2.0) / 100.0
+
+
+def _patch_paper(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    book: dict,
+    forecasts: list[dict],
+    cal_rows: list[dict],
+    cap: float = 0.025,
+) -> dict:
+    """Patch the snapshot fetch, persist seams, DB + settings + signer so run_paper runs offline.
+
+    Returns a ``captured`` dict recording the persist_snapshot / persist_fill call kwargs.
+    """
+    captured: dict = {"snapshots": [], "fills": []}
+
+    async def _fake_fetch(http, signer, ticker, *, rest_host=None):  # noqa: ANN001
+        return book
+
+    def _fake_persist_snapshot(bind, **kw):  # noqa: ANN001
+        captured["snapshots"].append(kw)
+        return 1
+
+    def _fake_persist_fill(bind, **kw):  # noqa: ANN001
+        captured["fills"].append(kw)
+        return 1
+
+    def _fake_latest(bind, table, where=None):  # noqa: ANN001
+        if table == "forecasts":
+            return forecasts
+        if table == "calibration_params":
+            return cal_rows
+        if table == "observations":
+            return []
+        raise AssertionError(f"unexpected table {table!r}")
+
+    class _Signer:
+        @classmethod
+        def from_settings(cls, settings):  # noqa: ANN001
+            return cls()
+
+        def sign(self, method, path):  # noqa: ANN001
+            return {}
+
+    monkeypatch.setattr(cli, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: type("S", (), {"max_position_fraction": cap, "execution_mode": "paper"})(),
+    )
+    monkeypatch.setattr(cli, "fetch_snapshot", _fake_fetch)
+    monkeypatch.setattr(cli, "persist_snapshot", _fake_persist_snapshot)
+    monkeypatch.setattr(cli, "persist_fill", _fake_persist_fill)
+    monkeypatch.setattr(cli, "KalshiSigner", _Signer)
+    monkeypatch.setattr("weatherquant.db.queries.latest", _fake_latest)
+    return captured
+
+
+def _paper_args(ticker: str = _PAPER_TICKER, demo: bool = False):
+    argv = ["paper", "--city", "NYC", "--date", "2026-06-18", "--ticker", ticker]
+    if demo:
+        argv.append("--demo")
+    return cli.build_parser().parse_args(argv)
+
+
+def test_run_paper_produces_midpoint_fed_ev_and_paper_fill(monkeypatch: pytest.MonkeyPatch):
+    """(a) run_paper produces a midpoint-fed EV/stake and a paper fill (no real order)."""
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    event_time = win.end_utc - timedelta(minutes=5)  # inside the CLV window
+    book = _scripted_paper_book(event_time)
+    _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+    result = cli.run_paper(_paper_args())
+    assert result["midpoint"] == pytest.approx(_expected_reflection_mid(book))
+    assert result["ev"] > 0.0  # μ=62.5 σ=1 vs a 0.42 mid → positive edge
+    assert result["stake"] > 0.0
+    assert result["fill"] is not None  # a paper fill was simulated
+    assert result["fill"]["count"] >= 1
+
+
+def test_run_paper_loop_closure_value_into_p_used(monkeypatch: pytest.MonkeyPatch):
+    """(b) LOOP-CLOSURE VALUE: the market_mid passed into price.p_used EQUALS the reflected mid (T-05-19)."""
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    event_time = win.end_utc - timedelta(minutes=5)
+    book = _scripted_paper_book(event_time)
+    _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+
+    # Capture the market_mid arg actually passed into price.p_used (the D-08/D-16 loop value).
+    import weatherquant.price as pricing
+
+    captured_mids: list[float] = []
+    real_p_used = pricing.p_used
+
+    def _spy_p_used(p_model, market_mid, *args, **kwargs):  # noqa: ANN001
+        captured_mids.append(market_mid)
+        return real_p_used(p_model, market_mid, *args, **kwargs)
+
+    monkeypatch.setattr(pricing, "p_used", _spy_p_used)
+
+    result = cli.run_paper(_paper_args())
+    expected_mid = _expected_reflection_mid(book)
+    # Both the returned midpoint AND the value fed into p_used equal the reflection-derived mid.
+    assert result["midpoint"] == pytest.approx(expected_mid)
+    assert captured_mids, "price.p_used was never called — the loop did not close"
+    assert captured_mids[0] == pytest.approx(expected_mid)
+
+
+def test_run_paper_cadence_sufficiency_persists_snapshot_in_closing_window(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """(c) PAP-04 CADENCE SUFFICIENCY: a book change inside the CLV window persists a snapshot there."""
+    from weatherquant.market import clv
+
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    window_start = win.end_utc - timedelta(minutes=clv.CLV_WINDOW_MINUTES)
+    event_time = win.end_utc - timedelta(minutes=clv.CLV_WINDOW_MINUTES // 2)  # inside window
+    book = _scripted_paper_book(event_time)
+    captured = _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+
+    cli.run_paper(_paper_args())
+
+    # The cadence is strictly finer than the window, so the in-window book change lands >= 1
+    # persisted snapshot whose available_at is inside [end - CLV_WINDOW, end).
+    in_window = [
+        kw
+        for kw in captured["snapshots"]
+        if window_start <= kw["available_at"] < win.end_utc
+    ]
+    assert len(in_window) >= 1
+    assert cli.PAPER_SNAPSHOT_CADENCE_SECONDS < clv.CLV_WINDOW_MINUTES * 60
+
+
+def test_run_paper_unknown_city_rejected_before_any_io(capsys: pytest.CaptureFixture):
+    """(d) An unknown city is rejected by _city_type BEFORE any I/O (ASVS V5)."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["paper", "--city", "ZZZ", "--date", "2026-06-18", "--ticker", _PAPER_TICKER])
+    assert excinfo.value.code != 0
+    err = capsys.readouterr().err
+    assert "ZZZ" in err
+
+
+def test_run_paper_refuses_live_mode(monkeypatch: pytest.MonkeyPatch):
+    """run_paper does NOT run in validated live mode (no order-submission path, D-15/T-05-14)."""
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    book = _scripted_paper_book(win.end_utc - timedelta(minutes=5))
+    _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+    # Flip settings to live — the paper simulator must refuse before any fill.
+    monkeypatch.setattr(
+        cli,
+        "get_settings",
+        lambda: type("S", (), {"max_position_fraction": 0.025, "execution_mode": "live"})(),
+    )
+    with pytest.raises(SystemExit, match="live"):
+        cli.run_paper(_paper_args())
