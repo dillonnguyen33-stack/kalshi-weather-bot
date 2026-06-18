@@ -5,7 +5,8 @@ Covers the four blend behaviors from the VALIDATION map:
 * recovery — ``blend_gaussians`` reproduces the analytic ``N(Σwμ, (Σwσ)²)`` of known
   Gaussians (the ``synthetic_gaussians`` fixture).
 * ``-k monoton`` — σ-monotonicity invariant: ``σ_blend ≤ max(σᵢ)`` (true by construction).
-* ``-k pit`` — non-U-shaped PIT sanity of the blend.
+* ``-k pit`` — PIT self-consistency smoke check (redundant with ``-k monoton`` for catching
+  overdispersion; see the note on ``test_blend_pit_not_u_shaped``).
 * ``-k weight`` — dropped-model renormalization + NULL-``crps_oos`` equal-weight fallback.
 
 All ``xfail`` (the stubs raise ``NotImplementedError``) so Wave 1 flips them GREEN without
@@ -41,9 +42,13 @@ def test_blend_sigma_monotonicity_invariant(synthetic_gaussians):
 
 
 def test_blend_pit_not_u_shaped(synthetic_gaussians):
-    # Draw from the analytic blend N(mu_blend, sigma_blend) and PIT through that same blend;
-    # a correct (non-overdispersed) blend gives an approximately uniform PIT — the central
-    # bins are NOT depressed into a U-shape (the linear-mixture-variance failure mode).
+    # NOTE (IN-A7): this is a uniformity SANITY check, not an overdispersion detector. It draws
+    # from N(mu_blend, sigma_blend) and PITs through that SAME Gaussian, so the PIT is uniform
+    # by construction regardless of how sigma_blend was computed — it would stay flat even for
+    # the forbidden overdispersed sqrt(Σwσ²). The actual guard against overdispersion is
+    # test_blend_sigma_monotonicity_invariant (-k monoton): sigma_blend = Σwᵢσᵢ ≤ max(σᵢ) fails
+    # the moment sqrt(Σwσ²) is substituted. This test is therefore REDUNDANT with -k monoton and
+    # kept only as a self-consistency smoke check of the normal_cdf PIT machinery.
     from weatherquant.calibrate.crps import normal_cdf
 
     rng = np.random.default_rng(7)

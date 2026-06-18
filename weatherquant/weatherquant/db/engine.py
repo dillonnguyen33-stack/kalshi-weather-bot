@@ -26,6 +26,12 @@ _REQUIRED_SCHEME = "postgresql+psycopg"
 _MIN_POSITION_FRACTION = 0.02
 _MAX_POSITION_FRACTION = 0.05
 
+# The single source of truth for the default single-position cap (D-13): the conservative
+# end of the locked band. Both the ``Settings.max_position_fraction`` field default and
+# ``price.kelly.stake_fraction``'s ``cap`` default reference THIS one constant so they can
+# never drift apart (WR-A1). Any configured override still passes the band validator above.
+DEFAULT_POSITION_FRACTION = 0.025
+
 
 def require_psycopg3_scheme(url: str) -> None:
     """Raise ``ValueError`` unless ``url``'s dialect is exactly ``postgresql+psycopg``.
@@ -70,7 +76,7 @@ class Settings(BaseSettings):
     # appear in a normal repr; they are deliberately NOT added to the redacted ``__repr__``
     # below (that fixed string only hides credentials, ASVS V14).
     bankroll_usd: float = 500.0  # PROJECT.md constraint: the $500 paper-trading bankroll.
-    max_position_fraction: float = 0.025  # D-13: conservative end of locked [0.02, 0.05].
+    max_position_fraction: float = DEFAULT_POSITION_FRACTION  # D-13: see DEFAULT_POSITION_FRACTION.
 
     @field_validator("database_url")
     @classmethod

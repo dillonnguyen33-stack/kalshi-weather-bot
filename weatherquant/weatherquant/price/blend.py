@@ -53,7 +53,11 @@ def accuracy_weights(
     into a weight vector that sums to 1, with lower ``crps_oos`` ⇒ higher weight via
     normalized inverse-CRPS ``w_i ∝ 1/max(crps_oos_i, eps)``. A per-model floor ``w_min`` is
     applied before the final renormalize so no model fully dominates or fully drops
-    (RESEARCH §Operational Defaults; equal weights are hard to beat → tilt gently). Because
+    (RESEARCH §Operational Defaults; equal weights are hard to beat → tilt gently). The floor
+    is PRE-renormalize, so it guarantees every present model keeps a strictly positive weight
+    but is an exact lower bound on the FINAL weight only while the floored sum ``≤ 1`` (with
+    ``W_MIN=0.05`` that holds for ``≤ 20`` present models — always true for the in-scope ≤ ~8);
+    past that the renormalizer can pull a model's final weight slightly below ``w_min``. Because
     only the models present are passed in, the renormalize that closes this function is also
     the dropped-model renormalization (D-03 / RESEARCH Pitfall 4): a missing model is simply
     absent from ``crps_oos`` and the survivors' weights renormalize to sum to 1.
@@ -113,8 +117,9 @@ def accuracy_weights(
     # --- Per-model floor, then final renormalize (also the dropped-model renormalization,
     # D-03 / Pitfall 4). The floor guarantees a strictly positive normalizer (threat
     # T-04-06) and keeps every present model in the blend. ---
-    floored = np.maximum(raw, w_min)
-    return floored / floored.sum()
+    floored: NDArray[np.float64] = np.maximum(raw, w_min)
+    weights: NDArray[np.float64] = floored / floored.sum()
+    return weights
 
 
 def blend_gaussians(

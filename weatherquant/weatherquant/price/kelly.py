@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 
+from weatherquant.db.engine import DEFAULT_POSITION_FRACTION  # single source for the cap default (WR-A1)
 from weatherquant.price.ev import _require_prob  # one prob/price validator for the whole money path
 from weatherquant.price.fee import exact_fee  # fee-aware Kelly reuses the exact integer-cent fee
 
@@ -98,7 +99,7 @@ def stake_fraction(
     afd_flag: bool,
     *,
     lam: float = KELLY_LAMBDA,
-    cap: float = 0.025,
+    cap: float = DEFAULT_POSITION_FRACTION,
     sigma0: float = SIGMA0_F,
     afd_haircut: float = AFD_HAIRCUT,
 ) -> float:
@@ -112,7 +113,9 @@ def stake_fraction(
 
     The ``cap`` is the position-cap fraction the caller threads through from
     ``Settings.max_position_fraction`` (bounds-validated to ``[0.02, 0.05]`` in 04-01); it
-    defaults to ``0.025`` (that field's default) only when no caller supplies it. The final
+    defaults to the shared ``db.engine.DEFAULT_POSITION_FRACTION`` — the SAME constant that
+    field default references — only when no caller supplies it (WR-A1: one source of truth,
+    so the default path can't drift from the configured cap). The final
     ``min(max(..., 0.0), cap)`` is the LAST operation and the tested hard invariant: no sized
     position ever exceeds ``cap`` for any input (D-13, threat T-04-13).
     """

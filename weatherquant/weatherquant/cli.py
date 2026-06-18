@@ -470,6 +470,9 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
             continue
         arr = np.asarray(vals, dtype=np.float64)
         mean_f = float(arr.mean())
+        # MUST match calibrate/strata.py:408 — both feed the var_f→σ link, so both use NumPy's
+        # population variance arr.var() (ddof=0). A ddof=1 here would bias σ relative to the
+        # variance the EMOS params were fit against (IN-A2). Deterministic model (1 member) → 0.
         var_f = float(arr.var()) if arr.size > 1 else 0.0  # deterministic model → var 0
         params = (
             cal["mean_intercept"],
@@ -610,8 +613,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "price":
         run_price(args)  # prints the blend/bucket/EV/Kelly smoke line(s) itself (D-16)
         return 0
-    parser.error(f"unknown command: {args.command}")
-    return 2  # unreachable — parser.error exits
+    parser.error(f"unknown command: {args.command}")  # NoReturn — exits non-zero
 
 
 if __name__ == "__main__":

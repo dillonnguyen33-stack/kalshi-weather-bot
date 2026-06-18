@@ -16,7 +16,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from weatherquant.price.kelly import kelly_fraction, stake_fraction
+from weatherquant.price.fee import exact_fee
+from weatherquant.price.kelly import kelly_fraction, stake_fraction, sufficiency_ramp
 
 # A positive-EV base case for the shrink/cap/afd tests. The edge is kept MILD on purpose
 # (p just above price): a strong edge would push λ·f_kelly above the cap so EVERY shrink
@@ -100,3 +101,15 @@ def test_stake_fraction_rejects_nonpositive_sigma(bad_sigma):
     # sigma_blend ≤ 0 would divide by zero at −sigma0 or amplify the pre-cap stake; fail loud.
     with pytest.raises(ValueError):
         stake_fraction(_P, _PRICE, _FEE, sigma_blend=bad_sigma, **_BASE)
+
+
+def test_kelly_fraction_resolves_fee_when_omitted():
+    """Omitting `fee` resolves it via exact_fee(1, price) — the one fee seam (IN-A5, D-09)."""
+    p, price = 0.60, 0.50
+    assert kelly_fraction(p, price) == kelly_fraction(p, price, exact_fee(1, price))
+
+
+def test_sufficiency_ramp_parent_pool_haircut():
+    """A parent-pooled fit gets the extra ×0.7 haircut vs an own-stratum fit (IN-A6, D-11)."""
+    n = 10  # below N_REF so the ramp is sub-1 and the 0.7 factor is observable
+    assert sufficiency_ramp(n, "parent:region") == 0.7 * sufficiency_ramp(n, "own:city")

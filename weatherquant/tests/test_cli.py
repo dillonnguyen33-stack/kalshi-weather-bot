@@ -181,3 +181,161 @@ def test_price_unknown_city_is_rejected_by_argparse(capsys: pytest.CaptureFixtur
     assert excinfo.value.code != 0  # argparse exits non-zero on a bad arg
     err = capsys.readouterr().err
     assert "ZZZ" in err  # the clear error names the bad code
+
+
+# --- run_price orchestration (WR-A4) — exercises the assembled money path offline -----------
+#
+# test_price_* above pin the PARSE contract; these lock the five just-applied money-path fixes
+# end-to-end by driving run_price with synthetic calibration + forecast rows. The DB engine,
+# settings, and queries.latest are mocked (mirroring the captured_range pattern) so the pure
+# math (link.predict → blend → bucket_prob → EV → Kelly) runs for real with no Postgres.
+
+_F_TO_K_OFFSET = 273.15
+
+
+def _f_to_kelvin(temp_f: float) -> float:
+    """Inverse of strata.kelvin_to_fahrenheit, so synthetic members land at a known °F."""
+    return (temp_f - 32.0) * 5.0 / 9.0 + _F_TO_K_OFFSET
+
+
+def _cal_row(
+    model: str,
+    *,
+    crps_oos: float | None = 1.0,
+    n_train: int | None = 500,
+    pool_level: str = "own:city",
+    mean_intercept: float | None = 0.0,
+    mean_slope: float | None = 1.0,
+    var_intercept: float | None = 1.0,
+    var_slope: float | None = 0.0,
+    sigma_floor: float | None = 0.5,
+) -> dict:
+    """An identity-link calibration row: μ = mean_f, σ = 1.0 (var_intercept=1, floor=0.5)."""
+    return {
+        "model": model,
+        "mean_intercept": mean_intercept,
+        "mean_slope": mean_slope,
+        "var_intercept": var_intercept,
+        "var_slope": var_slope,
+        "sigma_floor": sigma_floor,
+        "crps_oos": crps_oos,
+        "n_train": n_train,
+        "pool_level": pool_level,
+    }
+
+
+def _forecast_rows(model: str, temp_f: float, members: int = 2) -> list[dict]:
+    """`members` identical members for `model` at `temp_f` (var_f = 0 → deterministic)."""
+    return [
+        {"model": model, "temp_kelvin": _f_to_kelvin(temp_f)} for _ in range(members)
+    ]
+
+
+def _patch_price_db(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    forecasts: list[dict],
+    cal_rows: list[dict],
+    afd_rows: list[dict] | None = None,
+    cap: float = 0.025,
+) -> None:
+    """Patch get_engine/get_settings/queries.latest so run_price runs offline (D-16)."""
+    afd = afd_rows or []
+
+    def _fake_latest(bind, table, where=None):  # noqa: ANN001
+        if table == "forecasts":
+            return forecasts
+        if table == "calibration_params":
+            return cal_rows
+        if table == "observations":
+            return afd
+        raise AssertionError(f"unexpected table {table!r}")
+
+    monkeypatch.setattr(cli, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        cli, "get_settings", lambda: type("S", (), {"max_position_fraction": cap})()
+    )
+    monkeypatch.setattr("weatherquant.db.queries.latest", _fake_latest)
+
+
+def _price_args(ticker: str | None = "KXHIGHNY-62-63", market_mid: str = "0.1"):
+    argv = ["price", "--city", "NYC", "--date", "2026-06-12", "--market-mid", market_mid]
+    if ticker is not None:
+        argv += ["--ticker", ticker]
+    return cli.build_parser().parse_args(argv)
+
+
+def test_run_price_positive_edge_ev_and_stake_agree_in_sign(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A positive-edge bucket prints EV > 0 AND stake > 0 — they agree in sign (locks WR-01).
+
+    μ_blend = 62.5, σ = 1.0 puts ~68% mass in [62, 63] vs a mocked mid of 0.10, so the edge
+    (and the Kelly stake sized on the SAME shrunk p_used) is unambiguously positive.
+    """
+    _patch_price_db(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+    result = cli.run_price(_price_args())
+    bucket = result["buckets"][0]
+    assert bucket["ev"] > 0.0
+    assert bucket["stake_fraction"] > 0.0  # same sign as EV (WR-01)
+
+
+def test_run_price_null_n_train_raises(monkeypatch: pytest.MonkeyPatch):
+    """A NULL n_train on the sizing model fails loud instead of silently zeroing (locks WR-02)."""
+    _patch_price_db(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr", n_train=None)],
+    )
+    with pytest.raises(SystemExit, match="NULL n_train"):
+        cli.run_price(_price_args())
+
+
+def test_run_price_drops_model_with_null_emos_param(monkeypatch: pytest.MonkeyPatch):
+    """A model with ANY NULL EMOS param drops out of the blend (locks WR-04)."""
+    _patch_price_db(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5) + _forecast_rows("gfs", 62.5),
+        cal_rows=[_cal_row("hrrr"), _cal_row("gfs", mean_intercept=None)],
+    )
+    result = cli.run_price(_price_args())
+    assert result["models"] == ["hrrr"]  # gfs dropped on NULL mean_intercept (D-03)
+
+
+def test_run_price_min_ramp_model_chosen_deterministically(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Under tied weights the smallest-sufficiency model sizes the blend, order-independent (WR-05).
+
+    Two models with identical CRPS (⇒ tied weights) and identical (μ, σ) but different n_train.
+    The stake must reflect the THIN model's ramp regardless of forecast-row insertion order;
+    argmax(weights) used to leak iteration order here.
+    """
+    thin = _cal_row("aaa", n_train=15)  # ramp = 15/30 = 0.5 (the min)
+    thick = _cal_row("zzz", n_train=500)  # ramp = 1.0
+
+    def _stake(forecasts):
+        _patch_price_db(
+            monkeypatch, forecasts=forecasts, cal_rows=[thin, thick]
+        )
+        return cli.run_price(_price_args())["buckets"][0]["stake_fraction"]
+
+    fwd = _forecast_rows("aaa", 62.5) + _forecast_rows("zzz", 62.5)
+    rev = _forecast_rows("zzz", 62.5) + _forecast_rows("aaa", 62.5)
+    stake_fwd = _stake(fwd)
+    stake_rev = _stake(rev)
+    assert stake_fwd == stake_rev  # deterministic under tied weights (WR-05)
+
+    # And it is the MIN-ramp (thin, n_train=15) model that sets the haircut, not the thick one.
+    from weatherquant import price as pricing
+
+    prob = pricing.bucket_prob(62.5, 1.0, 61.5, 63.5)
+    pu = pricing.p_used(prob, 0.1)
+    expected = pricing.stake_fraction(
+        pu, 0.1, pricing.exact_fee(1, 0.1), 1.0, 15, "own:city", False, cap=0.025
+    )
+    assert stake_fwd == pytest.approx(expected)
