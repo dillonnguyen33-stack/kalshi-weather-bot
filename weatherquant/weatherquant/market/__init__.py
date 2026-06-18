@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from weatherquant.market.auth import KalshiSigner, load_key, sign
 from weatherquant.market.book import OrderBook, SeqGap, apply
+from weatherquant.market.client import fetch_snapshot, run_feed
 from weatherquant.market.reflect import no_ask_levels, yes_ask_levels
 
 __all__ = [
@@ -36,4 +37,6 @@ __all__ = [
     "OrderBook",
     "SeqGap",
     "apply",
+    "run_feed",
+    "fetch_snapshot",
 ]
