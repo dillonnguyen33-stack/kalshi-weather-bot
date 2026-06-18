@@ -13,11 +13,18 @@ Public surface (grows over 05-02..05-04):
 * ``reflect`` — :func:`yes_ask_levels`, :func:`no_ask_levels`: the ONE yes/no bid-only
   reflection seam (``ask = 100 - opposite bid``) every fill price/size routes through
   (PAP-02, the central correctness landmine).
+* ``book`` — :class:`OrderBook`, :class:`SeqGap`, :func:`apply`: the in-memory per-ticker
+  book + ``seq`` integrity (a gap raises ``SeqGap``, a ``CorrectnessError``, triggering a
+  REST re-snapshot — never a silent carry-forward, PAP-01, D-02).
+* ``client`` — :func:`run_feed`, :func:`fetch_snapshot`: the signed WS connect + auto-
+  reconnect loop (re-subscribe AND REST re-snapshot on every reconnection) and the signed
+  REST orderbook snapshot resync anchor (PAP-01).
 """
 
 from __future__ import annotations
 
 from weatherquant.market.auth import KalshiSigner, load_key, sign
+from weatherquant.market.book import OrderBook, SeqGap, apply
 from weatherquant.market.reflect import no_ask_levels, yes_ask_levels
 
 __all__ = [
@@ -26,4 +33,7 @@ __all__ = [
     "sign",
     "yes_ask_levels",
     "no_ask_levels",
+    "OrderBook",
+    "SeqGap",
+    "apply",
 ]
