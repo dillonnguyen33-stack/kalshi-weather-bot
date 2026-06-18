@@ -37,7 +37,7 @@ from typing import cast
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["crps_norm", "crps_norm_grad"]
+__all__ = ["crps_norm", "crps_norm_grad", "normal_cdf", "normal_pdf"]
 
 # 1 / sqrt(pi): the closed-form CRPS additive constant (the -1/sqrt(pi) term).
 _INV_SQRT_PI = 1.0 / math.sqrt(math.pi)
@@ -60,6 +60,15 @@ def _Phi(x: NDArray[np.float64]) -> NDArray[np.float64]:
 def _phi(x: NDArray[np.float64]) -> NDArray[np.float64]:
     """Standard-normal pdf: ``exp(-x^2/2) / sqrt(2*pi)``."""
     return cast(NDArray[np.float64], np.exp(-0.5 * x * x) * _INV_SQRT_2PI)
+
+
+# Public surface for Phase-4 bucket CDF differencing (D-04 / RESEARCH Pitfall 6):
+# the *same* erf-based bodies, exposed under public names so ``weatherquant.price`` imports
+# ONE source of truth for the normal CDF/PDF and never re-implements erf (D-14/D-15). These
+# are plain aliases — assigning, not re-deriving — so there is exactly one ``_Phi``/``_phi``
+# definition in the codebase.
+normal_cdf = _Phi
+normal_pdf = _phi
 
 
 def crps_norm(
