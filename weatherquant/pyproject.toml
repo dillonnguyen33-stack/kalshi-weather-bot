@@ -26,6 +26,14 @@ dependencies = [
     "anthropic>=0.109,<0.110",
     "apscheduler==3.11.2",
     "numpy==2.4.6",
+    # Phase-5 I/O edge (D-01): the live Kalshi orderbook WS feed + the manual RSA-PSS
+    # request signer (the official REST SDK signs internally, but the WS handshake / any
+    # custom call must sign manually). Allowed here because the no-scipy AST guard governs
+    # calibrate/ and price/ only, NOT market/ — these never touch the pure core. kalshi-python
+    # is deliberately NOT added: the REST orderbook snapshot is issued via the already-present
+    # httpx + this one manual signer (RESEARCH State-of-the-Art deprecation note A6).
+    "websockets==16.0",
+    "cryptography==49.0.0",
 ]
 
 [project.scripts]
