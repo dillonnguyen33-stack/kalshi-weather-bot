@@ -68,6 +68,29 @@ def test_zero_volume_closing_window_fails_loud():
         clv.vol_weighted_mid([{"mid": 50.0, "volume": 0}])
 
 
+def test_vol_weighted_mid_invariant_to_opposite_side_supporting_size():
+    """CORR-MED-3: once ``volume`` is the SUPPORTING top-of-book size, the closing mid is
+
+    invariant to growth in an opposite-side-heavy snapshot's irrelevant depth. Two snapshots
+    with different yes-mids: as long as each ``volume`` is the size that genuinely supports its
+    mid (not the two-sided union depth), the volume-weighted closing mid does not move when the
+    opposite-side-heavy snapshot's away-from-touch depth grows. This is the unit-level guard on
+    the weighting semantic — the weight tracks the priced side.
+    """
+    # Snapshot B is opposite-side-heavy: its yes mid is thinly supported (supporting size 5).
+    # Under the OLD union-depth weighting its weight would balloon with opposite-side depth; under
+    # the supporting-size semantic its weight is fixed at 5 regardless of that growth.
+    snap_a = {"mid": 50.0, "volume": 20}  # well-supported
+    snap_b_small = {"mid": 60.0, "volume": 5}  # thinly supported (supporting size 5)
+    snap_b_large = {"mid": 60.0, "volume": 5}  # opposite-side depth grew, supporting size UNCHANGED
+
+    mid_small = clv.vol_weighted_mid([snap_a, snap_b_small])
+    mid_large = clv.vol_weighted_mid([snap_a, snap_b_large])
+    assert mid_small == pytest.approx(mid_large)
+    # And the closing mid stays pulled toward the well-supported snapshot, not the thin one:
+    assert mid_small == pytest.approx((50.0 * 20 + 60.0 * 5) / 25)
+
+
 def test_closing_window_anchored_on_settlement_window_end():
     """The closing window anchors on ``settlement_window(...).end_utc``, half-open EXCLUSIVE.
 

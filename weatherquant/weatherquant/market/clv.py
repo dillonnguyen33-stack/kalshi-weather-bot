@@ -121,11 +121,17 @@ def vol_weighted_mid(closing_snapshots: Sequence[Mapping[str, Any]]) -> float:
 
     Each snapshot must carry a ``mid`` in CENTS (the float-valued half-cent midpoint persisted
     by ``run_paper`` — unit-consistent with ``best_yes_bid``/``best_no_bid``/``avg_price_cents``,
-    NOT [0,1] dollars, CR-01) and a real ``volume`` (the per-snapshot resting top-of-book
-    liquidity in whole contracts persisted via the audited writer, WR-01). The returned mid is
-    therefore in CENTS, so ``clv_cents`` subtracts ``avg_price_cents`` directly with no
-    conversion. An empty window or a zero total volume RAISES (no fillable closing data → no
-    CLV; never a fabricated mid/silent 0).
+    NOT [0,1] dollars, CR-01) and a real ``volume``. ``volume`` is the per-snapshot top-of-book
+    size SUPPORTING the persisted mid — the liquidity BEHIND THIS mid, ``min`` of the best-yes-bid
+    size and the reflected best-yes-ask size (= the best-no-bid size, reflect.py) — in whole
+    contracts, persisted via the audited writer (WR-01, CORR-MED-3). It is NOT the two-sided UNION
+    depth (05-06 MD-01): weighting by union depth would over-weight a snapshot deep on the OPPOSITE
+    side whose yes-mid is thinly supported, biasing the closing mid toward opposite-side-heavy
+    instants; weighting by the supporting size makes the weight track the liquidity that genuinely
+    backs each mid. The math here is UNCHANGED — only the meaning of ``vol`` is the supporting
+    size. The returned mid is therefore in CENTS, so ``clv_cents`` subtracts ``avg_price_cents``
+    directly with no conversion. An empty window or a zero total volume RAISES (no fillable closing
+    data → no CLV; never a fabricated mid/silent 0).
 
     Raises:
         ValueError: if ``closing_snapshots`` is empty or the total volume is non-positive.

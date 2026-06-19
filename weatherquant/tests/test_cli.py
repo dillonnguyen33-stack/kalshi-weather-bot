@@ -523,6 +523,72 @@ def test_run_paper_cadence_sufficiency_persists_snapshot_in_closing_window(
     assert cli.PAPER_SNAPSHOT_CADENCE_SECONDS < clv.CLV_WINDOW_MINUTES * 60
 
 
+def test_run_paper_persists_supporting_top_of_book_volume(monkeypatch: pytest.MonkeyPatch):
+    """(e) CORR-MED-3: persisted volume = the top-of-book size SUPPORTING the yes mid.
+
+    The persisted ``volume`` must be ``min(best_yes_bid_size, best_no_bid_size)`` — the
+    top-of-book two-sided size behind the persisted yes mid (the yes-ask supporting size IS the
+    best-no-bid size, per the reflection seam) — NOT the summed two-sided union depth. With a
+    THIN yes touch (size 10) and a DEEP no touch (size 1000) the weight is ``min(10, 1000) == 10``,
+    never ``10 + 1000 == 1010``.
+    """
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    event_time = win.end_utc - timedelta(minutes=5)
+    book = {
+        "type": "orderbook_snapshot",
+        "seq": 7,
+        "ticker": _PAPER_TICKER,
+        "yes": [[40, 10]],  # THIN at touch
+        "no": [[56, 1000]],  # DEEP at touch (opposite side)
+        "event_time": event_time,
+    }
+    captured = _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+
+    cli.run_paper(_paper_args())
+
+    assert captured["snapshots"], "no snapshot was persisted"
+    persisted_volume = captured["snapshots"][0]["volume"]
+    assert persisted_volume == 10  # min(10, 1000) — the supporting size, NOT 1010 (the old union)
+
+
+def test_run_paper_volume_invariant_to_opposite_side_depth_growth(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """(f) CORR-MED-3 INVARIANCE: growing ONLY the opposite (no) side's depth leaves volume fixed.
+
+    The weight tracks the priced (supporting) side. A no-heavy snapshot must NOT get a larger
+    weight on its thinly-supported yes-mid: with the no touch grown from 1000 to 10000 the
+    persisted volume stays at the supporting ``min(10, ...) == 10``.
+    """
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    event_time = win.end_utc - timedelta(minutes=5)
+    book = {
+        "type": "orderbook_snapshot",
+        "seq": 7,
+        "ticker": _PAPER_TICKER,
+        "yes": [[40, 10]],  # supporting size unchanged
+        "no": [[56, 10000]],  # opposite-side depth grown 10x
+        "event_time": event_time,
+    }
+    captured = _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+
+    cli.run_paper(_paper_args())
+
+    assert captured["snapshots"], "no snapshot was persisted"
+    # Invariant: only the opposite side grew; the supporting min is still the yes-bid size 10.
+    assert captured["snapshots"][0]["volume"] == 10
+
+
 def test_run_paper_unknown_city_rejected_before_any_io(capsys: pytest.CaptureFixture):
     """(d) An unknown city is rejected by _city_type BEFORE any I/O (ASVS V5)."""
     parser = cli.build_parser()

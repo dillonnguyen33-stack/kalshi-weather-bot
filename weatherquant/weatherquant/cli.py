@@ -835,18 +835,36 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     # and carrying the load-bearing book fields + raw book JSONB (D-03). Persisting on every
     # invocation keeps the CLV closing window dense (PAP-04): a book change inside the window
     # lands a snapshot whose available_at is inside the window.
-    best_yes_bid = max((int(p) for p, _ in snapshot.get("yes") or []), default=None)
-    best_no_bid = max((int(p) for p, _ in snapshot.get("no") or []), default=None)
-    # The per-snapshot volume signal is the total RESTING TOP-OF-BOOK liquidity present at this
-    # observed instant: the summed resting size across both bid sides of the orderbook payload
-    # (each level is [price_cents, size]). This is a REAL value off the feed — the orderbook
-    # payload exposes resting SIZE, not a separate traded-volume field — so the CLV closing mid
-    # is genuinely weighted by the book liquidity present at each snapshot (D-09, WR-01), not a
-    # fabricated placeholder. Cast to int (whole contracts).
-    volume = int(
-        sum(int(sz) for _, sz in (snapshot.get("yes") or []))
-        + sum(int(sz) for _, sz in (snapshot.get("no") or []))
-    )
+    yes_levels = snapshot.get("yes") or []
+    no_levels = snapshot.get("no") or []
+    # best_*_bid are the PRICE columns: the max (best) bid price on each side (cents). The yes ASK
+    # is the reflection 100 - best_no_bid (reflect.py); these prices back the persisted yes mid.
+    best_yes_bid = max((int(p) for p, _ in yes_levels), default=None)
+    best_no_bid = max((int(p) for p, _ in no_levels), default=None)
+    # The per-snapshot volume is the liquidity BEHIND the persisted yes mid — the top-of-book
+    # two-sided SUPPORTING size min(best_yes_bid_size, best_yes_ask_size). The persisted mid is the
+    # yes-side midpoint (best_yes_bid + best_yes_ask)/2 (via _reflection_midpoint_cents), so the
+    # size that actually supports it is the size you can trade at the touch: the smaller of the
+    # best-yes-bid size and the best-yes-ask size. Because Kalshi quotes only bids and the yes ask
+    # is reflected as 100 - best_no_bid carrying the best NO bid's SIZE (reflect.py),
+    # best_yes_ask_size == best_no_bid_size — so this is min(best_yes_bid_size, best_no_bid_size).
+    #
+    # WHY this over 05-06 MD-01's sum(yes sizes)+sum(no sizes): that two-sided UNION depth
+    # over-weights a snapshot deep on the OPPOSITE (no) side but thin on the yes side — its yes-mid
+    # is barely supported yet would carry a large CLV weight, biasing the closing mid toward
+    # opposite-side-heavy instants (CORR-MED-3). Narrowing to the supporting top-of-book size
+    # reconciles 05-06 MD-01 (still a REAL off-the-feed liquidity signal, no fabrication) while
+    # weighting each mid by the liquidity that genuinely backs THIS mid. The reflection's
+    # 100 - price is NOT re-derived here: the supporting yes-ask size IS the best-no-bid size by
+    # construction, read straight off the no side. Cast to int (whole contracts).
+    best_yes_bid_size = max(yes_levels, key=lambda lvl: int(lvl[0]))[1] if yes_levels else None
+    best_no_bid_size = max(no_levels, key=lambda lvl: int(lvl[0]))[1] if no_levels else None
+    if best_yes_bid_size is None or best_no_bid_size is None:
+        raise SystemExit(
+            "paper: book is one-sided — cannot derive the top-of-book supporting size behind "
+            "the persisted mid (no fabricated volume)."
+        )
+    volume = int(min(int(best_yes_bid_size), int(best_no_bid_size)))
     snapshot_for = event_time.isoformat()
     persisted_snapshot_times: list[str] = []
     rc_snap = persist_snapshot(

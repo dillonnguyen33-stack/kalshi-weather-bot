@@ -191,10 +191,14 @@ calibration_params = sa.Table(
 # un-divided ``mid_cents`` here and keeps the [0,1] ``mid_unit`` only for the p_used/EV/Kelly
 # pricing math; ``clv.vol_weighted_mid``/``clv_cents`` subtract ``avg_price_cents`` (cents)
 # directly, with no conversion. ``mid`` MUST stay ``sa.Float`` (NOT Integer) — rounding to an
-# int would inject +/-0.5c bias into every derived CLV. ``volume`` (05-06, WR-01) is the
-# per-snapshot book-liquidity signal in WHOLE CONTRACTS (Integer) consumed by
-# ``vol_weighted_mid`` to weight the closing mid; it is populated in run_paper from the summed
-# resting top-of-book size off the live orderbook payload (a REAL feed signal, not a fixture).
+# int would inject +/-0.5c bias into every derived CLV. ``volume`` (05-06 WR-01, refined 05-08
+# CORR-MED-3) is the per-snapshot book-liquidity signal in WHOLE CONTRACTS (Integer) consumed by
+# ``vol_weighted_mid`` to weight the closing mid; it is the top-of-book size SUPPORTING the
+# persisted yes mid — ``min(best_yes_bid_size, best_no_bid_size)``, the liquidity BEHIND THIS
+# mid (the best-no-bid size IS the reflected best-yes-ask size, reflect.py). It is NOT the
+# two-sided UNION depth (which would over-weight an opposite-side-deep, thinly-supported mid),
+# narrowing 05-06 MD-01's summed depth to the size that genuinely backs the priced mid while
+# remaining a REAL feed signal (not a fixture).
 market_snapshots = sa.Table(
     "market_snapshots",
     metadata,
@@ -206,8 +210,9 @@ market_snapshots = sa.Table(
     # mid is FLOAT-VALUED CENTS (the half-cent midpoint, unit-consistent with best_*_bid and
     # avg_price_cents) — NOT [0,1] dollars; stays Float so no +/-0.5c rounding bias (CR-01).
     sa.Column("mid", sa.Float, nullable=True),
-    # volume: per-snapshot book-liquidity signal in WHOLE CONTRACTS (summed resting top-of-book
-    # size off the live orderbook payload); weights the CLV closing mid (WR-01). Type mirrors 0005.
+    # volume: per-snapshot book-liquidity signal in WHOLE CONTRACTS — the top-of-book size
+    # SUPPORTING the persisted yes mid (min(best_yes_bid_size, best_no_bid_size)), the liquidity
+    # behind THIS mid; weights the CLV closing mid (WR-01, CORR-MED-3). Type mirrors 0005.
     sa.Column("volume", sa.Integer, nullable=True),
     sa.Column("seq", sa.BigInteger, nullable=True),
     sa.Column("detail", postgresql.JSONB, nullable=True),
