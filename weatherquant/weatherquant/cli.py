@@ -910,6 +910,18 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     snapshot_for = (
         f"{event_time.isoformat()}#{int(seq)}" if seq is not None else event_time.isoformat()
     )
+    # CLOSING-WINDOW AXIS CONTRACT (IN-01): the CLV closing window selects on available_at, and
+    # clv.snapshot_event_time prefers event_time/available_at over the snapshot_for ISO string.
+    # Those are independent columns; here all three derive from the ONE observed instant. Enforce
+    # their agreement at the write boundary (raise, survives -O) so a future writer that lets
+    # available_at and the snapshot_for instant diverge is caught here, not by a silently
+    # mis-windowed CLV. (The seq suffix is stripped before comparing the ISO instant.)
+    if snapshot_for.split("#", 1)[0] != event_time.isoformat():
+        raise RuntimeError(
+            "paper: snapshot_for instant disagrees with available_at "
+            f"({snapshot_for!r} vs {event_time.isoformat()!r}) — the CLV closing-window axis "
+            "would diverge (IN-01)."
+        )
     persisted_snapshot_times: list[str] = []
     rc_snap = persist_snapshot(
         bind,

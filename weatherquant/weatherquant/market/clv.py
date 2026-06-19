@@ -62,6 +62,16 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
     back to parsing the ``snapshot_for`` ISO string (the fixture / ISO-stamp shape). A naive
     datetime is assumed UTC. A missing/unparseable time is a caller bug — raise, never silently
     drop the row from the window (which would skew the closing mid).
+
+    CLOSING-WINDOW AXIS CONTRACT (IN-01): for persisted ``market_snapshots`` rows the
+    closing-window selection axis is ``available_at`` — the real observed book instant. The
+    preference order above (``event_time`` then ``available_at`` then ``snapshot_for``) is a
+    contract, not an accident: ``run_paper`` sets all three from the SAME observed instant
+    (``available_at=event_time`` and ``snapshot_for`` is that instant's ISO string), and asserts
+    their agreement at persist time. A FUTURE writer that sets ``available_at`` to ingest time
+    while ``snapshot_for`` keeps the observation instant would select the window on the wrong
+    axis; the persist-time assertion in ``run_paper`` is what catches that divergence at the
+    write boundary rather than letting it silently skew the CLV window.
     """
     for key in ("event_time", "available_at"):
         value = snapshot.get(key)
