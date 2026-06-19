@@ -251,6 +251,24 @@ async def _resnapshot_all(
         apply(books[ticker], snapshot)
 
 
+async def _emit(on_book: OnBookFn, ticker: str, book: OrderBook) -> None:
+    """Surface a book state to the downstream sink, awaiting a coroutine result (WR-04 wrapping).
+
+    The ONE place the ``on_book(ticker, book) + await-if-awaitable`` contract lives, called from
+    all three emit sites (on-(re)connect re-snapshot, in-loop seq-gap re-snapshot, normal delta)
+    so the contract cannot drift again (CR-02). A raise from the downstream sink (e.g. a
+    transient DB write error in the persist sink) is caught and logged here rather than allowed
+    to tear down the whole live feed: a sink hiccup must NOT kill the orderbook feed; the caller
+    continues/reconnects (WR-04).
+    """
+    try:
+        result = on_book(ticker, book)
+        if isinstance(result, Awaitable):
+            await result
+    except Exception as exc:  # noqa: BLE001 — the sink must not kill the feed (WR-04)
+        logger.warning("[market error] on_book sink failed for %s: %s", ticker, exc)
+
+
 async def run_feed(
     tickers: Sequence[str],
     signer: SignerFn,
@@ -313,6 +331,16 @@ async def run_feed(
                 )
                 continue
 
+            # Surface every freshly re-anchored book to the sink IMMEDIATELY on (re)connect,
+            # mirroring the in-loop seq-gap path (CR-02). Otherwise a reconnect that re-anchors a
+            # book inside the CLV closing window — then disconnects before any delta — silently
+            # drops that snapshot from persistence (the states most likely to fall inside a
+            # closing window after a disruption), and the very first observed book is never
+            # persisted until a delta mutates it.
+            if on_book is not None:
+                for ticker in tickers:
+                    await _emit(on_book, ticker, books[ticker])
+
             async for raw in ws:
                 msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
                 ticker = _msg_ticker(msg, tickers)
@@ -342,16 +370,13 @@ async def run_feed(
                     # Surface the freshly re-anchored book to the sink BEFORE continuing —
                     # otherwise every REST-resync book state (precisely the states most likely
                     # to fall inside a CLV closing window after a disruption) is silently
-                    # dropped from persistence (WR-02 / PAP-04 cadence sufficiency).
+                    # dropped from persistence (WR-02 / PAP-04 cadence sufficiency). Routed
+                    # through the one _emit helper so a raising sink cannot kill the feed (WR-04).
                     if on_book is not None:
-                        result = on_book(ticker, book)
-                        if isinstance(result, Awaitable):
-                            await result
+                        await _emit(on_book, ticker, book)
                     continue
                 if on_book is not None:
-                    result = on_book(ticker, book)
-                    if isinstance(result, Awaitable):
-                        await result
+                    await _emit(on_book, ticker, book)
         except websockets.ConnectionClosed as exc:
             # EXPECTED transient: the iterator reconnects with backoff; structured fallback.
             logger.warning(
