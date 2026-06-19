@@ -92,11 +92,6 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
     )
 
 
-# Private alias kept so any internal call site / external import of the old name still resolves;
-# the PUBLIC ``snapshot_event_time`` is the single seam (DD-1).
-_event_time = snapshot_event_time
-
-
 def closing_window_snapshots(
     snapshots: Sequence[Mapping[str, Any]],
     city: City,
