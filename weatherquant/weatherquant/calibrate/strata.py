@@ -309,6 +309,18 @@ def fit_pooled_month_strata(
 
     Returns one ``(month_samples, target_dates, fit)`` per RETAINED month so the caller can run
     the OOS audit and persist using the month's own samples.
+
+    SHRINKAGE-TARGET NOTE (IN-02): each season parent is fit on ALL pairs in the season, which
+    INCLUDES the month being shrunk toward it — so the blend ``w*own + (1-w)*parent`` shrinks a
+    child toward a parent that already contains it, not a strictly independent prior. This is
+    INTENTIONAL for this milestone: the parent is the season's full pooled fit (the rung-1 D-08
+    ladder target), which keeps the parent maximally data-rich and the implementation simple. The
+    statistical cost is that for very sparse months the regularization is mildly understated (the
+    parent is pulled slightly toward the child it contains), which can make a sparse month's fit a
+    touch sharper than a leave-the-month-out parent would yield — a subtlety affecting calibration
+    sharpness and therefore Kelly sizing. A leave-the-month-out season parent would make the prior
+    independent; deferred because it changes calibration output and needs its own validation. The
+    inclusion is deliberate, not an oversight.
     """
     by_month: dict[int, list[TrainingPair]] = {}
     by_season: dict[int, list[TrainingPair]] = {}
