@@ -9,16 +9,19 @@ This is the live half of the orderbook feed:
   :func:`weatherquant.market.book.parse_dollar_fp_side` (W1 — no second dollars→cents math
   lives here). The verified live REST orderbook carries NO ``seq`` field, so
   :func:`_resolve_seq` raises fail-loud ("no seq baseline", MED-5): REST is NOT a seq anchor.
-* :func:`run_feed` — the connection lifecycle: ``async for ws in connect(...)`` lets the
-  ``websockets`` iterator own socket reconnection + backoff. On EVERY (re)connection the loop
-  body re-sends the subscribe command; the fresh WS ``orderbook_snapshot`` (seq=1) that
-  arrives after subscribe is what ANCHORS each book (B1 — run_feed does NOT REST-resnapshot on
-  connect; the seq-less REST payload would crash the feed on the first connect). A control
-  frame (``subscribed``/``ok``/``error``/``unsubscribed``) is skipped before book keying. A WS
-  seq gap (:class:`SeqGap` / :class:`~weatherquant.ingest.errors.CorrectnessError`) BREAKS the
-  delta loop so the ``async for ws`` iterator advances to the NEXT connection, which
-  re-subscribes for a FRESH WS snapshot (a new per-subscription seq baseline) — never a REST
-  resync for a seq the REST API does not return (D-02 redesign, live-verified).
+* :func:`run_feed` — the connection lifecycle: a MANUAL reconnect loop opens one signed
+  connection at a time and RE-SIGNS the RSA-PSS handshake on every (re)connection (CR-01 — the
+  ``async for ws in connect(...)`` auto-reconnect idiom freezes the first handshake's headers
+  and replays a stale ``KALSHI-ACCESS-TIMESTAMP`` that Kalshi rejects, so reconnect-and-anchor
+  could never re-authenticate live). On EVERY (re)connection the loop body re-sends the
+  subscribe command; the fresh WS ``orderbook_snapshot`` (seq=1) that arrives after subscribe is
+  what ANCHORS each book (B1 — run_feed does NOT REST-resnapshot on connect; the seq-less REST
+  payload would crash the feed on the first connect). A control frame
+  (``subscribed``/``ok``/``error``/``unsubscribed``) is skipped before book keying. A WS seq gap
+  (:class:`SeqGap` / :class:`~weatherquant.ingest.errors.CorrectnessError`) BREAKS the delta loop
+  so the loop reconnects to the NEXT connection, which re-subscribes for a FRESH WS snapshot (a
+  new per-subscription seq baseline) — never a REST resync for a seq the REST API does not
+  return (D-02 redesign, live-verified).
 
 SSRF discipline (threat T-05-11, mirrors ``ingest/sources/_client.py``): the WS and REST
 hosts are FIXED prod/demo constants — never built from untrusted input — and are ``wss://`` /
@@ -29,6 +32,7 @@ asserts the re-subscribe + WS-snapshot re-anchor happen on reconnect, with NO li
 
 from __future__ import annotations
 
+import asyncio
 import email.utils
 import json
 import logging
@@ -59,6 +63,13 @@ REST_HOST_DEMO = "https://demo-api.kalshi.co"
 # The WS handshake is signed over GET + this fixed path (no query — Pitfall 6).
 WS_PATH = "/trade-api/ws/v2"
 _WS_METHOD = "GET"
+
+# Reconnect pacing for run_feed's MANUAL reconnect loop. The loop re-signs the handshake on
+# every (re)connection (CR-01), so it cannot delegate to the websockets auto-reconnect
+# iterator's built-in backoff; this is a capped exponential backoff reproduced in its place,
+# applied only on unbounded (production) runs — bounded test runs reconnect immediately.
+_RECONNECT_BACKOFF_BASE_SECONDS = 1.0
+_RECONNECT_BACKOFF_MAX_SECONDS = 30.0
 
 # REST orderbook path template; the {ticker} is path-segment data, the host is a fixed const.
 _REST_ORDERBOOK_PATH = "/trade-api/v2/markets/{ticker}/orderbook"
@@ -252,14 +263,17 @@ async def run_feed(
     demo: bool = False,
     max_reconnects: int | None = None,
 ) -> None:
-    """Run the signed WS orderbook feed with auto-reconnect + re-subscribe + WS-snapshot anchor.
+    """Run the signed WS orderbook feed with re-signed reconnects + re-subscribe + WS anchor.
 
-    The ``websockets`` iterator (``async for ws in connect(...)``) owns socket reconnection and
-    backoff. On EVERY (re)connection the loop body re-sends the ``orderbook_delta`` subscribe
-    command; the fresh WS ``orderbook_snapshot`` (seq=1) that arrives right after the subscribe
-    ANCHORS each book (B1 — run_feed does NOT REST-resnapshot on connect; the verified live REST
-    orderbook_fp carries no seq and would crash the feed via the "no seq baseline" raise). The
-    WS snapshot, not REST, is the per-subscription seq baseline.
+    A MANUAL reconnect loop owns socket reconnection: it opens one connection at a time and
+    RE-SIGNS the RSA-PSS handshake on EVERY (re)connection (CR-01 — the ``async for ws in
+    connect(...)`` auto-reconnect idiom would freeze the first connection's ``additional_headers``
+    and replay a stale ``KALSHI-ACCESS-TIMESTAMP``, which the live server rejects on its
+    timestamp-skew window). On EVERY (re)connection the loop body re-sends the ``orderbook_delta``
+    subscribe command; the fresh WS ``orderbook_snapshot`` (seq=1) that arrives right after the
+    subscribe ANCHORS each book (B1 — run_feed does NOT REST-resnapshot on connect; the verified
+    live REST orderbook_fp carries no seq and would crash the feed via the "no seq baseline"
+    raise). The WS snapshot, not REST, is the per-subscription seq baseline.
 
     Inside the delta loop:
 
@@ -268,27 +282,34 @@ async def run_feed(
     * a WS ``orderbook_snapshot``/``orderbook_delta`` is routed through
       :func:`~weatherquant.market.book.apply` and the book is surfaced to ``on_book``;
     * a :class:`SeqGap` / :class:`~weatherquant.ingest.errors.CorrectnessError` BREAKS the delta
-      loop so the ``async for ws`` iterator advances to the NEXT connection, which re-subscribes
-      for a FRESH WS snapshot (a new per-subscription seq baseline) — the unknown book is never
-      carried forward and REST is never consulted for a seq it does not return (D-02 redesign);
+      loop so the loop reconnects to the NEXT connection, which re-subscribes for a FRESH WS
+      snapshot (a new per-subscription seq baseline) — the unknown book is never carried forward
+      and REST is never consulted for a seq it does not return (D-02 redesign);
     * a malformed message fails loud; only ``websockets.ConnectionClosed`` (and other transient
-      socket errors) log a structured fallback and let the iterator reconnect.
+      socket errors) log a structured fallback and let the loop reconnect.
+
+    Between (re)connections the loop applies a capped exponential backoff on unbounded
+    (production) runs only — bounded runs (``max_reconnects`` set, primarily tests) reconnect
+    immediately. The backoff resets after any connection that delivered book data.
 
     Args:
         tickers: the market tickers to subscribe to.
-        signer: ``signer(method, path) -> headers`` for the signed WS handshake.
+        signer: ``signer(method, path) -> headers`` for the signed WS handshake; RE-INVOKED once
+            per (re)connection so each handshake carries a fresh timestamp (CR-01).
         http: injectable async HTTP client (kept for parity with :func:`fetch_snapshot`'s seam;
             run_feed itself issues no REST call — the WS snapshot is the only seq anchor).
         on_book: optional callback ``on_book(ticker, book)`` invoked after each applied WS
             snapshot/delta (the downstream fill/snapshot sink); may be sync or async. The book
             it receives carries the real WS event time on :attr:`OrderBook.event_time` after a
             delta (PAP-03 carry+surface; the WS→persistence sink is deferred — B2).
-        ws_connect: injectable WS connector returning an async iterator of connections (the
-            ``websockets.connect`` async-iterator idiom); a mock in tests. Defaults to
-            ``websockets.connect``.
+        ws_connect: injectable WS connector — ``ws_connect(url, additional_headers=...)`` returns
+            a SINGLE connection usable as an async context manager (the ``websockets.connect``
+            idiom); re-called per (re)connection so the handshake can be re-signed. A mock in
+            tests. Defaults to ``websockets.connect``.
         demo: use the fixed demo hosts instead of prod (SSRF guard; both are constants).
         max_reconnects: optional bound on (re)connections — primarily for tests so a mock WS
-            that always reconnects does not loop forever. ``None`` runs indefinitely.
+            that always reconnects does not loop forever (and so bounded runs skip the reconnect
+            backoff). ``None`` runs indefinitely with backoff between reconnects.
     """
     ws_url, _ = _resolve_hosts(demo)
     connector = ws_connect or websockets.connect
@@ -298,51 +319,67 @@ async def run_feed(
     books: dict[str, OrderBook] = {t: OrderBook(t) for t in tickers}
 
     connections = 0
-    async for ws in connector(ws_url, additional_headers=dict(signer(_WS_METHOD, WS_PATH))):
+    backoff = _RECONNECT_BACKOFF_BASE_SECONDS
+    while max_reconnects is None or connections < max_reconnects:
         connections += 1
+        # CR-01: re-sign the RSA-PSS handshake on EVERY (re)connection so the
+        # KALSHI-ACCESS-TIMESTAMP is fresh. The websockets auto-reconnect iterator would freeze
+        # the first handshake's headers and replay a stale signature the live server rejects, so
+        # the whole reconnect/re-subscribe/re-anchor path could never re-authenticate. A manual
+        # loop re-invokes the signer here, opening one freshly-signed connection at a time.
+        headers = dict(signer(_WS_METHOD, WS_PATH))
+        delivered = False
         try:
-            # (Re)connect: re-subscribe; the fresh WS snapshot (seq=1) re-anchors each book.
-            # No connect-time REST resnapshot (B1) — REST has no seq, the WS snapshot anchors.
-            await ws.send(subscribe_cmd)
+            async with connector(ws_url, additional_headers=headers) as ws:
+                # (Re)connect: re-subscribe; the fresh WS snapshot (seq=1) re-anchors each book.
+                # No connect-time REST resnapshot (B1) — REST has no seq, the WS snapshot anchors.
+                await ws.send(subscribe_cmd)
 
-            async for raw in ws:
-                msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
-                # A control frame ('subscribed'/'ok'/'error'/'unsubscribed') is feed-level and
-                # carries no ticker key — skip it BEFORE _msg_ticker keys a book (the verified
-                # first frame after subscribe; one home for the set in book.py — W1).
-                if isinstance(msg, Mapping) and msg.get("type") in CONTROL_FRAME_TYPES:
-                    logger.debug("[ws] skipping control frame: %s", msg.get("type"))
-                    continue
-                ticker = _msg_ticker(msg, tickers)
-                book = books[ticker]
-                try:
-                    apply(book, msg)
-                except (SeqGap, CorrectnessError) as gap:
-                    # The local book is UNKNOWN across the gap — break to the reconnect iterator
-                    # so the NEXT connection re-subscribes for a FRESH WS snapshot (new seq
-                    # baseline), never REST-resyncing for a seq REST does not return (D-02
-                    # redesign, W2). Do NOT re-subscribe on this same socket; do NOT fetch.
-                    logger.warning(
-                        "[orderbook error] seq gap on %s (%s) — re-subscribing for a fresh WS "
-                        "snapshot (D-02)",
-                        ticker,
-                        gap,
-                    )
-                    break
-                # Surface the freshly applied book (snapshot or delta) to the sink. The book's
-                # .event_time is the real WS event time after a delta (PAP-03 carry+surface, B2);
-                # the WS→persistence sink is deferred (not wired here). Routed through the one
-                # _emit helper so a raising sink cannot kill the feed (WR-04).
-                if on_book is not None:
-                    await _emit(on_book, ticker, book)
+                async for raw in ws:
+                    msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                    # A control frame ('subscribed'/'ok'/'error'/'unsubscribed') is feed-level and
+                    # carries no ticker key — skip it BEFORE _msg_ticker keys a book (the verified
+                    # first frame after subscribe; one home for the set in book.py — W1).
+                    if isinstance(msg, Mapping) and msg.get("type") in CONTROL_FRAME_TYPES:
+                        logger.debug("[ws] skipping control frame: %s", msg.get("type"))
+                        continue
+                    ticker = _msg_ticker(msg, tickers)
+                    book = books[ticker]
+                    try:
+                        apply(book, msg)
+                    except (SeqGap, CorrectnessError) as gap:
+                        # The local book is UNKNOWN across the gap — break so the loop reconnects
+                        # and the NEXT connection re-subscribes for a FRESH WS snapshot (new seq
+                        # baseline), never REST-resyncing for a seq REST does not return (D-02
+                        # redesign, W2). Do NOT re-subscribe on this same socket; do NOT fetch.
+                        logger.warning(
+                            "[orderbook error] seq gap on %s (%s) — re-subscribing for a fresh WS "
+                            "snapshot (D-02)",
+                            ticker,
+                            gap,
+                        )
+                        break
+                    delivered = True
+                    # Surface the freshly applied book (snapshot or delta) to the sink. The book's
+                    # .event_time is the real WS event time after a delta (PAP-03 carry+surface,
+                    # B2); the WS→persistence sink is deferred (not wired here). Routed through the
+                    # one _emit helper so a raising sink cannot kill the feed (WR-04).
+                    if on_book is not None:
+                        await _emit(on_book, ticker, book)
         except websockets.ConnectionClosed as exc:
-            # EXPECTED transient: the iterator reconnects with backoff; structured fallback.
+            # EXPECTED transient: the loop reconnects (re-signing); structured fallback.
             logger.warning(
                 "[ws error] kalshi WS connection closed (%s) — reconnecting + re-subscribing",
                 exc,
             )
-        if max_reconnects is not None and connections >= max_reconnects:
-            break
+        # Reconnect pacing: unbounded (production) runs back off between reconnects so a
+        # persistently failing endpoint is not hammered, resetting after any connection that
+        # delivered book data; bounded runs (tests) reconnect immediately for determinism.
+        if max_reconnects is None:
+            backoff = _RECONNECT_BACKOFF_BASE_SECONDS if delivered else min(
+                backoff * 2, _RECONNECT_BACKOFF_MAX_SECONDS
+            )
+            await asyncio.sleep(backoff)
 
 
 def _msg_ticker(msg: Mapping[str, Any], tickers: Sequence[str]) -> str:

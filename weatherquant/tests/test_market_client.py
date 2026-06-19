@@ -73,12 +73,19 @@ class _MockHttp:
 
 
 class _MockWS:
-    """One WS connection: records sends, yields ``messages`` then raises ConnectionClosed."""
+    """One WS connection (an async context manager, the ``websockets.connect`` per-connection
+    idiom): records sends, yields ``messages`` then raises ConnectionClosed."""
 
     def __init__(self, messages, *, close_after=True):
         self._messages = list(messages)
         self._close_after = close_after
         self.sent = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False  # never suppress — a ConnectionClosed propagates to run_feed's handler
 
     async def send(self, data):
         self.sent.append(data)
@@ -96,22 +103,20 @@ class _MockWS:
 
 
 class _MockConnector:
-    """A ``websockets.connect``-shaped async iterator yielding scripted connections in order."""
+    """A ``websockets.connect``-shaped callable: each call OPENS the next scripted connection (an
+    async context manager), recording the per-connection ``(url, additional_headers)`` so a test
+    can assert the handshake is re-signed on every (re)connection (CR-01)."""
 
     def __init__(self, connections):
         self._connections = list(connections)
-        self.connect_calls = []  # (url, additional_headers)
+        self._index = 0
+        self.connect_calls = []  # (url, additional_headers) — one entry PER (re)connection
 
     def __call__(self, url, *, additional_headers=None):
         self.connect_calls.append((url, additional_headers))
-        return self
-
-    def __aiter__(self):
-        return self._gen()
-
-    async def _gen(self):
-        for conn in self._connections:
-            yield conn
+        conn = self._connections[self._index]
+        self._index += 1
+        return conn
 
 
 def _signer(method, path):
@@ -309,6 +314,48 @@ async def test_reconnect_uses_fresh_ws_seq_baseline():
     )
 
     assert captured == [1, 2, 1]
+    assert http.calls == []
+
+
+async def test_handshake_is_resigned_on_every_reconnection():
+    """CR-01: the RSA-PSS WS handshake is re-signed on EVERY (re)connection, not frozen once.
+
+    The ``async for ws in connect(...)`` auto-reconnect idiom reuses the FIRST connection's
+    ``additional_headers`` — replaying a stale ``KALSHI-ACCESS-TIMESTAMP`` the live server
+    rejects. run_feed must re-invoke the signer per connection so each handshake carries a fresh
+    timestamp. Two connections → two signer calls → two DISTINCT timestamps in the connector's
+    per-connection headers. The pre-fix bug yields ONE signer call and a single frozen header set.
+    """
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2)])  # drops → reconnect
+    conn2 = _MockWS([_ws_snapshot(1)], close_after=False)
+    connector = _MockConnector([conn1, conn2])
+
+    sign_calls = []
+
+    def recording_signer(method, path):
+        # A fresh monotonic timestamp per call, mirroring auth.py's int(time.time()*1000) stamp.
+        ts = str(1000 + len(sign_calls))
+        sign_calls.append((method, path, ts))
+        return {
+            "KALSHI-ACCESS-KEY": "k",
+            "KALSHI-ACCESS-SIGNATURE": "s",
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+        }
+
+    await run_feed([_TICKER], recording_signer, http=http, ws_connect=connector, max_reconnects=2)
+
+    # The signer ran once PER connection (not once for the whole feed), and the handshake was
+    # built fresh for each of the two connections.
+    assert len(connector.connect_calls) == 2
+    assert len(sign_calls) == 2
+    # Each connection's handshake carried a DISTINCT, freshly-signed timestamp — the stale-header
+    # reuse bug (CR-01) would leave these identical (or only one connect_call recorded).
+    ts1 = connector.connect_calls[0][1]["KALSHI-ACCESS-TIMESTAMP"]
+    ts2 = connector.connect_calls[1][1]["KALSHI-ACCESS-TIMESTAMP"]
+    assert ts1 != ts2
+    # Every connection signed GET over the fixed query-stripped WS path (no host from input).
+    assert {(m, p) for m, p, _ in sign_calls} == {("GET", "/trade-api/ws/v2")}
     assert http.calls == []
 
 
