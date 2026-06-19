@@ -666,14 +666,16 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
 PAPER_MIN_STAKE_FRACTION = 1e-4
 
 
-def _reflection_midpoint(book: object) -> float:
-    """Derive the live-book midpoint in [0,1] from the REFLECTED best levels (the ONE seam).
+def _reflection_midpoint_cents(book: object) -> float:
+    """Derive the live-book midpoint in FLOAT-VALUED CENTS from the REFLECTED best levels.
 
     Kalshi quotes only bids; the yes ask is reflected as ``100 - best_no_bid`` (cents) via
     :func:`weatherquant.market.reflect.yes_ask_levels` (best/cheapest first). The midpoint is
-    ``(best_yes_bid + best_yes_ask) / 2`` cents, converted to ``[0,1]``. This is the value the
-    Phase-4 D-08/D-16 loop closes on — it MUST equal the reflection-derived mid, never a native
-    ask read (there is none) and never a fabricated value.
+    ``(best_yes_bid + best_yes_ask) / 2`` in CENTS (the half-cent midpoint, e.g. 50.5 for a
+    yes bid 50 / reflected yes ask 51). This is the value PERSISTED as ``market_snapshots.mid``
+    (CR-01) — unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and the
+    fill's ``avg_price_cents``, so ``clv.clv_cents`` subtracts with NO conversion. The [0,1]
+    pricing value is ``mid_cents / 100.0`` (see :func:`_reflection_midpoint`).
 
     Fails loud (raise) when either side of the book is empty — no two-sided market → no
     derivable midpoint (absence = absence, never a fabricated mid).
@@ -693,8 +695,20 @@ def _reflection_midpoint(book: object) -> float:
         )
     best_yes_bid = max(yes_bid_prices)
     best_yes_ask = yes_asks[0][0]  # cheapest reflected yes ask = 100 - best_no_bid
-    mid_cents = (best_yes_bid + best_yes_ask) / 2.0
-    return mid_cents / 100.0
+    return (best_yes_bid + best_yes_ask) / 2.0
+
+
+def _reflection_midpoint(book: object) -> float:
+    """Derive the live-book midpoint in [0,1] from the REFLECTED best levels (the ONE seam).
+
+    The [0,1] PRICING value: ``_reflection_midpoint_cents(book) / 100.0``. This is the value
+    the Phase-4 D-08/D-16 loop closes on (fed into ``price.p_used``/``bucket_ev``/
+    ``stake_fraction``) — it MUST equal the reflection-derived mid, never a native ask read
+    (there is none) and never a fabricated value. The PERSISTED ``mid`` is the un-divided
+    cents value from :func:`_reflection_midpoint_cents` (CR-01); the two are the SAME midpoint
+    in two units, split so persistence and pricing never share one mismatched unit.
+    """
+    return _reflection_midpoint_cents(book) / 100.0
 
 
 def _snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
@@ -787,10 +801,16 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     snapshot = asyncio.run(_fetch())
     event_time = _snapshot_event_time(snapshot)
 
-    # The REAL reflection-derived live-book midpoint — the value the D-08/D-16 loop closes on.
-    midpoint = _reflection_midpoint(snapshot)
-    if not (0.0 <= midpoint <= 1.0):  # the reflected mid must be a valid probability (ASVS V5)
-        raise SystemExit(f"paper: reflected midpoint {midpoint} is not in [0, 1]")
+    # The REAL reflection-derived live-book midpoint, derived ONCE and split into TWO units so
+    # persistence and pricing never share one mismatched unit (CR-01): mid_cents is the
+    # float-valued CENTS midpoint PERSISTED as market_snapshots.mid (unit-consistent with
+    # best_*_bid/avg_price_cents → CLV needs no conversion); mid_unit = mid_cents/100.0 is the
+    # [0,1] PRICING value the Phase-4 D-08/D-16 loop closes on (p_used/EV/Kelly). The pricing
+    # value is UNCHANGED from before — only the persisted unit is corrected.
+    mid_cents = _reflection_midpoint_cents(snapshot)
+    mid_unit = mid_cents / 100.0
+    if not (0.0 <= mid_unit <= 1.0):  # the reflected mid must be a valid probability (ASVS V5)
+        raise SystemExit(f"paper: reflected midpoint {mid_unit} is not in [0, 1]")
 
     blend = _blend_distribution(bind, city, target, lead)
     mu_blend = blend["mu_blend"]
@@ -804,12 +824,13 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
     prob = pricing.bucket_prob(mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi)
 
-    # Feed the REAL midpoint into the SAME money path run_price mocks (D-08/D-16 loop closed):
-    # p_used shrinks the model prob toward the real mid, EV and Kelly size on that shrunk belief.
-    pu = pricing.p_used(prob, midpoint)
-    ev = pricing.bucket_ev(prob, midpoint, midpoint)
+    # Feed the REAL [0,1] mid_unit into the SAME money path run_price mocks (D-08/D-16 loop
+    # closed): p_used shrinks the model prob toward the real mid, EV and Kelly size on that
+    # shrunk belief. mid_unit (NOT mid_cents) feeds pricing — the pricing path is in [0,1].
+    pu = pricing.p_used(prob, mid_unit)
+    ev = pricing.bucket_ev(prob, mid_unit, mid_unit)
     stake = pricing.stake_fraction(
-        pu, midpoint, pricing.exact_fee(1, midpoint),
+        pu, mid_unit, pricing.exact_fee(1, mid_unit),
         sigma_blend, n_train, pool_level, afd_flag, cap=cap,
     )
 
@@ -820,6 +841,16 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     # lands a snapshot whose available_at is inside the window.
     best_yes_bid = max((int(p) for p, _ in snapshot.get("yes") or []), default=None)
     best_no_bid = max((int(p) for p, _ in snapshot.get("no") or []), default=None)
+    # The per-snapshot volume signal is the total RESTING TOP-OF-BOOK liquidity present at this
+    # observed instant: the summed resting size across both bid sides of the orderbook payload
+    # (each level is [price_cents, size]). This is a REAL value off the feed — the orderbook
+    # payload exposes resting SIZE, not a separate traded-volume field — so the CLV closing mid
+    # is genuinely weighted by the book liquidity present at each snapshot (D-09, WR-01), not a
+    # fabricated placeholder. Cast to int (whole contracts).
+    volume = int(
+        sum(int(sz) for _, sz in (snapshot.get("yes") or []))
+        + sum(int(sz) for _, sz in (snapshot.get("no") or []))
+    )
     snapshot_for = event_time.isoformat()
     persisted_snapshot_times: list[str] = []
     rc_snap = persist_snapshot(
@@ -828,7 +859,10 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_for=snapshot_for,
         best_yes_bid=best_yes_bid,
         best_no_bid=best_no_bid,
-        mid=midpoint,
+        # PERSIST CENTS (CR-01): mid_cents is unit-consistent with best_*_bid/avg_price_cents so
+        # CLV subtracts directly. NEVER persist the [0,1] mid_unit here.
+        mid=mid_cents,
+        volume=volume,
         seq=snapshot.get("seq"),
         detail={"yes": snapshot.get("yes"), "no": snapshot.get("no")},
         available_at=event_time,
@@ -855,7 +889,7 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
                 side="yes",
                 price=int(round(fill.avg_price_cents)),
                 count=fill.count,
-                fee=int(round(pricing.exact_fee(fill.count, midpoint) * 100)),
+                fee=int(round(pricing.exact_fee(fill.count, mid_unit) * 100)),
                 is_maker=fill.is_maker,
                 event_time=fill.event_time,
                 bucket_prob=prob,
@@ -873,12 +907,14 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
             }
 
     logger.info(
-        "paper city=%s date=%s ticker=%s midpoint=%.4f p_used=%.4f ev=%+.4f stake=%.4f fill=%s",
-        city, target, ticker, midpoint, pu, ev, stake, fill_summary,
+        "paper city=%s date=%s ticker=%s midpoint=%.4f mid_cents=%.2f p_used=%.4f ev=%+.4f "
+        "stake=%.4f fill=%s",
+        city, target, ticker, mid_unit, mid_cents, pu, ev, stake, fill_summary,
     )
     print(
-        f"paper {city} {target} {ticker}: mid={midpoint:.4f} P={prob:.4f} EV={ev:+.4f} "
-        f"stake={stake:.4f} fill={'none' if fill_summary is None else fill_summary['count']}"
+        f"paper {city} {target} {ticker}: mid={mid_unit:.4f} ({mid_cents:.2f}c) P={prob:.4f} "
+        f"EV={ev:+.4f} stake={stake:.4f} "
+        f"fill={'none' if fill_summary is None else fill_summary['count']}"
     )
 
     return {
@@ -887,7 +923,10 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         "lead": lead,
         "ticker": ticker,
         "models": blend["used_models"],
-        "midpoint": midpoint,
+        # The [0,1] pricing midpoint (UNCHANGED loop-closure value — the spy asserts this == the
+        # value fed into p_used); mid_cents is the persisted-unit twin (CR-01).
+        "midpoint": mid_unit,
+        "mid_cents": mid_cents,
         "p_used": pu,
         "prob": prob,
         "ev": ev,

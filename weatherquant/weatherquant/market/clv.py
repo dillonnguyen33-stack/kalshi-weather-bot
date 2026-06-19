@@ -109,10 +109,15 @@ def closing_window_snapshots(
 
 
 def vol_weighted_mid(closing_snapshots: Sequence[Mapping[str, Any]]) -> float:
-    """Volume-weighted closing mid ``Σ(mid_i·vol_i)/Σvol_i`` in cents (D-09), fail-loud on empty.
+    """Volume-weighted closing mid ``Σ(mid_i·vol_i)/Σvol_i`` in CENTS (D-09), fail-loud on empty.
 
-    Each snapshot must carry a ``mid`` (cents) and a ``volume``. An empty window or a zero
-    total volume RAISES (no fillable closing data → no CLV; never a fabricated mid/silent 0).
+    Each snapshot must carry a ``mid`` in CENTS (the float-valued half-cent midpoint persisted
+    by ``run_paper`` — unit-consistent with ``best_yes_bid``/``best_no_bid``/``avg_price_cents``,
+    NOT [0,1] dollars, CR-01) and a real ``volume`` (the per-snapshot resting top-of-book
+    liquidity in whole contracts persisted via the audited writer, WR-01). The returned mid is
+    therefore in CENTS, so ``clv_cents`` subtracts ``avg_price_cents`` directly with no
+    conversion. An empty window or a zero total volume RAISES (no fillable closing data → no
+    CLV; never a fabricated mid/silent 0).
 
     Raises:
         ValueError: if ``closing_snapshots`` is empty or the total volume is non-positive.
@@ -145,11 +150,13 @@ def clv_cents(
 ) -> float:
     """Per-trade CLV in cents: a fill better than the close is POSITIVE (D-09).
 
-    ``edge = closing_mid - fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` (positive
-    when we paid LESS than the volume-weighted closing mid — a good fill) and ``-edge`` for a
-    ``"sell"`` (the sign flips: selling ABOVE the close is the good fill). The closing mid is
-    derived from ``closing_snapshots`` via :func:`vol_weighted_mid` (which fails loud on an
-    empty/zero-volume window — no fabricated CLV).
+    Both operands are CENTS: the closing mid (``vol_weighted_mid`` over snapshots whose ``mid``
+    is float-valued cents, CR-01) and the fill's ``avg_price_cents``. ``edge = closing_mid -
+    fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` (positive when we paid LESS than the
+    volume-weighted closing mid — a good fill) and ``-edge`` for a ``"sell"`` (the sign flips:
+    selling ABOVE the close is the good fill). No unit conversion is needed now that the
+    persisted ``mid`` is cents. The closing mid is derived from ``closing_snapshots`` via
+    :func:`vol_weighted_mid` (which fails loud on an empty/zero-volume window — no fabricated CLV).
 
     Args:
         fill: the executed fill (carries the size-weighted ``avg_price_cents``).

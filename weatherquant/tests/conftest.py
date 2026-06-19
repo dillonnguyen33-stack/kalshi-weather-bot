@@ -377,12 +377,17 @@ def scripted_book() -> dict:
 def closing_window_snapshots() -> list[dict]:
     """A golden closing-window snapshot series with a KNOWN volume-weighted mid (PAP-04).
 
-    Each row is ``market_snapshots``-shaped: ``mid`` (cents) + ``volume`` over the closing
-    window. The volume-weighted closing mid is
+    Each row is ``market_snapshots``-shaped and MIRRORS THE PRODUCTION PERSISTED ROW SHAPE
+    (05-06, CR-01/WR-01): ``mid`` in float-valued CENTS (unit-consistent with the persisted
+    best_*_bid/avg_price_cents) + an integer ``volume`` (the real per-snapshot resting
+    top-of-book liquidity the audited writer now persists) — NO LONGER a contradictory
+    dollars-vs-cents convention versus the persist path. The volume-weighted closing mid is
     ``(50*100 + 52*300 + 51*100) / (100+300+100) = (5000+15600+5100)/500 = 51.4¢``.
     A fill at 48¢ (better than the 51.4¢ closing mid, for a yes BUY) yields POSITIVE CLV;
     a fill at 55¢ yields NEGATIVE CLV. The window itself is anchored on
     ``time.settlement_window(...).end_utc`` (the half-open EXCLUSIVE end), never re-derived.
+    The end-to-end persist→CLV path on these same units is exercised by
+    ``tests/test_clv_integration.py`` (the production-shaped integration test).
     """
     return [
         {"snapshot_for": "2026-06-18T19:55Z", "mid": 50.0, "volume": 100},
