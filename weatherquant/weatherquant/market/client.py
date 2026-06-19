@@ -339,6 +339,14 @@ async def run_feed(
                         )
                         break
                     apply(book, snapshot)
+                    # Surface the freshly re-anchored book to the sink BEFORE continuing —
+                    # otherwise every REST-resync book state (precisely the states most likely
+                    # to fall inside a CLV closing window after a disruption) is silently
+                    # dropped from persistence (WR-02 / PAP-04 cadence sufficiency).
+                    if on_book is not None:
+                        result = on_book(ticker, book)
+                        if isinstance(result, Awaitable):
+                            await result
                     continue
                 if on_book is not None:
                     result = on_book(ticker, book)
