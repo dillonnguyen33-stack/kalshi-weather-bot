@@ -697,18 +697,6 @@ def _reflection_midpoint_cents(book: object) -> float:
             "cannot derive a two-sided midpoint (no fabricated mid)."
         )
     best_yes_ask = yes_asks[0][0]  # cheapest reflected yes ask = 100 - best_no_bid
-    # Reject a crossed/locked reflected book (best bid >= best ask) at the money-path edge
-    # (CR-01). A crossed book lets the reflected ask "prices" violate cheapest-first, so the
-    # taker sweep would credit an average that corresponds to no walk a real taker could
-    # execute; the downstream 1..99c rounded-band guard can still pass on a crossed book while
-    # the credited price is wrong. Fail loud rather than feed a fabricated mid/fill into the
-    # ledger and CLV (absence/inconsistency is not a tradeable two-sided market).
-    if best_yes_bid >= best_yes_ask:
-        raise SystemExit(
-            f"paper: reflected book is crossed/locked (best_yes_bid={best_yes_bid}c >= "
-            f"best_yes_ask={best_yes_ask}c) — refusing to derive a midpoint or credit a fill "
-            "from a non-tradeable book (CR-01)."
-        )
     return (best_yes_bid + best_yes_ask) / 2.0
 
 
