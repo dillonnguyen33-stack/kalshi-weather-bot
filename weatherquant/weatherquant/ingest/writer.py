@@ -9,7 +9,7 @@ private helper so there is exactly ONE place that:
 2. otherwise executes a SQLAlchemy Core ``table.insert().values(...)`` (Core only, no ORM)
    and raises ``RuntimeError`` unless ``result.rowcount == 1`` — the preserve_rowcount
    contract (D-11). An explicit raise (not a bare ``assert``) so the guard survives
-   ``python -O`` (WR-06).
+   ``python -O`` (which strips asserts).
 
 There is NO UPDATE / upsert / ON CONFLICT path anywhere here: the append-only trigger
 (:mod:`weatherquant.db.ddl`) would raise, so a correction is a fresh INSERT with a later
@@ -34,11 +34,11 @@ from weatherquant.ingest.idempotency import row_exists
 
 
 class WriteIntegrityError(CorrectnessError, RuntimeError):
-    """The single-row insert integrity contract was violated (D-11, WR-06).
+    """The single-row insert integrity contract was violated (D-11).
 
     Raised when the audited insert reports ``rowcount != 1``. A :class:`CorrectnessError`
     (and still a ``RuntimeError`` for back-compat) so the orchestrator's graceful-degradation
-    handler (WR-05) lets this CORRECTNESS ALARM propagate loudly via the single
+    handler lets this CORRECTNESS ALARM propagate loudly via the single
     ``except CorrectnessError`` re-raise — a row that should have landed silently vanishing is a
     real bug, not a backfillable gap.
     """
@@ -56,7 +56,7 @@ def _insert_row(
     The ONE audited insert path (D-10/D-11). Calls ``row_exists`` over the natural key +
     content FIRST; if the identical row is already present, returns 0 (no-op skip) without
     touching the table. Otherwise executes a Core insert and raises ``RuntimeError`` unless
-    ``rowcount == 1`` (WR-06: an explicit raise, not a stripped-under-``-O`` assert).
+    ``rowcount == 1`` (an explicit raise, not a stripped-under-``-O`` assert).
     Never issues an UPDATE/upsert — the append-only trigger would raise.
     """
 
@@ -74,7 +74,7 @@ def _insert_row(
         # the implicit RETURNING id on the Identity() PK (D-11 contract). This integrity
         # guard is an explicit raise, NOT a bare assert: `python -O` / PYTHONOPTIMIZE strips
         # asserts, which would silently disable the only check that the single audited insert
-        # actually landed a row (WR-06).
+        # actually landed a row.
         if rowcount != 1:
             raise WriteIntegrityError(
                 f"expected rowcount==1 inserting into {table.name}, got {rowcount}"
@@ -189,9 +189,9 @@ def insert_market_snapshot(
     load-bearing top-of-book fields (``best_yes_bid``/``best_no_bid`` in integer cents, the
     only side Kalshi quotes — the ask is reflected as ``100 - opposite bid`` in
     ``market/reflect.py``), the derived ``mid`` (the real market midpoint in FLOAT-VALUED
-    CENTS — unit-consistent with ``best_*_bid``/``avg_price_cents``, CR-01), ``volume`` (the
-    per-snapshot book-liquidity volume signal in WHOLE CONTRACTS — the summed resting
-    top-of-book size off the live orderbook payload; weights the CLV closing mid, WR-01), the
+    CENTS so it is unit-consistent with ``best_*_bid``/``avg_price_cents`` and CLV needs no
+    conversion), ``volume`` (the per-snapshot book-liquidity signal in WHOLE CONTRACTS — the
+    top-of-book size SUPPORTING the persisted mid, weighting the CLV closing mid), the
     WS ``seq``, and the raw book payload ``detail`` (JSONB, mirroring ``observations.detail``).
     Omitting ``volume`` persists NULL (back-compat). Re-inserting an identical snapshot is a no-op
     (returns 0); a changed payload appends a fresh row (returns 1). NO UPDATE/upsert — the

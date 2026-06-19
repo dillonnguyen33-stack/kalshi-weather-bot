@@ -5,8 +5,8 @@ delegates to :func:`weatherquant.ingest.writer.insert_market_snapshot` /
 :func:`~weatherquant.ingest.writer.insert_fill` — the single audited append-only path
 (skip-before-insert idempotency, the ``rowcount == 1`` integrity raise, ``available_at`` a
 caller param, NO UPDATE/upsert; D-10/D-11/D-13). Every read delegates to
-:func:`weatherquant.db.queries.latest` with the FULL natural key (an under-specified key is
-rejected there, the WR-02 trap).
+:func:`weatherquant.db.queries.latest` with the FULL natural key — an under-specified key is
+rejected there, so a partial-key read can never silently return the wrong row.
 
 The point of the adapter is a small, market-flavoured surface (``persist_snapshot`` /
 ``persist_fill`` / ``latest_snapshots``) the ``run_paper`` CLI orchestrates, so the I/O edge
@@ -45,9 +45,10 @@ def persist_snapshot(
     """Persist one market snapshot via the audited writer (no Core insert here, D-13).
 
     Delegates verbatim to :func:`weatherquant.ingest.writer.insert_market_snapshot`.
-    ``mid`` is FLOAT-VALUED CENTS (CR-01) and ``volume`` is the per-snapshot book-liquidity
-    signal in whole contracts (WR-01) — both threaded straight through. ``available_at`` is
-    the REAL WS event time (D-08) — passed straight through, never ``now()``.
+    ``mid`` is FLOAT-VALUED CENTS (unit-consistent with ``best_*_bid``/``avg_price_cents`` so
+    CLV needs no conversion) and ``volume`` is the per-snapshot book-liquidity signal in whole
+    contracts — both threaded straight through. ``available_at`` is the REAL WS event time
+    (D-08) — passed straight through, never ``now()``.
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
@@ -114,7 +115,8 @@ def latest_snapshots(bind: Bind, ticker: str) -> list[RowMapping]:
 
     Reads through :func:`weatherquant.db.queries.latest` with the table's FULL canonical
     natural key ``(ticker, snapshot_for)`` (resolved from ``NATURAL_KEYS``; an
-    under-specified key would be rejected — WR-02). The ``where={"ticker": ticker}`` scope
+    under-specified key would be rejected, so the read cannot match the wrong row). The
+    ``where={"ticker": ticker}`` scope
     filter is applied as a bound parameter before the ``DISTINCT ON``, so this returns one
     row per distinct ``snapshot_for`` for the ticker, each the newest by ``available_at``.
 

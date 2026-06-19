@@ -395,17 +395,17 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
             ]
 
             count = 0
-            # Each month stratum is fit pooled toward its season parent (CR-01 / D-08): the
-            # n<N_MIN parent fallback and the shrinkage blend now fire on the production path,
-            # and a sparse-season month is skipped rather than persisted as a degenerate fit.
+            # Each month stratum is fit pooled toward its season parent: the n<N_MIN parent
+            # fallback and the shrinkage blend fire on the production path, and a sparse-season
+            # month is skipped rather than persisted as a degenerate fit.
             for month_samples, target_dates, fit in strata.fit_pooled_month_strata(
                 pairs, city=city, model=model, lead=lead
             ):
                 m, s2, y = month_samples.m, month_samples.s2, month_samples.y
 
                 # crps_train must describe the PERSISTED (pooled) params: their in-sample mean
-                # CRPS over the month's own rows (WR-01). Taking it from the OOS train-slice fit
-                # instead would store a metric for a different fit on ~0.7·N different samples.
+                # CRPS over the month's own rows. Taking it from the OOS train-slice fit instead
+                # would store a metric for a different fit on ~0.7·N different samples.
                 mu_is, sig_is = link.predict(
                     (fit.a, fit.b, fit.c, fit.d, fit.sigma_floor), m, s2
                 )
@@ -417,7 +417,7 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
                 # leave the metrics NaN (absence = absence) rather than persist a leaky number.
                 # The persisted params' data cutoff is the latest target date — independent of
                 # the diagnostic OOS split.
-                # WR-05: these two come from an UNPOOLED re-fit on the OOS train slice, so on a
+                # These two come from an UNPOOLED re-fit on the OOS train slice, so on a
                 # pooled/parent-fallback row they describe a different fit than crps_train above —
                 # a generic "does EMOS generalize?" diagnostic, not the persisted fit's OOS score.
                 crps_oos = crps_baseline_oos = math.nan
@@ -465,9 +465,10 @@ def _blend_distribution(
     aggregates members to ``(mean_f, var_f)`` at the ONE K→°F seam, reconstructs ``(μ_i, σ_i)``
     via ``link.predict``, computes accuracy weights from ``crps_oos`` and Vincentizes to
     ``(μ_blend, σ_blend)``, reads the AFD disagreement flag, and resolves the conservative
-    (smallest-sufficiency-ramp) representative ``n_train``/``pool_level`` (WR-05). Fails loud on
-    a NULL ``n_train`` (WR-02) and on no usable model. Pure money-path math stays in
-    ``weatherquant.price``; this is the shared DB-read edge.
+    (smallest-sufficiency-ramp) representative ``n_train``/``pool_level`` — the conservative
+    pick keeps the sized stake honest when strata disagree on sufficiency. Fails loud on a NULL
+    ``n_train`` and on no usable model. Pure money-path math stays in ``weatherquant.price``;
+    this is the shared DB-read edge.
 
     Returns a dict with ``used_models``/``mu_blend``/``sigma_blend``/``afd_flag``/``n_train``/
     ``pool_level``/``cap`` — everything the bucket/EV/Kelly leg needs, market-midpoint-agnostic.
@@ -633,9 +634,9 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
         prob = pricing.bucket_prob(
             mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi
         )
-        # EV and the sized stake MUST share one decision basis (WR-01). bucket_ev shrinks the
-        # model prob toward the market mid internally (D-08, p_used); size Kelly on that SAME
-        # shrunk belief so the printed edge and the stake agree in sign near the boundary.
+        # EV and the sized stake MUST share one decision basis. bucket_ev shrinks the model prob
+        # toward the market mid internally (D-08, p_used); size Kelly on that SAME shrunk belief
+        # so the printed edge and the stake agree in sign near the boundary.
         pu = pricing.p_used(prob, market_mid)
         ev = pricing.bucket_ev(prob, market_mid, market_mid)
         stake = pricing.stake_fraction(
@@ -673,10 +674,10 @@ def _reflection_midpoint_cents(book: object) -> float:
     :func:`weatherquant.market.reflect.yes_ask_levels` (best/cheapest first). The midpoint is
     ``(best_yes_bid + best_yes_ask) / 2`` in CENTS (the half-cent midpoint, e.g. 50.5 for a
     yes bid 50 / reflected yes ask 51). This is the value PERSISTED as ``market_snapshots.mid``
-    (CR-01) — unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and the
-    fill's ``avg_price_cents``, so ``clv.clv_cents`` subtracts with NO conversion. The [0,1]
-    The [0,1] pricing value is this midpoint divided by 100 — ``run_paper`` computes it
-    inline as ``mid_unit = mid_cents / 100.0`` (3 chars of clear code, no wrapper helper).
+    — unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and the fill's
+    ``avg_price_cents``, so ``clv.clv_cents`` subtracts with NO conversion. The [0,1] pricing
+    value is this midpoint divided by 100 — ``run_paper`` computes it inline as
+    ``mid_unit = mid_cents / 100.0`` (3 chars of clear code, no wrapper helper).
 
     Fails loud (raise) when either side of the book is empty — no two-sided market → no
     derivable midpoint (absence = absence, never a fabricated mid).
@@ -785,12 +786,11 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     snapshot = asyncio.run(_fetch())
     event_time = _snapshot_event_time(snapshot)
 
-    # The REAL reflection-derived live-book midpoint, derived ONCE and split into TWO units so
-    # persistence and pricing never share one mismatched unit (CR-01): mid_cents is the
-    # float-valued CENTS midpoint PERSISTED as market_snapshots.mid (unit-consistent with
-    # best_*_bid/avg_price_cents → CLV needs no conversion); mid_unit = mid_cents/100.0 is the
-    # [0,1] PRICING value the Phase-4 D-08/D-16 loop closes on (p_used/EV/Kelly). The pricing
-    # value is UNCHANGED from before — only the persisted unit is corrected.
+    # The REAL reflection-derived live-book midpoint is kept in TWO units because persistence
+    # and pricing need different ones: mid_cents (float-valued CENTS) is PERSISTED as
+    # market_snapshots.mid so it is unit-consistent with best_*_bid/avg_price_cents and CLV
+    # subtracts with no conversion; mid_unit = mid_cents/100.0 is the [0,1] value pricing needs
+    # because p_used/EV/Kelly operate on probabilities (it closes the Phase-4 D-08/D-16 loop).
     mid_cents = _reflection_midpoint_cents(snapshot)
     mid_unit = mid_cents / 100.0
     if not (0.0 <= mid_unit <= 1.0):  # the reflected mid must be a valid probability (ASVS V5)
@@ -861,8 +861,8 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         snapshot_for=snapshot_for,
         best_yes_bid=best_yes_bid,
         best_no_bid=best_no_bid,
-        # PERSIST CENTS (CR-01): mid_cents is unit-consistent with best_*_bid/avg_price_cents so
-        # CLV subtracts directly. NEVER persist the [0,1] mid_unit here.
+        # Persist CENTS: mid_cents is unit-consistent with best_*_bid/avg_price_cents so CLV
+        # subtracts directly. NEVER persist the [0,1] mid_unit here.
         mid=mid_cents,
         volume=volume,
         seq=snapshot.get("seq"),
@@ -925,8 +925,8 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         "lead": lead,
         "ticker": ticker,
         "models": blend["used_models"],
-        # The [0,1] pricing midpoint (UNCHANGED loop-closure value — the spy asserts this == the
-        # value fed into p_used); mid_cents is the persisted-unit twin (CR-01).
+        # The [0,1] pricing midpoint fed into p_used/EV/Kelly; mid_cents is its persisted-unit
+        # twin (FLOAT-VALUED CENTS, the unit market_snapshots.mid stores).
         "midpoint": mid_unit,
         "mid_cents": mid_cents,
         "p_used": pu,

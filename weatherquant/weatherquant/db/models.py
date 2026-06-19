@@ -182,23 +182,23 @@ calibration_params = sa.Table(
 # midpoint fed into the Phase-4 EV/Kelly path, closing the D-08/D-16 loop); ``seq`` is the WS
 # orderbook_delta sequence number (BigInteger — a gap triggers a resnapshot, PAP-01); and
 # ``detail`` (JSONB) carries the raw book payload, mirroring ``observations.detail``. The
-# natural key (ticker, snapshot_for) is UNCHANGED so ix_market_snapshots_latest is intact.
-# Types mirror the 0004/0005 migrations EXACTLY so metadata.create_all == the migrated schema.
+# natural key is (ticker, snapshot_for) so ix_market_snapshots_latest keys the latest snapshot.
+# Column types must equal the applied migration so metadata.create_all reproduces the migrated
+# schema (the migration test, not this comment, enforces that parity).
 #
-# MONEY-UNIT LANDMARK (05-06, CR-01): ``mid`` is FLOAT-VALUED CENTS — the half-cent bid/ask
-# midpoint, unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and with the
-# fill's ``avg_price_cents`` (cents). It is NOT [0,1] dollars. ``run_paper`` persists the
-# un-divided ``mid_cents`` here and keeps the [0,1] ``mid_unit`` only for the p_used/EV/Kelly
-# pricing math; ``clv.vol_weighted_mid``/``clv_cents`` subtract ``avg_price_cents`` (cents)
-# directly, with no conversion. ``mid`` MUST stay ``sa.Float`` (NOT Integer) — rounding to an
-# int would inject +/-0.5c bias into every derived CLV. ``volume`` (05-06 WR-01, refined 05-08
-# CORR-MED-3) is the per-snapshot book-liquidity signal in WHOLE CONTRACTS (Integer) consumed by
-# ``vol_weighted_mid`` to weight the closing mid; it is the top-of-book size SUPPORTING the
+# MONEY-UNIT LANDMARK: ``mid`` is FLOAT-VALUED CENTS — the half-cent bid/ask midpoint,
+# unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and with the fill's
+# ``avg_price_cents`` (cents). It is NOT [0,1] dollars. Keeping one unit lets
+# ``clv.vol_weighted_mid``/``clv_cents`` subtract ``avg_price_cents`` directly with no
+# conversion (``run_paper`` persists the un-divided ``mid_cents`` here and keeps the [0,1]
+# ``mid_unit`` only for the p_used/EV/Kelly pricing math). ``mid`` MUST stay ``sa.Float`` (NOT
+# Integer) — rounding to an int would inject +/-0.5c bias into every derived CLV. ``volume`` is
+# the per-snapshot book-liquidity signal in WHOLE CONTRACTS (Integer) consumed by
+# ``vol_weighted_mid`` to weight the closing mid: it is the top-of-book size SUPPORTING the
 # persisted yes mid — ``min(best_yes_bid_size, best_no_bid_size)``, the liquidity BEHIND THIS
-# mid (the best-no-bid size IS the reflected best-yes-ask size, reflect.py). It is NOT the
-# two-sided UNION depth (which would over-weight an opposite-side-deep, thinly-supported mid),
-# narrowing 05-06 MD-01's summed depth to the size that genuinely backs the priced mid while
-# remaining a REAL feed signal (not a fixture).
+# mid (the best-no-bid size IS the reflected best-yes-ask size, reflect.py). It is the
+# supporting size, NOT the two-sided UNION depth, which would over-weight an opposite-side-deep
+# but thinly-supported mid while still being a REAL feed signal (not a fixture).
 market_snapshots = sa.Table(
     "market_snapshots",
     metadata,
@@ -208,11 +208,11 @@ market_snapshots = sa.Table(
     sa.Column("best_yes_bid", sa.Integer, nullable=True),
     sa.Column("best_no_bid", sa.Integer, nullable=True),
     # mid is FLOAT-VALUED CENTS (the half-cent midpoint, unit-consistent with best_*_bid and
-    # avg_price_cents) — NOT [0,1] dollars; stays Float so no +/-0.5c rounding bias (CR-01).
+    # avg_price_cents) — NOT [0,1] dollars; stays Float so no +/-0.5c rounding bias.
     sa.Column("mid", sa.Float, nullable=True),
     # volume: per-snapshot book-liquidity signal in WHOLE CONTRACTS — the top-of-book size
     # SUPPORTING the persisted yes mid (min(best_yes_bid_size, best_no_bid_size)), the liquidity
-    # behind THIS mid; weights the CLV closing mid (WR-01, CORR-MED-3). Type mirrors 0005.
+    # behind THIS mid; weights the CLV closing mid.
     sa.Column("volume", sa.Integer, nullable=True),
     sa.Column("seq", sa.BigInteger, nullable=True),
     sa.Column("detail", postgresql.JSONB, nullable=True),
