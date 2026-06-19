@@ -56,6 +56,15 @@ _REST_METHOD = "GET"
 # Dollars → cents: Kalshi REST returns price/size as dollar strings; converge to integer cents.
 _DOLLARS_TO_CENTS = 100
 
+# Max tolerated skew between the server ``Date`` header and the local fetch clock (WR-01). The
+# header is untrusted server/network input that becomes the persisted ``available_at`` (the D-08
+# no-look-ahead anchor) and the axis ``clv.closing_window_snapshots`` filters on; a skewed or
+# hostile ``Date`` (hours off, or in the future) would silently shift the snapshot into/out of
+# the CLV closing window or back-date the anchor. Beyond this bound we distrust the header and
+# fall back to the local clock. Five minutes comfortably covers legitimate clock drift /
+# response latency while rejecting an integrity-breaking skew.
+MAX_CLOCK_SKEW_S = 300.0
+
 # Type aliases for the injectable seams (so tests can supply mocks with no live network).
 SignerFn = Callable[[str, str], Mapping[str, str]]
 OnBookFn = Callable[[str, OrderBook], Any]
@@ -111,6 +120,7 @@ def _observed_instant(response: Any) -> datetime:
     ``datetime.now(timezone.utc)`` — the single sanctioned ``now()`` in this module — captured
     at the fetch site.
     """
+    now = datetime.now(timezone.utc)
     raw_date = None
     headers = getattr(response, "headers", None)
     if headers is not None:
@@ -122,8 +132,20 @@ def _observed_instant(response: Any) -> datetime:
             parsed = None
         if parsed is not None:
             # A naive RFC-1123 date is GMT/UTC; normalize tz-aware results to UTC.
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc)
+            parsed = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+            # Bound the untrusted header against the local fetch clock (WR-01): a header skewed
+            # beyond MAX_CLOCK_SKEW_S (or in the future) would silently shift the snapshot into/
+            # out of the CLV closing window or back-date the no-look-ahead anchor (D-08). On an
+            # implausible skew, distrust the header and fall back to the local clock.
+            if abs((parsed - now).total_seconds()) <= MAX_CLOCK_SKEW_S:
+                return parsed
+            logger.warning(
+                "[market error] server Date header %r skewed > %ss from local clock — "
+                "falling back to local now() for the observed instant (WR-01)",
+                raw_date,
+                MAX_CLOCK_SKEW_S,
+            )
+    return now
 
 
 def _require_fp(payload: Mapping[str, Any]) -> Mapping[str, Any]:
