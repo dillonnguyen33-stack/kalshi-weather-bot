@@ -113,6 +113,19 @@ def taker_sweep(
     if want_count <= 0:
         raise ValueError(f"want_count must be positive; got {want_count}")
     _validate_levels(ask_levels)
+    # Enforce the cheapest-first invariant the sweep RELIES ON but does not otherwise check
+    # (CR-01). The credited price is the size-weighted average of whatever order the levels are
+    # walked in; a mis-ordered or crossed/locked reflected book would credit liquidity taken at
+    # the wrong (more expensive) prices and fabricate a worse-than-achievable average that
+    # corresponds to no walk a real taker could execute. Fail loud rather than silently mis-price
+    # the credited Gate-1 fill.
+    prices = [price for price, _ in ask_levels]
+    if prices != sorted(prices):
+        raise ValueError(
+            f"ask_levels must be cheapest-(best-)price-first; got prices {prices} — a "
+            "crossed/mis-ordered book would credit a fabricated, worse-than-achievable fill "
+            "price (D-05/D-07)."
+        )
 
     filled = 0
     cost = 0
