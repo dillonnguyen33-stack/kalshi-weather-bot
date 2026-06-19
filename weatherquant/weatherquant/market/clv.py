@@ -69,8 +69,12 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
             return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     raw = snapshot.get("snapshot_for")
     if isinstance(raw, str):
+        # Strip an optional ``#<seq>`` disambiguation suffix (WR-03): run_paper appends the WS seq
+        # to snapshot_for so two distinct same-second book states stay distinct natural-key rows;
+        # the suffix is not part of the ISO instant, so drop it before parsing.
+        iso = raw.split("#", 1)[0]
         # Accept a trailing 'Z' (the fixture shape) as UTC.
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
         return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
     raise ValueError(
         f"snapshot carries no usable event time (event_time/available_at/snapshot_for): "

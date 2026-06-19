@@ -877,7 +877,19 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
             "the persisted mid (no fabricated volume)."
         )
     volume = int(min(int(best_yes_bid_size), int(best_no_bid_size)))
-    snapshot_for = event_time.isoformat()
+    # The market_snapshots natural key is (ticker, snapshot_for). RFC-1123 Date headers carry only
+    # SECOND resolution (WR-01's preferred event_time source), so two distinct book states fetched
+    # in the same wall-clock second would share an ISO-only snapshot_for; queries.latest's
+    # DISTINCT ON (ticker, snapshot_for) would then silently discard one of the two from the
+    # closing-window mid (WR-03). Append the WS seq (the monotonic per-book sequence that DOES
+    # differ between distinct states) so two same-second states remain distinct natural-key rows
+    # the closing window can both weight. The closing-window axis for persisted rows is the
+    # event_time/available_at datetime (preferred by clv.snapshot_event_time), which the seq
+    # suffix does not touch; the parser strips the suffix before its ISO fallback.
+    seq = snapshot.get("seq")
+    snapshot_for = (
+        f"{event_time.isoformat()}#{int(seq)}" if seq is not None else event_time.isoformat()
+    )
     persisted_snapshot_times: list[str] = []
     rc_snap = persist_snapshot(
         bind,
