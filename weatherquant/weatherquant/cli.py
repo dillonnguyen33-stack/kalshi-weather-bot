@@ -747,9 +747,13 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
        side), held to settlement; a sub-minimum or non-positive-EV intent simulates NO fill;
     6. on a positive intent, simulates a (possibly partial) fill via ``fills.taker_sweep``
        against the reflected asks;
-    7. PERSISTS the market snapshot (debounced cadence ``PAPER_SNAPSHOT_CADENCE_SECONDS``,
-       dense enough that the CLV closing window holds >= 1 snapshot, PAP-04) and the fill via
-       ``market.persist`` — both stamped with the REAL WS event time (D-08);
+    7. PERSISTS exactly ONE market snapshot per invocation and (on a positive intent) the fill
+       via ``market.persist`` — both stamped with the REAL WS event time (D-08). NOTE: this
+       command is single-shot; there is NO in-process debounced cadence loop here. Whether the
+       CLV closing window holds >= 1 persisted snapshot (PAP-04 cadence sufficiency) is the
+       OPERATOR's per-invocation responsibility — run ``paper`` often enough during the closing
+       window. ``PAPER_SNAPSHOT_CADENCE_SECONDS`` is the design-time TARGET cadence a future
+       feed-driven loop must honour, not a guarantee this single-shot command provides;
     8. places NO real order. Returns a small result dict (``midpoint``/``p_used``/``ev``/
        ``stake``/fill summary/persisted-snapshot event times).
 
@@ -759,12 +763,20 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     from weatherquant import price as pricing
     from weatherquant.market import fills, reflect
 
-    # The debounced snapshot cadence MUST stay strictly finer than the CLV closing window so the
-    # window always holds >= 1 persisted snapshot (PAP-04 cadence sufficiency, T-05-20).
-    assert PAPER_SNAPSHOT_CADENCE_SECONDS < clv.CLV_WINDOW_MINUTES * 60, (
-        "PAPER_SNAPSHOT_CADENCE_SECONDS must be strictly finer than the CLV closing window "
-        "(clv.CLV_WINDOW_MINUTES) so the window is never silently sparse (PAP-04)."
-    )
+    # Design-time invariant on the two cadence constants (PAP-04 cadence sufficiency, T-05-20):
+    # the TARGET snapshot cadence must stay strictly finer than the CLV closing window so a
+    # future feed-driven loop honouring PAPER_SNAPSHOT_CADENCE_SECONDS keeps the window dense.
+    # This single-shot command persists ONE snapshot per invocation and runs no cadence loop, so
+    # actual window density is the operator's per-invocation responsibility (WR-02) — but the
+    # constant relationship still must hold for the loop this targets. Raise (not assert) so the
+    # check survives `python -O`/PYTHONOPTIMIZE, mirroring the writer's documented discipline
+    # (IN-05).
+    if PAPER_SNAPSHOT_CADENCE_SECONDS >= clv.CLV_WINDOW_MINUTES * 60:
+        raise RuntimeError(
+            "PAPER_SNAPSHOT_CADENCE_SECONDS must be strictly finer than the CLV closing window "
+            "(clv.CLV_WINDOW_MINUTES * 60) so a feed-driven cadence loop never leaves the window "
+            "silently sparse (PAP-04, T-05-20)."
+        )
 
     city = args.city
     target = args.date
@@ -830,11 +842,11 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         sigma_blend, n_train, pool_level, afd_flag, cap=cap,
     )
 
-    # Persist the snapshot at the debounced cadence (here: once per run_paper invocation, which
-    # is by construction within one cadence window), stamped with the REAL WS event time (D-08)
-    # and carrying the load-bearing book fields + raw book JSONB (D-03). Persisting on every
-    # invocation keeps the CLV closing window dense (PAP-04): a book change inside the window
-    # lands a snapshot whose available_at is inside the window.
+    # Persist exactly ONE snapshot for this invocation (this command is single-shot; there is no
+    # in-process cadence loop, WR-02), stamped with the REAL WS event time (D-08) and carrying the
+    # load-bearing book fields + raw book JSONB (D-03). CLV closing-window density (PAP-04) is the
+    # operator's per-invocation responsibility: each run lands a snapshot whose available_at is
+    # the real observed instant, so running `paper` during the closing window keeps it covered.
     yes_levels = snapshot.get("yes") or []
     no_levels = snapshot.get("no") or []
     # best_*_bid are the PRICE columns: the max (best) bid price on each side (cents). The yes ASK
