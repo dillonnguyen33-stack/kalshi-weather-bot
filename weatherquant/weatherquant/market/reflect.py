@@ -51,6 +51,19 @@ def _reflect(levels: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     return [(_COMPLEMENT - price, count) for price, count in ordered]
 
 
+def best_bid(book: object, side: str) -> int | None:
+    """Return the best (highest) bid PRICE in cents for ``side`` (``"yes"``/``"no"``), or ``None``.
+
+    The single top-of-book BID accessor, living alongside the ask reflection so bid and ask
+    top-of-book are derived in ONE place (IN-03). Routes through the same ``_levels`` book
+    accessor as the reflection (the dict-or-attribute shape), so a caller never re-derives the
+    ``book["yes"] if isinstance(...)`` access or the ``max(prices)`` inline. An empty side
+    returns ``None`` (absence is absence — no fabricated price).
+    """
+    prices = [price for price, _ in _levels(book, side)]
+    return max(prices) if prices else None
+
+
 def yes_ask_levels(book: object) -> list[tuple[int, int]]:
     """Return the synthesized YES ask levels reflected from the book's ``no`` bids.
 
@@ -74,4 +87,4 @@ def no_ask_levels(book: object) -> list[tuple[int, int]]:
     return _reflect(_levels(book, "yes"))
 
 
-__all__ = ["yes_ask_levels", "no_ask_levels"]
+__all__ = ["best_bid", "yes_ask_levels", "no_ask_levels"]

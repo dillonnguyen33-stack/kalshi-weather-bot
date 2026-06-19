@@ -684,18 +684,18 @@ def _reflection_midpoint_cents(book: object) -> float:
     """
     from weatherquant.market import reflect
 
-    # The yes BID side comes straight off the book; the yes ASK is reflected from the no bids
-    # via the ONE reflection seam (yes_ask = 100 - no_bid). Never read a native ask (there is
-    # none) and never re-derive the 100 - price reflection outside reflect.py.
-    yes_raw = book["yes"] if isinstance(book, Mapping) else getattr(book, "yes")
-    yes_bid_prices = [int(price) for price, _ in yes_raw]
+    # The yes BID top-of-book comes off the book via the ONE bid accessor; the yes ASK is
+    # reflected from the no bids via the ONE reflection seam (yes_ask = 100 - no_bid). Both
+    # top-of-book derivations live in reflect.py — never read a native ask (there is none), never
+    # re-derive the 100 - price reflection, and never re-implement the book accessor / max(prices)
+    # inline (IN-03).
+    best_yes_bid = reflect.best_bid(book, "yes")
     yes_asks = reflect.yes_ask_levels(book)  # reflected from the no bids, cheapest first
-    if not yes_bid_prices or not yes_asks:
+    if best_yes_bid is None or not yes_asks:
         raise SystemExit(
             "paper: book is one-sided (missing a yes bid or a reflected yes ask) — "
             "cannot derive a two-sided midpoint (no fabricated mid)."
         )
-    best_yes_bid = max(yes_bid_prices)
     best_yes_ask = yes_asks[0][0]  # cheapest reflected yes ask = 100 - best_no_bid
     # Reject a crossed/locked reflected book (best bid >= best ask) at the money-path edge
     # (CR-01). A crossed book lets the reflected ask "prices" violate cheapest-first, so the
