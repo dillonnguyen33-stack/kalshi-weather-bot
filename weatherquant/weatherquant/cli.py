@@ -237,9 +237,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Mirrors `price` (same _city_type ASVS-V5 validation, --date/--lead/--ticker) but the KEY
     # change is that run_paper supplies the REAL reflection-derived live-book midpoint (vs
     # run_price's mocked --market-mid) and feeds it into price.p_used/bucket_ev/stake_fraction
-    # — closing the Phase-4 D-08/D-16 loop. It places NO real order (paper only,
-    # assert_paper_mode) and persists the snapshot + (possibly partial) fill via the audited
-    # market.persist path, stamped with the real WS event time.
+    # — closing the Phase-4 D-08/D-16 loop. It places NO real order (paper only — run_paper runs
+    # only when execution_mode is NOT 'live') and persists the snapshot + (possibly partial) fill
+    # via the audited market.persist path, stamped with the real WS event time.
     paper = sub.add_parser(
         "paper",
         help="Paper-trade a (city, date): feed the REAL live-book midpoint into the "
@@ -675,7 +675,8 @@ def _reflection_midpoint_cents(book: object) -> float:
     yes bid 50 / reflected yes ask 51). This is the value PERSISTED as ``market_snapshots.mid``
     (CR-01) — unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and the
     fill's ``avg_price_cents``, so ``clv.clv_cents`` subtracts with NO conversion. The [0,1]
-    pricing value is ``mid_cents / 100.0`` (see :func:`_reflection_midpoint`).
+    The [0,1] pricing value is this midpoint divided by 100 — ``run_paper`` computes it
+    inline as ``mid_unit = mid_cents / 100.0`` (3 chars of clear code, no wrapper helper).
 
     Fails loud (raise) when either side of the book is empty — no two-sided market → no
     derivable midpoint (absence = absence, never a fabricated mid).
@@ -696,19 +697,6 @@ def _reflection_midpoint_cents(book: object) -> float:
     best_yes_bid = max(yes_bid_prices)
     best_yes_ask = yes_asks[0][0]  # cheapest reflected yes ask = 100 - best_no_bid
     return (best_yes_bid + best_yes_ask) / 2.0
-
-
-def _reflection_midpoint(book: object) -> float:
-    """Derive the live-book midpoint in [0,1] from the REFLECTED best levels (the ONE seam).
-
-    The [0,1] PRICING value: ``_reflection_midpoint_cents(book) / 100.0``. This is the value
-    the Phase-4 D-08/D-16 loop closes on (fed into ``price.p_used``/``bucket_ev``/
-    ``stake_fraction``) — it MUST equal the reflection-derived mid, never a native ask read
-    (there is none) and never a fabricated value. The PERSISTED ``mid`` is the un-divided
-    cents value from :func:`_reflection_midpoint_cents` (CR-01); the two are the SAME midpoint
-    in two units, split so persistence and pricing never share one mismatched unit.
-    """
-    return _reflection_midpoint_cents(book) / 100.0
 
 
 def _snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
@@ -755,8 +743,6 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     All pure math stays in :mod:`weatherquant.price` / :mod:`weatherquant.market.fills`; this
     is the I/O edge.
     """
-    import asyncio
-
     from weatherquant import price as pricing
     from weatherquant.market import fills, reflect
 
@@ -773,9 +759,11 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     ticker = args.ticker
 
     settings = get_settings()
-    # Paper-only: the simulator is unreachable in validated 'live' mode (the live path would use
-    # the real order flow, not the shadow simulator). assert_paper_mode is the fail-CLOSED fence
-    # for the (non-existent) order path; here we assert we are NOT in live so the simulator runs.
+    # The SIMULATOR-only gate: run_paper runs ONLY when execution_mode is NOT 'live' — in live
+    # mode the real order flow (Gate 2) would run, not the shadow simulator, so the simulator
+    # bows out. This is a distinct check from market.fills.assert_paper_mode, which is the
+    # separate, inverse (fail-CLOSED) fence guarding the future order path; it is NOT the check
+    # applied here.
     if settings.execution_mode == "live":
         raise SystemExit(
             "paper: execution_mode='live' — the paper-fill simulator does not run in live "
