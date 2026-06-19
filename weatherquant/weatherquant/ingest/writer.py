@@ -251,6 +251,22 @@ def insert_fill(
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
     """
+    # A maker rests AT a known price, so a maker fill MUST carry a real resting price. fills.py's
+    # maker_queue_fill returns avg_price_cents=0.0 as an OUT-OF-BAND placeholder (the queue model
+    # proves the COUNT; taker is the credited Gate-1 path) — the caller is meant to supply the
+    # resting price out of band. Persisting that un-supplied 0c through here would silently stamp
+    # price=0 on a money field that feeds CLV as closing_mid - 0 (CORR-MED-4). Fail loud with the
+    # established money-path correctness alarm (same WriteIntegrityError the rowcount==1 contract
+    # raises, surviving python -O) so the contract violation surfaces at the audited write
+    # boundary rather than corrupting CLV downstream. Taker fills (is_maker is not True) are
+    # unaffected.
+    if is_maker is True and (price is None or price == 0):
+        raise WriteIntegrityError(
+            f"refusing to persist a maker fill (ticker={ticker}, trade_id={trade_id}) with "
+            f"price={price!r}: a maker rests at a real resting price; price in {{None, 0}} is "
+            "the out-of-band maker_queue_fill placeholder and would corrupt CLV as "
+            "closing_mid - 0 (CORR-MED-4)."
+        )
     natural_key = {
         "ticker": ticker,
         "trade_id": trade_id,

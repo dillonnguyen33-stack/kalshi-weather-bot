@@ -146,6 +146,67 @@ def test_insert_fill_idempotent(pg_conn):
 
 
 @_skip_until_0504
+def test_insert_fill_rejects_maker_zero_price(pg_conn):
+    """A maker fill with the fabricated 0c (or None) placeholder price fails loud (CORR-MED-4).
+
+    fills.maker_queue_fill returns avg_price_cents=0.0 out of band (the queue model proves the
+    COUNT, the caller supplies the resting price). Persisting that 0c through the audited path
+    would stamp price=0 — a money field that feeds CLV as closing_mid - 0. The guard raises the
+    established WriteIntegrityError BEFORE any row lands.
+    """
+    for bad_price in (0, None):
+        with pytest.raises(writer.WriteIntegrityError, match="maker.*real resting price"):
+            writer.insert_fill(
+                pg_conn,
+                ticker="KXHIGHNY-26JUN18-T72",
+                trade_id=f"t-maker-{bad_price}",
+                side="yes",
+                price=bad_price,
+                count=10,
+                fee=2,
+                is_maker=True,
+                event_time=_T0,
+                available_at=_T0,
+            )
+
+
+@_skip_until_0504
+def test_insert_fill_maker_real_price_lands(pg_conn):
+    """A maker fill WITH a real non-zero resting price persists normally (rowcount==1)."""
+    rc = writer.insert_fill(
+        pg_conn,
+        ticker="KXHIGHNY-26JUN18-T72",
+        trade_id="t-maker-real",
+        side="yes",
+        price=50,
+        count=10,
+        fee=2,
+        is_maker=True,
+        event_time=_T0,
+        available_at=_T0,
+    )
+    assert rc == 1
+
+
+@_skip_until_0504
+def test_insert_fill_taker_unaffected_by_maker_guard(pg_conn):
+    """A taker fill (is_maker=False) lands normally even at price=0 — the maker guard is maker-only."""
+    rc = writer.insert_fill(
+        pg_conn,
+        ticker="KXHIGHNY-26JUN18-T72",
+        trade_id="t-taker-zero",
+        side="yes",
+        price=0,
+        count=10,
+        fee=2,
+        is_maker=False,
+        event_time=_T0,
+        available_at=_T0,
+    )
+    assert rc == 1
+
+
+@_skip_until_0504
 def test_insert_fill_update_raises(pg_conn):
     """The append-only trigger raises on any UPDATE to a fill row (D-10)."""
     writer.insert_fill(

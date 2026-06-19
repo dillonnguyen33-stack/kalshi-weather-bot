@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from weatherquant.ingest.writer import WriteIntegrityError, insert_fill
 from weatherquant.market import fills
 from weatherquant.market.fills import BookEvent
 
@@ -90,3 +91,76 @@ def test_maker_queue_fill_fail_loud_inputs():
         fills.maker_queue_fill(size_ahead=100, our_size=0, events=[])
     with pytest.raises(ValueError, match="size_ahead must be non-negative"):
         fills.maker_queue_fill(size_ahead=-1, our_size=50, events=[])
+
+
+# The maker_queue_fill above returns avg_price_cents=0.0 as an OUT-OF-BAND placeholder (the
+# queue model proves the COUNT; the caller supplies the real resting price, taker is the credited
+# Gate-1 path). The audited write path (writer.insert_fill, D-11) must therefore REFUSE a maker
+# fill whose price is the un-supplied 0c placeholder — persisting price=0 would corrupt CLV as
+# closing_mid - 0 (CORR-MED-4). These precondition tests fire BEFORE any DB touch, so they need
+# no live bind (the raise short-circuits _insert_row); bind=None is never reached.
+@pytest.mark.parametrize("bad_price", [0, None])
+def test_insert_fill_rejects_maker_zero_price(bad_price):
+    """A maker fill with a fabricated 0c (or None) price fails loud (WriteIntegrityError)."""
+    with pytest.raises(WriteIntegrityError, match="maker.*real resting price"):
+        insert_fill(
+            None,
+            ticker="KXHIGHNY-26JUN18-T72",
+            trade_id="t-maker-0",
+            side="yes",
+            price=bad_price,
+            count=10,
+            fee=2,
+            is_maker=True,
+            event_time=WS_T1,
+            available_at=WS_T1,
+        )
+
+
+def test_insert_fill_maker_real_price_passes_guard():
+    """A maker fill WITH a real non-zero resting price clears the guard (reaches the DB path).
+
+    The guard is a pure precondition on is_maker+price; with a real price it must NOT raise
+    WriteIntegrityError BEFORE the bind is used. We give a dummy bind that raises a DISTINCT
+    error when touched, proving the maker-price guard let the call through to _insert_row.
+    """
+
+    class _SentinelBind:
+        def __getattr__(self, _name):  # any DB access raises a distinguishable marker
+            raise RuntimeError("reached-db")
+
+    with pytest.raises(RuntimeError, match="reached-db"):
+        insert_fill(
+            _SentinelBind(),
+            ticker="KXHIGHNY-26JUN18-T72",
+            trade_id="t-maker-1",
+            side="yes",
+            price=50,
+            count=10,
+            fee=2,
+            is_maker=True,
+            event_time=WS_T1,
+            available_at=WS_T1,
+        )
+
+
+def test_insert_fill_taker_zero_price_not_blocked_by_maker_guard():
+    """A taker fill (is_maker=False) is unaffected by the maker-price guard (reaches the DB path)."""
+
+    class _SentinelBind:
+        def __getattr__(self, _name):
+            raise RuntimeError("reached-db")
+
+    with pytest.raises(RuntimeError, match="reached-db"):
+        insert_fill(
+            _SentinelBind(),
+            ticker="KXHIGHNY-26JUN18-T72",
+            trade_id="t-taker-0",
+            side="yes",
+            price=0,
+            count=10,
+            fee=2,
+            is_maker=False,
+            event_time=WS_T1,
+            available_at=WS_T1,
+        )
