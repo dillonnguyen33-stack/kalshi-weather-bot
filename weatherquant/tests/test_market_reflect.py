@@ -14,11 +14,19 @@ import ast
 import pathlib
 
 from weatherquant.market import reflect
+from weatherquant.market.book import OrderBook, apply
 
 
 def test_yes_ask_is_hundred_minus_no_bid_with_size(orderbook_snapshot):
-    """yes-ask = ``100 - best_no_bid`` (51¢) carrying the no-bid's size (80), best-first."""
-    asks = reflect.yes_ask_levels(orderbook_snapshot)
+    """yes-ask = ``100 - best_no_bid`` (51¢) carrying the no-bid's size (80), best-first.
+
+    The conftest ``orderbook_snapshot`` is now the VERIFIED enveloped WS message (05-11), so it
+    is parsed into an ``OrderBook`` first (the reflect seam reflects a parsed book, not the raw
+    wire envelope) — the cent-space top-of-book is unchanged, so the numbers are identical.
+    """
+    book = OrderBook()
+    apply(book, orderbook_snapshot)
+    asks = reflect.yes_ask_levels(book)
     # no bids [[49,80],[48,150],[47,260]] -> yes asks [(51,80),(52,150),(53,260)], cheapest first.
     assert asks == [(51, 80), (52, 150), (53, 260)]
     # Best (cheapest) yes ask is the reflection of the BEST (highest) no bid.
@@ -26,8 +34,14 @@ def test_yes_ask_is_hundred_minus_no_bid_with_size(orderbook_snapshot):
 
 
 def test_no_ask_is_hundred_minus_yes_bid_with_size(orderbook_snapshot):
-    """no-ask = ``100 - best_yes_bid`` (53¢) carrying the yes-bid's size (120), best-first."""
-    asks = reflect.no_ask_levels(orderbook_snapshot)
+    """no-ask = ``100 - best_yes_bid`` (53¢) carrying the yes-bid's size (120), best-first.
+
+    Parses the enveloped ``orderbook_snapshot`` into an ``OrderBook`` first (05-11); the cent-
+    space top-of-book is unchanged, so the reflected numbers are identical.
+    """
+    book = OrderBook()
+    apply(book, orderbook_snapshot)
+    asks = reflect.no_ask_levels(book)
     # yes bids [[47,120],[46,200],[45,350]] -> no asks [(53,120),(54,200),(55,350)].
     assert asks == [(53, 120), (54, 200), (55, 350)]
     assert asks[0] == (53, 120)

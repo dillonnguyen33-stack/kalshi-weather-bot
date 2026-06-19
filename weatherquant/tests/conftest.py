@@ -295,62 +295,118 @@ def synthetic_gaussians() -> SyntheticGaussians:
     )
 
 
-# --- Phase-5 paper-fill-simulator synthetic fixtures (05-00 Wave-0 scaffold) --------
-# Plain-dict orderbook/stream fixtures mirroring the Kalshi ``orderbook_snapshot`` /
-# ``orderbook_delta`` WS message shape (RESEARCH Pattern 2): ``type`` / ``seq`` / per-side
-# ``yes`` / ``no`` bid level lists of ``[price_cents, size]``, and deltas carry a single
-# ``side`` / ``price`` / ``delta`` change. Prices are integer CENTS (Kalshi quotes the BID
-# side of each outcome; the ask is reflected as ``100 - opposite bid`` in market/reflect.py).
-# These are import-light (no websockets/cryptography import here) so the no-leak boundary is
-# never crossed by the test fixtures themselves. Later waves (05-02 book, 05-03 fills) flip
-# their RED stubs GREEN against these fixed contracts.
+# --- Phase-5 paper-fill-simulator synthetic fixtures (05-11 verified live schema) -----------
+# Orderbook/stream fixtures encoding the Kalshi V2 WS protocol VERIFIED LIVE in 05-UAT.md
+# (## Gaps → verified_live_schema): an ENVELOPE (top-level ``type``/``sid``/``seq``; the book
+# data nested under ``msg``) with DOLLAR/FIXED-POINT STRING levels and a PER-SUBSCRIPTION seq
+# (snapshot=1, first delta=2, +1 each). A snapshot side is ``[[price_dollar_string,
+# count_fp_string], ...]`` under ``msg.yes_dollars_fp``/``msg.no_dollars_fp``; a delta carries
+# ``msg.side``/``msg.price_dollars``/``msg.delta_fp`` plus the real WS event time
+# (``msg.ts``/``msg.ts_ms``). Dollar string × 100 → integer cents; count/delta via
+# ``round(float(...))``. These are import-light (no websockets/cryptography import here) so the
+# no-leak boundary is never crossed by the fixtures. The dollar-string values below were chosen
+# so they parse to the SAME integer-cent top-of-book the flat fixtures used, keeping the
+# reflect-seam numeric expectations identical (only the wire shape changed): yes 47¢×120 best,
+# no 49¢×80 best → reflected yes-ask 51¢, mid 49¢.
 
 
 @pytest.fixture
 def orderbook_snapshot() -> dict:
-    """A Kalshi-shaped ``orderbook_snapshot`` message with known top-of-book.
+    """A VERIFIED enveloped Kalshi ``orderbook_snapshot`` with a known top-of-book.
 
-    Bid levels are ``[price_cents, size]`` sorted best-first. The best yes bid is 47¢ (size
-    120) and the best no bid is 49¢ (size 80) — so the reflected yes-ask is ``100 - 49 =
-    51¢`` and the implied mid is ``(47 + 51) / 2 = 49¢`` (a 4¢ spread). ``seq`` anchors the
-    delta stream below.
+    The book data is nested under ``msg`` as dollar/fixed-point STRING levels
+    (``[[price_dollars, count_fp], ...]``); the per-subscription ``seq`` anchor is 1. Parsed to
+    cents/int the best yes bid is 47¢ (size 120) and the best no bid is 49¢ (size 80) — so the
+    reflected yes-ask is ``100 - 49 = 51¢`` and the implied mid is ``(47 + 51) / 2 = 49¢``.
     """
     return {
         "type": "orderbook_snapshot",
-        "seq": 100,
-        "ticker": "KXHIGHNY-26JUN18-T72",
-        "yes": [[47, 120], [46, 200], [45, 350]],
-        "no": [[49, 80], [48, 150], [47, 260]],
+        "sid": 1,
+        "seq": 1,
+        "msg": {
+            "market_ticker": "KXHIGHNY-26JUN18-T72",
+            "market_id": "ec1f8e9a-0000-0000-0000-000000000000",
+            "yes_dollars_fp": [["0.47", "120.00"], ["0.46", "200.00"], ["0.45", "350.00"]],
+            "no_dollars_fp": [["0.49", "80.00"], ["0.48", "150.00"], ["0.47", "260.00"]],
+        },
     }
 
 
 @pytest.fixture
 def orderbook_delta_stream() -> list[dict]:
-    """A CONTIGUOUS ``orderbook_delta`` stream (seq 101, 102, 103) over the snapshot.
+    """A CONTIGUOUS enveloped ``orderbook_delta`` stream (seq 2, 3, 4) over the snapshot.
 
-    Each delta is a single-level change: ``delta`` is the signed size change at
-    ``(side, price)``. Applied in order onto :func:`orderbook_snapshot` they keep the book
-    consistent (no gap), so the book module must accept them without resnapshotting.
+    Each delta is a single-level change under ``msg``: ``delta_fp`` is the signed size change at
+    ``(msg.side, msg.price_dollars)``, and each carries the real WS event time
+    (``msg.ts``/``msg.ts_ms``). The net level changes match the old flat stream (yes 47 −20; no
+    50 +60; yes 48 +40) so the post-apply book assertions stay numerically identical. Applied in
+    order onto :func:`orderbook_snapshot` (seq 1) they keep the book consistent (no gap).
     """
     return [
-        {"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20},
-        {"type": "orderbook_delta", "seq": 102, "side": "no", "price": 50, "delta": 60},
-        {"type": "orderbook_delta", "seq": 103, "side": "yes", "price": 48, "delta": 40},
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "yes",
+                "price_dollars": "0.47", "delta_fp": "-20.00",
+                "ts": "2026-06-18T19:55:00.000000Z", "ts_ms": 1781812500000,
+            },
+        },
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 3,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "no",
+                "price_dollars": "0.50", "delta_fp": "60.00",
+                "ts": "2026-06-18T19:55:01.000000Z", "ts_ms": 1781812501000,
+            },
+        },
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 4,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "yes",
+                "price_dollars": "0.48", "delta_fp": "40.00",
+                "ts": "2026-06-18T19:55:02.000000Z", "ts_ms": 1781812502000,
+            },
+        },
     ]
 
 
 @pytest.fixture
 def orderbook_delta_stream_with_gap() -> list[dict]:
-    """A delta stream with an INJECTED seq gap (101 then 104 — 102/103 missing).
+    """An enveloped delta stream with an INJECTED seq gap (2 then 5 — 3/4 missing).
 
     The book module must detect the discontinuity (next seq != last seq + 1) and raise the
-    ``SeqGap`` correctness error (05-02) rather than silently applying the out-of-order delta
-    — a gap means the local book is unknown and must be resnapshotted (PAP-01, D-02).
+    ``SeqGap`` correctness error (book-level raise only; the gap-RECOVERY mechanism is 05-12's
+    concern) rather than silently applying the out-of-order delta — a gap means the local book
+    is unknown and must be re-snapshotted (PAP-01, D-02).
     """
     return [
-        {"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20},
-        {"type": "orderbook_delta", "seq": 104, "side": "no", "price": 49, "delta": -30},
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "yes",
+                "price_dollars": "0.47", "delta_fp": "-20.00",
+                "ts": "2026-06-18T19:55:00.000000Z", "ts_ms": 1781812500000,
+            },
+        },
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 5,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "no",
+                "price_dollars": "0.49", "delta_fp": "-30.00",
+                "ts": "2026-06-18T19:55:03.000000Z", "ts_ms": 1781812503000,
+            },
+        },
     ]
+
+
+@pytest.fixture
+def control_frame() -> dict:
+    """The VERIFIED Kalshi control frame (first message after a subscribe).
+
+    A ``subscribed`` acknowledgement carrying no book data; ``book.apply`` must IGNORE it
+    (mutate nothing, never fail loud) rather than treating it as an unknown data type.
+    """
+    return {"type": "subscribed", "id": 1, "msg": {"channel": "orderbook_delta", "sid": 1}}
 
 
 @pytest.fixture
