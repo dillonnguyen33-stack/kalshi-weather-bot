@@ -884,20 +884,48 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         fill = fills.taker_sweep(yes_asks, want_count, event_time=event_time)
         if fill is not None:
             trade_id = f"{ticker}:{snapshot_for}:yes"
+            # FAIL LOUD on a taker price that rounds out of the valid 1..99c band. The maker-zero
+            # guard in insert_fill (writer.py) only fires for is_maker is True, so a taker fill
+            # whose size-weighted average rounds to 0 (a 0c reflected ask from a no_bid of 100, or
+            # a malformed/edge book) would otherwise persist price=0 and corrupt CLV as
+            # closing_mid - 0 — the exact failure mode the maker guard exists to prevent, on the
+            # path it exempts (WR-04). Surface the out-of-band sweep here rather than fabricate a
+            # free fill; survives python -O via SystemExit (not assert).
+            fill_price_cents = int(round(fill.avg_price_cents))
+            if not (1 <= fill_price_cents <= 99):
+                raise SystemExit(
+                    f"paper: taker fill on {ticker} rounds to price={fill_price_cents}c, outside "
+                    f"the valid 1..99c band (avg_price_cents={fill.avg_price_cents!r}) — refusing "
+                    "to persist a fabricated 0c/out-of-band fill that would corrupt CLV (WR-04)."
+                )
             persist_fill(
                 bind,
                 ticker=ticker,
                 trade_id=trade_id,
                 side="yes",
-                price=int(round(fill.avg_price_cents)),
+                price=fill_price_cents,
                 count=fill.count,
-                fee=int(round(pricing.exact_fee(fill.count, mid_unit) * 100)),
+                # Fee on the ACHIEVED size-weighted fill price (in [0,1]), NOT the decision-time
+                # mid — so the persisted fee is internally consistent with the persisted price
+                # whenever the sweep clears away from the mid (thin/multi-level/partial). Feeing
+                # on mid_unit double-counted the slippage into the audited fee (WR-03).
+                fee=int(round(pricing.exact_fee(fill.count, fill.avg_price_cents / 100.0) * 100)),
                 is_maker=fill.is_maker,
                 event_time=fill.event_time,
                 bucket_prob=prob,
                 ev=ev,
                 kelly_stake=stake,
-                detail={"avg_price_cents": fill.avg_price_cents, "partial": fill.partial},
+                # Record the decision mid alongside the achieved price + the per-fill slippage
+                # (achieved - mid) so an audit of the fills row can distinguish "edge realized"
+                # from "edge eaten by the sweep" rather than infer it — the order was sized on
+                # mid_cents but clears at avg_price_cents, which a multi-level partial sweep can
+                # push materially worse than the touch the mid implied (WR-05).
+                detail={
+                    "avg_price_cents": fill.avg_price_cents,
+                    "partial": fill.partial,
+                    "mid_cents": mid_cents,
+                    "slippage_cents": fill.avg_price_cents - mid_cents,
+                },
                 available_at=fill.event_time,
             )
             fill_summary = {
