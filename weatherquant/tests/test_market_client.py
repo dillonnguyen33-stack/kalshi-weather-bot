@@ -1,10 +1,22 @@
-"""Signed WS + REST client reconnect discipline (PAP-01) — GREEN (05-02).
+"""Signed WS + REST client reconnect discipline (PAP-01) — verified-schema rewrite (05-12).
 
-On reconnect the client must BOTH re-subscribe to ``orderbook_delta`` AND re-snapshot the
-book (a reconnected stream must not reuse a stale local book — the seq baseline is gone,
-T-05-09). The ``-k reconnect`` selector matches the VALIDATION map command ``pytest
-tests/test_market_client.py -k reconnect``. Exercised with a MOCK WS + a MOCK HTTP client
-(injectable seams) — no live network, no live creds.
+Two halves are exercised here against the live-verified Kalshi V2 protocol (05-UAT.md ##
+Gaps → verified_live_schema):
+
+* ``run_feed`` — the WS connection lifecycle. The B1/D-02 redesign (05-12): run_feed NO
+  LONGER REST-resnapshots on connect (the seq-less REST orderbook_fp would crash the feed
+  on the FIRST connect via ``_resolve_seq``'s "no seq baseline" raise). Each book is anchored
+  by the fresh WS ``orderbook_snapshot`` (seq=1) that arrives after the subscribe command.
+  A control frame (``subscribed``) is skipped before book keying. A WS seq gap BREAKS to the
+  reconnect iterator, which re-subscribes on the NEXT connection for a fresh WS snapshot — it
+  never REST-resyncs for a seq the REST API does not return.
+* ``fetch_snapshot`` — the SIGNED REST orderbook read for ``run_paper``'s one-shot use. REST
+  has NO seq, so the DEFAULT seq-less ``_FP_PAYLOAD`` fails loud ("no seq baseline", MED-5);
+  the parse-success tests opt into a local seq-bearing payload to reach the dollars→cents +
+  self-stamp code that must NOT regress.
+
+Exercised with a MOCK WS + a MOCK HTTP client (injectable seams) — no live network, no
+live creds. The ``-k reconnect`` selector still matches the VALIDATION map command.
 """
 
 from __future__ import annotations
@@ -107,7 +119,24 @@ def _signer(method, path):
     return {"KALSHI-ACCESS-KEY": "k", "KALSHI-ACCESS-SIGNATURE": "s", "KALSHI-ACCESS-TIMESTAMP": "1"}
 
 
+_TICKER = "KXHIGHNY-26JUN18-T72"
+
+# The VERIFIED live REST orderbook payload is SEQ-LESS — the orderbook_fp carries
+# yes_dollars/no_dollars and NO "seq" key (05-UAT.md verified_live_schema). This is the
+# DEFAULT for fetch_snapshot tests (run_paper's one-shot read); run_feed never consumes it
+# (run_feed no longer REST-resnapshots, B1). On this default fetch_snapshot fails loud.
 _FP_PAYLOAD = {
+    "orderbook_fp": {
+        "yes_dollars": [["0.47", "120"], ["0.46", "200"]],
+        "no_dollars": [["0.49", "80"]],
+    }
+}
+
+# A LOCAL seq-bearing REST variant for the few fetch_snapshot parse-SUCCESS tests that must
+# reach the dollars→cents + self-stamp code (the verified-success path historically anchored
+# on a REST seq). The seq-less default is the verified live shape; this opts a success-path
+# test into a payload that parses without the "no seq baseline" raise.
+_FP_PAYLOAD_WITH_SEQ = {
     "orderbook_fp": {
         "seq": 100,
         "yes_dollars": [["0.47", "120"], ["0.46", "200"]],
@@ -115,49 +144,158 @@ _FP_PAYLOAD = {
     }
 }
 
-_TICKER = "KXHIGHNY-26JUN18-T72"
+
+# --- Enveloped WS message builders (verified live schema) ----------------------------------
 
 
-# --- Tests ---------------------------------------------------------------------------------
+def _ws_snapshot(seq=1, *, ticker=_TICKER, ts=None):
+    """A VERIFIED enveloped WS orderbook_snapshot (book data under ``msg``, dollar strings)."""
+    msg = {
+        "market_ticker": ticker,
+        "yes_dollars_fp": [["0.47", "120.00"], ["0.46", "200.00"]],
+        "no_dollars_fp": [["0.49", "80.00"]],
+    }
+    if ts is not None:
+        msg["ts"] = ts
+    return {"type": "orderbook_snapshot", "sid": 1, "seq": seq, "msg": msg}
 
 
-async def test_reconnect_resubscribes_and_resnapshots():
-    """A reconnect re-subscribes to the feed AND re-snapshots (book not reused stale)."""
+def _ws_delta(seq, *, side="yes", price="0.47", delta="-20.00", ticker=_TICKER, ts=None):
+    """A VERIFIED enveloped WS orderbook_delta (single (side, price) change, dollar strings)."""
+    msg = {
+        "market_ticker": ticker,
+        "side": side,
+        "price_dollars": price,
+        "delta_fp": delta,
+    }
+    if ts is not None:
+        msg["ts"] = ts
+    return {"type": "orderbook_delta", "sid": 1, "seq": seq, "msg": msg}
+
+
+_CONTROL_FRAME = {"type": "subscribed", "id": 1, "msg": {"channel": "orderbook_delta", "sid": 1}}
+
+
+# --- run_feed: B1 (no connect-time REST resnapshot) + control frame + WS-seq anchor --------
+
+
+async def test_connect_does_not_rest_resnapshot_for_seq():
+    """B1: run_feed runs to completion WITHOUT a connect-time REST GET (no seq-less crash).
+
+    The mock WS yields a WS orderbook_snapshot (seq 1) + a contiguous delta (seq 2); the mock
+    HTTP returns the SEQ-LESS orderbook_fp. The feed must NOT call fetch_snapshot for a seq
+    baseline on connect (the seq-less payload would raise "no seq baseline" and kill the feed,
+    the exact PAP-01 symptom) — it anchors on the WS snapshot instead.
+    """
     http = _MockHttp(_FP_PAYLOAD)
-    # Two scripted connections: the first drops after a delta, the second is the reconnect.
-    conn1 = _MockWS(
-        [{"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20}]
-    )
-    conn2 = _MockWS([], close_after=False)
-    connector = _MockConnector([conn1, conn2])
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2)], close_after=False)
+    connector = _MockConnector([conn1])
+
+    # Runs to completion without raising on the seq-less REST payload.
+    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=1)
+
+    # No connect-time REST GET — the seq baseline came from the WS snapshot, never REST (B1).
+    assert http.calls == []
+
+
+async def test_subscribed_control_frame_is_skipped():
+    """A leading ``subscribed`` control frame is consumed without keying a book (multi-ticker).
+
+    Driven with a MULTI-ticker feed so the missing ticker key on the control frame cannot be
+    absorbed by the single-ticker shortcut; the following WS snapshot+delta apply normally.
+    """
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS([_CONTROL_FRAME, _ws_snapshot(1), _ws_delta(2)], close_after=False)
+    connector = _MockConnector([conn1])
 
     seen = []
+    # Two tickers → the control frame's absent ticker key cannot fall through the shortcut.
     await run_feed(
-        [_TICKER],
+        [_TICKER, "KX-OTHER"],
         _signer,
         http=http,
         on_book=lambda t, b: seen.append((t, b.seq)),
         ws_connect=connector,
-        max_reconnects=2,
+        max_reconnects=1,
     )
 
-    # Subscribe command re-sent on BOTH connections.
+    # The control frame keyed no book; the snapshot+delta surfaced the real ticker at seq 1, 2.
+    assert (_TICKER, 1) in seen
+    assert (_TICKER, 2) in seen
+    assert http.calls == []
+
+
+async def test_ws_snapshot_is_seq_anchor():
+    """The WS orderbook_snapshot anchors the seq; contiguous deltas advance it (no REST)."""
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2), _ws_delta(3, side="no", price="0.49")],
+                    close_after=False)
+    connector = _MockConnector([conn1])
+
+    captured = []
+    await run_feed(
+        [_TICKER],
+        _signer,
+        http=http,
+        on_book=lambda t, b: captured.append(b.seq),
+        ws_connect=connector,
+        max_reconnects=1,
+    )
+
+    # Book ends at seq 3, anchored on the WS snapshot; the seq baseline never came from REST.
+    assert captured[-1] == 3
+    assert http.calls == []
+
+
+async def test_seq_gap_resubscribes_for_fresh_ws_snapshot():
+    """A WS seq gap breaks to the reconnect iterator, which re-subscribes for a fresh snapshot.
+
+    conn1 yields WS snapshot(seq 1) → delta(seq 2) → delta(seq 5 GAP); conn2 is the reconnect
+    with a fresh WS snapshot(seq 1). The deterministic break-to-reconnect mechanism (W2): the
+    subscribe command is re-sent on conn2 AND fetch_snapshot is NOT called for the gap.
+    """
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2), _ws_delta(5, side="no", price="0.49")])
+    conn2 = _MockWS([_ws_snapshot(1)], close_after=False)
+    connector = _MockConnector([conn1, conn2])
+
+    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=2)
+
+    # The gap broke conn1's loop; conn2 re-subscribed for a fresh WS snapshot (D-02 redesign).
+    assert len(conn2.sent) == 1
+    assert "subscribe" in conn2.sent[0]
+    # fetch_snapshot was NOT called for the gap — REST is never the seq anchor.
+    assert http.calls == []
+
+
+async def test_reconnect_resubscribes():
+    """A reconnect re-subscribes on the new connection (W3 — WS-seq, no REST resnapshot)."""
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2)])  # drops after a delta
+    conn2 = _MockWS([_ws_snapshot(1)], close_after=False)  # the reconnect
+    connector = _MockConnector([conn1, conn2])
+
+    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=2)
+
+    # Subscribe command re-sent on BOTH connections; never a REST GET (WS-seq anchor).
     assert len(conn1.sent) == 1
     assert len(conn2.sent) == 1
     assert "subscribe" in conn1.sent[0]
     assert "subscribe" in conn2.sent[0]
-    # fetch_snapshot re-invoked on reconnect: one REST GET per connection (2 total).
-    assert len(http.calls) == 2
+    assert http.calls == []
 
 
-async def test_reconnect_uses_fresh_seq_baseline():
-    """After reconnect the book's seq baseline comes from the fresh snapshot, not the old one."""
+async def test_reconnect_uses_fresh_ws_seq_baseline():
+    """After reconnect the seq baseline comes from the fresh WS snapshot, not a carried seq.
+
+    conn1: snapshot(1) → delta(2) then drops; conn2: snapshot(1). The captured on_book seqs
+    reflect the WS anchor (connect-snapshot@1, delta@2, reconnect-snapshot@1) — NOT a REST seq.
+    The trailing 1 is the point: the reconnect re-anchors on the fresh WS snapshot (seq 1)
+    rather than carrying conn1's stale 2 forward (T-05-09).
+    """
     http = _MockHttp(_FP_PAYLOAD)
-    # First connection advances seq to 101 via a delta, then drops.
-    conn1 = _MockWS(
-        [{"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20}]
-    )
-    conn2 = _MockWS([], close_after=False)
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2)])
+    conn2 = _MockWS([_ws_snapshot(1)], close_after=False)
     connector = _MockConnector([conn1, conn2])
 
     captured = []
@@ -170,42 +308,52 @@ async def test_reconnect_uses_fresh_seq_baseline():
         max_reconnects=2,
     )
 
-    # CR-02: the re-anchored REST book is delivered to on_book on every (re)connect, not only
-    # after a subsequent delta. So the callback fires at each fresh REST baseline (seq 100) plus
-    # after conn1's delta (seq 101): connect@100, delta@101, reconnect@100. The trailing 100 is
-    # the point of this test — the reconnect re-snapshots back to the fresh REST seq baseline
-    # rather than carrying conn1's stale 101 forward (T-05-09).
-    assert captured == [100, 101, 100]
+    assert captured == [1, 2, 1]
+    assert http.calls == []
 
 
-async def test_seq_gap_inside_loop_triggers_resnapshot():
-    """A SeqGap during delta consumption discards + REST-resyncs the book (D-02)."""
+async def test_event_time_surfaced_to_on_book():
+    """PAP-03 (B2): on_book observes the book's real WS event time after a delta (never now()).
+
+    A WS snapshot then a delta carrying ``msg.ts`` is applied; the on_book callback sees
+    ``book.event_time`` == that tz-aware UTC instant. CARRY+SURFACE only — NOT DB persistence.
+    """
     http = _MockHttp(_FP_PAYLOAD)
-    # snapshot seq 100 -> delta 101 ok -> delta 104 GAP -> resnapshot, then no more.
-    conn1 = _MockWS(
-        [
-            {"type": "orderbook_delta", "seq": 101, "side": "yes", "price": 47, "delta": -20},
-            {"type": "orderbook_delta", "seq": 104, "side": "no", "price": 49, "delta": -30},
-        ],
-        close_after=False,
-    )
+    ts = "2026-06-18T19:55:00.000000Z"
+    conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2, ts=ts)], close_after=False)
     connector = _MockConnector([conn1])
 
-    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=1)
+    seen_times = []
+    await run_feed(
+        [_TICKER],
+        _signer,
+        http=http,
+        on_book=lambda t, b: seen_times.append(b.event_time),
+        ws_connect=connector,
+        max_reconnects=1,
+    )
 
-    # Two REST GETs: the connect re-snapshot + the in-loop gap re-snapshot.
-    assert len(http.calls) == 2
+    expected = datetime(2026, 6, 18, 19, 55, 0, tzinfo=timezone.utc)
+    # The real WS event time reached the sink after the delta (never back-dated to now()).
+    assert expected in seen_times
+
+
+# --- fetch_snapshot: verified REST behavior for run_paper's one-shot read (MUST NOT regress) -
 
 
 async def test_fetch_snapshot_signs_query_stripped_path_and_converts_to_cents():
-    """REST snapshot signs the path WITHOUT the query and converts dollars -> cents."""
+    """REST snapshot signs the path WITHOUT the query and converts dollars -> cents.
+
+    Uses a LOCAL seq-bearing payload (the verified default is seq-less → fail loud); this
+    test exercises the dollars→cents + self-stamp success path that must not regress.
+    """
     signed_paths = []
 
     def recording_signer(method, path):
         signed_paths.append(path)
         return {"KALSHI-ACCESS-KEY": "k"}
 
-    http = _MockHttp(_FP_PAYLOAD)
+    http = _MockHttp(_FP_PAYLOAD_WITH_SEQ)
     snap = await fetch_snapshot(http, recording_signer, _TICKER, depth=10)
 
     # Signed path carries NO query string (Pitfall 6 / T-05-06).
@@ -227,7 +375,7 @@ async def test_fetch_snapshot_signs_query_stripped_path_and_converts_to_cents():
 
 async def test_fetch_snapshot_stamps_observed_instant_from_date_header():
     """CRIT-1: a server ``Date`` header IS the observed book instant (D-08, parsed to UTC)."""
-    http = _MockHttp(_FP_PAYLOAD, headers={"Date": "Wed, 18 Jun 2026 19:55:00 GMT"})
+    http = _MockHttp(_FP_PAYLOAD_WITH_SEQ, headers={"Date": "Wed, 18 Jun 2026 19:55:00 GMT"})
     snap = await fetch_snapshot(http, _signer, _TICKER)
     assert snap["event_time"] == datetime(2026, 6, 18, 19, 55, 0, tzinfo=timezone.utc)
     assert snap["snapshot_for"] == snap["event_time"].isoformat()
@@ -248,10 +396,12 @@ async def test_fetch_snapshot_non_mapping_orderbook_fp_fails_loud():
 
 
 async def test_fetch_snapshot_missing_seq_fails_loud():
-    """MED-5: neither fp.seq nor payload.seq present → fail loud, never fabricate seq=0."""
-    http = _MockHttp(
-        {"orderbook_fp": {"yes_dollars": [["0.47", "120"]], "no_dollars": [["0.49", "80"]]}}
-    )
+    """MED-5: the VERIFIED seq-less REST orderbook_fp fails loud — never fabricate seq=0.
+
+    This is the DEFAULT verified live shape: REST carries no seq, so run_paper's one-shot read
+    fails loud rather than anchoring on a fabricated seq (the WS snapshot is the only seq anchor).
+    """
+    http = _MockHttp(_FP_PAYLOAD)  # the seq-less verified default
     with pytest.raises(ValueError, match="no seq baseline"):
         await fetch_snapshot(http, _signer, _TICKER)
 
@@ -263,6 +413,9 @@ async def test_fetch_snapshot_malformed_level_fails_loud():
     )
     with pytest.raises(ValueError, match="level"):
         await fetch_snapshot(http, _signer, _TICKER)
+
+
+# --- _msg_ticker + host constants (unchanged behavior) -------------------------------------
 
 
 async def test_msg_ticker_non_str_fails_loud():
