@@ -301,7 +301,17 @@ async def run_feed(
         try:
             # (Re)connect: re-subscribe AND force a REST re-snapshot BEFORE consuming deltas.
             await ws.send(subscribe_cmd)
-            await _resnapshot_all(books, http, signer, tickers, rest_host=rest_host)
+            try:
+                await _resnapshot_all(books, http, signer, tickers, rest_host=rest_host)
+            except httpx.HTTPError as exc:
+                # A transient REST blip on (re)connection must NOT kill the feed: degrade to a
+                # reconnect so the `async for ws` iterator re-handshakes + retries the resync
+                # (WR-01). fetch_snapshot already logged + re-raised FAIL-LOUD at its boundary.
+                logger.warning(
+                    "[market error] on-reconnect re-snapshot failed (%s) — forcing WS reconnect",
+                    exc,
+                )
+                continue
 
             async for raw in ws:
                 msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
@@ -316,7 +326,18 @@ async def run_feed(
                         ticker,
                         gap,
                     )
-                    snapshot = await fetch_snapshot(http, signer, ticker, rest_host=rest_host)
+                    try:
+                        snapshot = await fetch_snapshot(http, signer, ticker, rest_host=rest_host)
+                    except httpx.HTTPError as exc:
+                        # A transient REST blip during the exact moment the book must re-anchor
+                        # must NOT crash the feed: break the delta loop so the `async for ws`
+                        # iterator reconnects + re-snapshots (WR-01).
+                        logger.warning(
+                            "[market error] re-snapshot of %s failed (%s) — forcing WS reconnect",
+                            ticker,
+                            exc,
+                        )
+                        break
                     apply(book, snapshot)
                     continue
                 if on_book is not None:
