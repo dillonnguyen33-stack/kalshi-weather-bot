@@ -170,10 +170,12 @@ async def test_reconnect_uses_fresh_seq_baseline():
         max_reconnects=2,
     )
 
-    # After conn1's delta the book was at 101; the reconnect re-snapshots back to the REST seq
-    # baseline (100) rather than carrying 101 forward — the stale book is discarded (T-05-09).
-    # (The on_book callback fired once, at seq 101 on conn1.)
-    assert captured == [101]
+    # CR-02: the re-anchored REST book is delivered to on_book on every (re)connect, not only
+    # after a subsequent delta. So the callback fires at each fresh REST baseline (seq 100) plus
+    # after conn1's delta (seq 101): connect@100, delta@101, reconnect@100. The trailing 100 is
+    # the point of this test — the reconnect re-snapshots back to the fresh REST seq baseline
+    # rather than carrying conn1's stale 101 forward (T-05-09).
+    assert captured == [100, 101, 100]
 
 
 async def test_seq_gap_inside_loop_triggers_resnapshot():
