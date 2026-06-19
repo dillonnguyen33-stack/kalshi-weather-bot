@@ -9,6 +9,8 @@ tests/test_market_client.py -k reconnect``. Exercised with a MOCK WS + a MOCK HT
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 from weatherquant.market import client as ws_client
@@ -28,8 +30,10 @@ pytestmark = pytest.mark.asyncio
 
 
 class _MockResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, *, headers=None):
         self._payload = payload
+        # httpx responses expose ``.headers``; default empty so the now()-fallback path runs.
+        self.headers = dict(headers or {})
 
     def raise_for_status(self):
         return None
@@ -39,15 +43,20 @@ class _MockResponse:
 
 
 class _MockHttp:
-    """Records every signed REST GET and returns a fixed ``orderbook_fp`` snapshot."""
+    """Records every signed REST GET and returns a fixed ``orderbook_fp`` snapshot.
 
-    def __init__(self, payload):
+    Optionally carries a ``headers`` mapping (e.g. a ``Date`` header) returned on every
+    response so a test can exercise the server-observed-instant stamp.
+    """
+
+    def __init__(self, payload, *, headers=None):
         self._payload = payload
+        self._headers = headers
         self.calls = []  # (url, params, headers)
 
     async def get(self, url, *, params=None, headers=None):
         self.calls.append((url, params, headers))
-        return _MockResponse(self._payload)
+        return _MockResponse(self._payload, headers=self._headers)
 
 
 class _MockWS:
@@ -206,6 +215,51 @@ async def test_fetch_snapshot_signs_query_stripped_path_and_converts_to_cents():
     assert snap["yes"] == [[47, 120], [46, 200]]
     assert snap["no"] == [[49, 80]]
     assert snap["seq"] == 100
+    # CRIT-1: the snapshot self-stamps the observed instant — a tz-aware UTC datetime under
+    # event_time AND its ISO string under snapshot_for (no Date header here → now() fallback).
+    assert isinstance(snap["event_time"], datetime)
+    assert snap["event_time"].tzinfo is not None
+    assert snap["snapshot_for"] == snap["event_time"].isoformat()
+
+
+async def test_fetch_snapshot_stamps_observed_instant_from_date_header():
+    """CRIT-1: a server ``Date`` header IS the observed book instant (D-08, parsed to UTC)."""
+    http = _MockHttp(_FP_PAYLOAD, headers={"Date": "Wed, 18 Jun 2026 19:55:00 GMT"})
+    snap = await fetch_snapshot(http, _signer, _TICKER)
+    assert snap["event_time"] == datetime(2026, 6, 18, 19, 55, 0, tzinfo=timezone.utc)
+    assert snap["snapshot_for"] == snap["event_time"].isoformat()
+
+
+async def test_fetch_snapshot_missing_orderbook_fp_fails_loud():
+    """HIGH-2: a renamed/absent ``orderbook_fp`` raises a descriptive ValueError, not KeyError."""
+    http = _MockHttp({"orderbook": {"seq": 100, "yes_dollars": [], "no_dollars": []}})
+    with pytest.raises(ValueError, match="orderbook_fp"):
+        await fetch_snapshot(http, _signer, _TICKER)
+
+
+async def test_fetch_snapshot_non_mapping_orderbook_fp_fails_loud():
+    """HIGH-2: a non-Mapping ``orderbook_fp`` (list/None) raises a descriptive ValueError."""
+    http = _MockHttp({"orderbook_fp": ["not", "a", "mapping"]})
+    with pytest.raises(ValueError, match="orderbook_fp"):
+        await fetch_snapshot(http, _signer, _TICKER)
+
+
+async def test_fetch_snapshot_missing_seq_fails_loud():
+    """MED-5: neither fp.seq nor payload.seq present → fail loud, never fabricate seq=0."""
+    http = _MockHttp(
+        {"orderbook_fp": {"yes_dollars": [["0.47", "120"]], "no_dollars": [["0.49", "80"]]}}
+    )
+    with pytest.raises(ValueError, match="no seq baseline"):
+        await fetch_snapshot(http, _signer, _TICKER)
+
+
+async def test_fetch_snapshot_malformed_level_fails_loud():
+    """HIGH-2: a malformed level (not a 2-element sequence) raises a descriptive ValueError."""
+    http = _MockHttp(
+        {"orderbook_fp": {"seq": 100, "yes_dollars": [["0.47"]], "no_dollars": []}}
+    )
+    with pytest.raises(ValueError, match="level"):
+        await fetch_snapshot(http, _signer, _TICKER)
 
 
 async def test_hosts_are_fixed_constants():

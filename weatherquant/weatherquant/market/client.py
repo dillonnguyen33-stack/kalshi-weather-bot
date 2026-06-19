@@ -24,11 +24,14 @@ asserts the re-subscribe + re-snapshot happen on reconnect, with NO live network
 
 from __future__ import annotations
 
+import email.utils
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 import websockets
 
 from weatherquant.ingest.errors import CorrectnessError
@@ -83,9 +86,79 @@ def _parse_fp_side(raw: Any) -> list[list[int]]:
         return []
     levels: list[list[int]] = []
     for level in raw:
-        price_d, count = level  # fail loud if not a 2-tuple
+        # Validate the level is a 2-element [price, count] sequence BEFORE unpacking (mirror
+        # book._coerce_levels' len-2 guard) — a malformed level raises a descriptive ValueError,
+        # never a coerced/fabricated level or an opaque "not enough values to unpack" (HIGH-2).
+        if isinstance(level, (str, bytes, Mapping)):
+            raise ValueError(f"orderbook_fp level must be [price, count], got {level!r}")
+        items = list(level)
+        if len(items) != 2:
+            raise ValueError(
+                f"orderbook_fp level must be exactly [price, count], got {items!r}"
+            )
+        price_d, count = items
         levels.append([_cents(price_d), round(float(count))])
     return levels
+
+
+def _observed_instant(response: Any) -> datetime:
+    """Capture the server-observed book instant for a snapshot (CRIT-1, D-08).
+
+    WHY this is the legitimate live-now fence: under D-08 the real REST observation time IS the
+    observed book instant — captured HERE at the I/O edge (the fetch site), mirroring
+    ``ingest/available_at.py``'s LIVE branch, so nothing downstream ever back-dates it. Prefer
+    the server ``Date`` header (RFC-1123) when present and parseable; fall back to
+    ``datetime.now(timezone.utc)`` — the single sanctioned ``now()`` in this module — captured
+    at the fetch site.
+    """
+    raw_date = None
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        raw_date = headers.get("Date")
+    if raw_date:
+        try:
+            parsed = email.utils.parsedate_to_datetime(raw_date)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            # A naive RFC-1123 date is GMT/UTC; normalize tz-aware results to UTC.
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc)
+
+
+def _require_fp(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Fail-loud accessor for ``orderbook_fp`` (mirror book._msg_get; name the missing field).
+
+    A renamed/absent ``orderbook_fp`` raises a descriptive ValueError naming the field (never a
+    bare KeyError); a non-Mapping ``orderbook_fp`` (a list/None) also raises (ASVS V5, HIGH-2).
+    """
+    if "orderbook_fp" not in payload:
+        raise ValueError(
+            f"orderbook snapshot missing required field 'orderbook_fp': {payload!r}"
+        )
+    fp = payload["orderbook_fp"]
+    if not isinstance(fp, Mapping):
+        raise ValueError(
+            f"orderbook_fp must be a mapping of seq/yes_dollars/no_dollars, got {fp!r}"
+        )
+    return fp
+
+
+def _resolve_seq(fp: Mapping[str, Any], payload: Mapping[str, Any]) -> int:
+    """Resolve the snapshot's seq baseline, fail-loud on absence (MED-5, D-02).
+
+    A snapshot anchors delta integrity (D-02); a fabricated ``seq=0`` would spuriously trip
+    SeqGap on the first real delta or mask a genuine gap. Read ``fp.seq`` then ``payload.seq``;
+    if BOTH are absent raise rather than default (absence = absence).
+    """
+    seq = fp.get("seq")
+    if seq is None:
+        seq = payload.get("seq")
+    if seq is None:
+        raise ValueError(
+            "orderbook snapshot carries no seq baseline — cannot anchor delta integrity (D-02)"
+        )
+    return int(seq)
 
 
 async def fetch_snapshot(
@@ -113,24 +186,44 @@ async def fetch_snapshot(
         rest_host: the fixed REST host constant (prod by default; demo for the checkpoint).
 
     Returns:
-        A snapshot-shaped dict: ``{"type": "orderbook_snapshot", "seq", "ticker", "yes", "no"}``
-        with integer-cent bid levels.
+        A snapshot-shaped dict: ``{"type": "orderbook_snapshot", "seq", "ticker", "yes", "no",
+        "event_time", "snapshot_for"}`` with integer-cent bid levels. ``event_time`` is the
+        tz-aware UTC observed book instant (CRIT-1, D-08) and ``snapshot_for`` is its ISO string.
+
+    Raises:
+        ValueError: on a malformed/renamed payload (missing/non-Mapping ``orderbook_fp``, a
+            malformed level, or a missing seq baseline) — fail loud, never a fabricated book.
+        httpx.HTTPError: on a transport/HTTP error (logged ``[market error]`` and re-raised).
     """
     path = _REST_ORDERBOOK_PATH.format(ticker=ticker)
     headers = dict(signer(_REST_METHOD, path))  # sign the QUERY-STRIPPED path (Pitfall 6)
     url = f"{rest_host}{path}"
     params = {"depth": depth} if depth else None
-    response = await http.get(url, params=params, headers=headers)
-    response.raise_for_status()
-    payload = response.json()
-    fp = payload["orderbook_fp"]
-    return {
-        "type": "orderbook_snapshot",
-        "seq": int(fp.get("seq", payload.get("seq", 0))),
-        "ticker": ticker,
-        "yes": _parse_fp_side(fp.get("yes_dollars")),
-        "no": _parse_fp_side(fp.get("no_dollars")),
-    }
+    # The whole network call + untrusted-JSON parse is wrapped in the house-style try/except
+    # (mirror book._msg_get / _coerce_levels discipline): a transport error or a malformed
+    # payload is logged with a [market error] prefix and re-raised FAIL-LOUD — the run_paper
+    # call site needs a clear money-path failure, never a fabricated book (HIGH-2 / T-05-27).
+    try:
+        response = await http.get(url, params=params, headers=headers)
+        response.raise_for_status()
+        # Capture the observed book instant AT the fetch site (D-08, the live-now fence here).
+        observed = _observed_instant(response)
+        payload = response.json()
+        fp = _require_fp(payload)
+        return {
+            "type": "orderbook_snapshot",
+            "seq": _resolve_seq(fp, payload),
+            "ticker": ticker,
+            "yes": _parse_fp_side(fp.get("yes_dollars")),
+            "no": _parse_fp_side(fp.get("no_dollars")),
+            # The server-observed instant: the real REST observation time IS the book instant
+            # under D-08, stamped HERE so nothing downstream back-dates it (CRIT-1).
+            "event_time": observed,
+            "snapshot_for": observed.isoformat(),
+        }
+    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+        logger.warning("[market error] fetch_snapshot failed for %s: %s", ticker, exc)
+        raise
 
 
 def _subscribe_command(tickers: Sequence[str]) -> str:
@@ -219,7 +312,7 @@ async def run_feed(
                 except (SeqGap, CorrectnessError) as gap:
                     # The local book is unknown across the gap — discard + REST resync (D-02).
                     logger.warning(
-                        "orderbook seq gap on %s (%s) — re-snapshotting via REST (D-02)",
+                        "[orderbook error] seq gap on %s (%s) — re-snapshotting via REST (D-02)",
                         ticker,
                         gap,
                     )
@@ -233,7 +326,8 @@ async def run_feed(
         except websockets.ConnectionClosed as exc:
             # EXPECTED transient: the iterator reconnects with backoff; structured fallback.
             logger.warning(
-                "kalshi WS connection closed (%s) — reconnecting + re-snapshotting", exc
+                "[ws error] kalshi WS connection closed (%s) — reconnecting + re-snapshotting",
+                exc,
             )
         if max_reconnects is not None and connections >= max_reconnects:
             break
