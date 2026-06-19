@@ -877,8 +877,20 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     # weighting each mid by the liquidity that genuinely backs THIS mid. The reflection's
     # 100 - price is NOT re-derived here: the supporting yes-ask size IS the best-no-bid size by
     # construction, read straight off the no side. Cast to int (whole contracts).
-    best_yes_bid_size = max(yes_levels, key=lambda lvl: int(lvl[0]))[1] if yes_levels else None
-    best_no_bid_size = max(no_levels, key=lambda lvl: int(lvl[0]))[1] if no_levels else None
+    #
+    # AGGREGATE size per price before taking the best (WR-07): run_paper reads the raw REST
+    # snapshot["yes"]/["no"] lists, which are NOT guaranteed collapsed to one entry per price. If
+    # two entries share the best price, taking the single max-price level's size would undercount
+    # the supporting liquidity and make the CLV supporting-size weight wrong. Sum all sizes at the
+    # best price instead.
+    def _best_price_size(levels: list[Any]) -> int | None:
+        by_price: dict[int, int] = {}
+        for price, size in levels:
+            by_price[int(price)] = by_price.get(int(price), 0) + int(size)
+        return by_price[max(by_price)] if by_price else None
+
+    best_yes_bid_size = _best_price_size(yes_levels)
+    best_no_bid_size = _best_price_size(no_levels)
     if best_yes_bid_size is None or best_no_bid_size is None:
         raise SystemExit(
             "paper: book is one-sided — cannot derive the top-of-book supporting size behind "
