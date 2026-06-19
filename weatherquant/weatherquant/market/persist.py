@@ -38,6 +38,7 @@ def persist_snapshot(
     best_yes_bid: int | None = None,
     best_no_bid: int | None = None,
     mid: float | None = None,
+    volume: int | None = None,
     seq: int | None = None,
     detail: Mapping[str, object] | None = None,
     available_at: datetime,
@@ -45,8 +46,9 @@ def persist_snapshot(
     """Persist one market snapshot via the audited writer (no Core insert here, D-13).
 
     Delegates verbatim to :func:`weatherquant.ingest.writer.insert_market_snapshot`.
-    ``available_at`` is the REAL WS event time (D-08) — passed straight through, never
-    ``now()``.
+    ``mid`` is FLOAT-VALUED CENTS (CR-01) and ``volume`` is the per-snapshot book-liquidity
+    signal in whole contracts (WR-01) — both threaded straight through. ``available_at`` is
+    the REAL WS event time (D-08) — passed straight through, never ``now()``.
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
@@ -58,6 +60,7 @@ def persist_snapshot(
         best_yes_bid=best_yes_bid,
         best_no_bid=best_no_bid,
         mid=mid,
+        volume=volume,
         seq=seq,
         detail=detail,
         available_at=available_at,

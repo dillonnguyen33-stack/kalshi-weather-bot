@@ -39,14 +39,20 @@ _T1 = datetime(2026, 6, 18, 19, 56, tzinfo=timezone.utc)
 
 @_skip_until_0504
 def test_insert_market_snapshot_rowcount_one(pg_conn):
-    """A single snapshot insert lands exactly one row (rowcount==1 contract, D-11)."""
+    """A single snapshot insert lands exactly one row (rowcount==1 contract, D-11).
+
+    ``mid`` is persisted in FLOAT-VALUED CENTS (50.5), the SAME unit the production
+    ``run_paper`` persist path now writes (CR-01) — not [0,1] dollars — and ``volume`` (the
+    summed resting top-of-book size, WR-01) is exercised through the audited writer.
+    """
     rc = writer.insert_market_snapshot(
         pg_conn,
         ticker="KXHIGHNY-26JUN18-T72",
         snapshot_for="2026-06-18T19:55Z",
         best_yes_bid=50,
         best_no_bid=48,
-        mid=0.51,
+        mid=50.5,
+        volume=200,
         seq=101,
         detail={"raw": "book"},
         available_at=_T0,
@@ -62,7 +68,8 @@ def test_insert_market_snapshot_idempotent(pg_conn):
         snapshot_for="2026-06-18T19:55Z",
         best_yes_bid=50,
         best_no_bid=48,
-        mid=0.51,
+        mid=50.5,
+        volume=200,
         seq=101,
         detail={"raw": "book"},
         available_at=_T0,
@@ -71,7 +78,7 @@ def test_insert_market_snapshot_idempotent(pg_conn):
     # Identical natural key + content + available_at → skip-before-insert returns 0.
     assert writer.insert_market_snapshot(pg_conn, **kw) == 0
     # A changed payload (new mid) is a fresh append → 1.
-    assert writer.insert_market_snapshot(pg_conn, **{**kw, "mid": 0.52}) == 1
+    assert writer.insert_market_snapshot(pg_conn, **{**kw, "mid": 51.5}) == 1
 
 
 @_skip_until_0504
@@ -81,14 +88,14 @@ def test_insert_market_snapshot_update_raises(pg_conn):
         pg_conn,
         ticker="KXHIGHNY-26JUN18-T72",
         snapshot_for="2026-06-18T19:55Z",
-        mid=0.51,
+        mid=50.5,
         available_at=_T0,
     )
     with pytest.raises(Exception):  # noqa: B017 — the per-table append-only trigger RAISEs
         pg_conn.execute(
             sa.update(market_snapshots)
             .where(market_snapshots.c.ticker == "KXHIGHNY-26JUN18-T72")
-            .values(mid=0.99)
+            .values(mid=99.0)
         )
 
 

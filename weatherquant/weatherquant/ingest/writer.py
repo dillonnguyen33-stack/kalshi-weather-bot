@@ -176,6 +176,7 @@ def insert_market_snapshot(
     best_yes_bid: int | None = None,
     best_no_bid: int | None = None,
     mid: float | None = None,
+    volume: int | None = None,
     seq: int | None = None,
     detail: Mapping[str, object] | None = None,
     available_at: datetime,
@@ -186,9 +187,12 @@ def insert_market_snapshot(
     time-bucket key (a string, e.g. an ISO instant; see ``db/models.py``). Content: the
     load-bearing top-of-book fields (``best_yes_bid``/``best_no_bid`` in integer cents, the
     only side Kalshi quotes — the ask is reflected as ``100 - opposite bid`` in
-    ``market/reflect.py``), the derived ``mid`` (the real market midpoint fed into the
-    Phase-4 EV/Kelly path), the WS ``seq``, and the raw book payload ``detail`` (JSONB,
-    mirroring ``observations.detail``). Re-inserting an identical snapshot is a no-op
+    ``market/reflect.py``), the derived ``mid`` (the real market midpoint in FLOAT-VALUED
+    CENTS — unit-consistent with ``best_*_bid``/``avg_price_cents``, CR-01), ``volume`` (the
+    per-snapshot book-liquidity volume signal in WHOLE CONTRACTS — the summed resting
+    top-of-book size off the live orderbook payload; weights the CLV closing mid, WR-01), the
+    WS ``seq``, and the raw book payload ``detail`` (JSONB, mirroring ``observations.detail``).
+    Omitting ``volume`` persists NULL (back-compat). Re-inserting an identical snapshot is a no-op
     (returns 0); a changed payload appends a fresh row (returns 1). NO UPDATE/upsert — the
     append-only trigger would raise; a correction is a later-``available_at`` INSERT.
 
@@ -206,6 +210,7 @@ def insert_market_snapshot(
         "best_yes_bid": best_yes_bid,
         "best_no_bid": best_no_bid,
         "mid": mid,
+        "volume": volume,
         "seq": seq,
         "detail": detail,
     }

@@ -183,7 +183,18 @@ calibration_params = sa.Table(
 # orderbook_delta sequence number (BigInteger — a gap triggers a resnapshot, PAP-01); and
 # ``detail`` (JSONB) carries the raw book payload, mirroring ``observations.detail``. The
 # natural key (ticker, snapshot_for) is UNCHANGED so ix_market_snapshots_latest is intact.
-# Types mirror the 0004 migration EXACTLY so metadata.create_all == the migrated schema.
+# Types mirror the 0004/0005 migrations EXACTLY so metadata.create_all == the migrated schema.
+#
+# MONEY-UNIT LANDMARK (05-06, CR-01): ``mid`` is FLOAT-VALUED CENTS — the half-cent bid/ask
+# midpoint, unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and with the
+# fill's ``avg_price_cents`` (cents). It is NOT [0,1] dollars. ``run_paper`` persists the
+# un-divided ``mid_cents`` here and keeps the [0,1] ``mid_unit`` only for the p_used/EV/Kelly
+# pricing math; ``clv.vol_weighted_mid``/``clv_cents`` subtract ``avg_price_cents`` (cents)
+# directly, with no conversion. ``mid`` MUST stay ``sa.Float`` (NOT Integer) — rounding to an
+# int would inject +/-0.5c bias into every derived CLV. ``volume`` (05-06, WR-01) is the
+# per-snapshot book-liquidity signal in WHOLE CONTRACTS (Integer) consumed by
+# ``vol_weighted_mid`` to weight the closing mid; it is populated in run_paper from the summed
+# resting top-of-book size off the live orderbook payload (a REAL feed signal, not a fixture).
 market_snapshots = sa.Table(
     "market_snapshots",
     metadata,
@@ -192,7 +203,12 @@ market_snapshots = sa.Table(
     sa.Column("snapshot_for", sa.Text, nullable=False),
     sa.Column("best_yes_bid", sa.Integer, nullable=True),
     sa.Column("best_no_bid", sa.Integer, nullable=True),
+    # mid is FLOAT-VALUED CENTS (the half-cent midpoint, unit-consistent with best_*_bid and
+    # avg_price_cents) — NOT [0,1] dollars; stays Float so no +/-0.5c rounding bias (CR-01).
     sa.Column("mid", sa.Float, nullable=True),
+    # volume: per-snapshot book-liquidity signal in WHOLE CONTRACTS (summed resting top-of-book
+    # size off the live orderbook payload); weights the CLV closing mid (WR-01). Type mirrors 0005.
+    sa.Column("volume", sa.Integer, nullable=True),
     sa.Column("seq", sa.BigInteger, nullable=True),
     sa.Column("detail", postgresql.JSONB, nullable=True),
     _available_at_column(),
