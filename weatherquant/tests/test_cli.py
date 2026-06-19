@@ -350,6 +350,7 @@ def test_run_price_min_ramp_model_chosen_deterministically(
 
 from datetime import datetime, timedelta  # noqa: E402
 
+from weatherquant.market import client as ws_client  # noqa: E402
 from weatherquant.registry import get_city  # noqa: E402
 from weatherquant.time import settlement_window  # noqa: E402
 
@@ -530,6 +531,100 @@ def test_run_paper_unknown_city_rejected_before_any_io(capsys: pytest.CaptureFix
     assert excinfo.value.code != 0
     err = capsys.readouterr().err
     assert "ZZZ" in err
+
+
+# --- CRIT-1 regression guard: run_paper end-to-end on the REAL fetch_snapshot shape ----------
+#
+# This is the standing guard for AUDIT-CRIT-1: it drives the REAL market.client.fetch_snapshot
+# (mocking ONLY the httpx transport, NOT cli.fetch_snapshot) so run_paper exercises the actual
+# producer's output shape — the snapshot self-stamps event_time at the fetch site, so
+# _snapshot_event_time resolves and run_paper no longer aborts. The fixture must NEVER again
+# hand-inject event_time (the divergence that masked the gap). With Task 1 reverted (no stamp)
+# this test FAILS with SystemExit "no usable event time".
+
+
+class _RealShapeResponse:
+    """An httpx-response-shaped object: headers (Date) + raise_for_status + json (orderbook_fp)."""
+
+    def __init__(self, payload, headers):
+        self._payload = payload
+        self.headers = dict(headers)
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _RealShapeAsyncClient:
+    """An httpx.AsyncClient-shaped async context manager returning a fixed REST orderbook GET.
+
+    Drives the REAL fetch_snapshot through its actual transport seam (await http.get(...)) so
+    the test exercises the production parse + observed-instant stamp, not a stubbed fetch.
+    """
+
+    def __init__(self, payload, headers):
+        self._payload = payload
+        self._headers = headers
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url, *, params=None, headers=None):
+        return _RealShapeResponse(self._payload, self._headers)
+
+
+def test_run_paper_end_to_end_real_fetch_snapshot(monkeypatch: pytest.MonkeyPatch):
+    """CRIT-1 GUARD: run_paper runs end-to-end on the REAL fetch_snapshot output (no injected event_time).
+
+    The HTTP transport is mocked; cli.fetch_snapshot stays REAL. The snapshot carries a Date
+    header inside the CLV closing window for the NYC settlement date, so fetch_snapshot stamps
+    event_time at the fetch site and the money path (pricing -> fill -> persist) completes.
+    """
+    import httpx
+
+    win = settlement_window(get_city("NYC"), _PAPER_DATE)
+    # An observed instant inside the half-open CLV closing window, formatted as an RFC-1123
+    # Date header (the producer's observed-instant source under D-08).
+    observed = (win.end_utc - timedelta(minutes=5)).replace(microsecond=0)
+    date_header = observed.strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+    # The REAL orderbook_fp payload shape (dollar-string pairs), NOT a pre-stamped book: yes bid
+    # 40c, no bid 56c -> reflected yes ask 44c -> mid 42c (0.42), a positive edge vs mu=62.5.
+    real_payload = {
+        "orderbook_fp": {
+            "seq": 7,
+            "yes_dollars": [["0.40", "200"]],
+            "no_dollars": [["0.56", "200"]],
+        }
+    }
+
+    captured = _patch_paper(
+        monkeypatch,
+        book={},  # unused: the fetch patch below is OVERRIDDEN to the real client
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+    # OVERRIDE the _patch_paper fetch stub: restore the REAL fetch_snapshot and mock ONLY the
+    # httpx transport so run_paper exercises the production producer shape (no injected event_time).
+    monkeypatch.setattr(cli, "fetch_snapshot", ws_client.fetch_snapshot)
+    monkeypatch.setattr(
+        httpx, "AsyncClient", lambda *a, **k: _RealShapeAsyncClient(real_payload, {"Date": date_header})
+    )
+
+    result = cli.run_paper(_paper_args())
+
+    # run_paper ran end-to-end on the REAL shape (it did NOT SystemExit): a midpoint-fed EV and
+    # a persisted snapshot whose available_at is the fetch-stamped observed instant.
+    assert result["midpoint"] == pytest.approx(0.42)
+    assert result["ev"] > 0.0
+    assert captured["snapshots"], "no snapshot persisted — the real-shape money path did not run"
+    persisted_at = captured["snapshots"][0]["available_at"]
+    assert persisted_at == observed  # the fetch-site stamp, not an injected/back-dated time
 
 
 def test_run_paper_refuses_live_mode(monkeypatch: pytest.MonkeyPatch):

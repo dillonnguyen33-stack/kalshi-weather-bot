@@ -712,23 +712,19 @@ def _reflection_midpoint(book: object) -> float:
 
 
 def _snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
-    """Extract the snapshot's REAL WS event time, fail-loud (never now(), D-08).
+    """Thin CLI wrapper over the single ``clv.snapshot_event_time`` seam (DD-1, D-08).
 
-    The persisted ``available_at`` MUST be the real observed instant of the book, never the
-    wall clock (back-dating destroys Phase-6 no-look-ahead, D-08). Accepts an explicit
-    ``event_time`` datetime or a ``snapshot_for`` ISO string; a naive value is treated as UTC.
+    The snapshot event-time parse has ONE home (``clv.snapshot_event_time``) — it already
+    handles the full key set (``event_time``/``available_at``/``snapshot_for``), so the cli no
+    longer drifts on ``available_at``. This wrapper only translates the ``ValueError`` (fail
+    loud, never now()) into the CLI's ``SystemExit`` surface; it duplicates no parse body. The
+    persisted ``available_at`` is therefore the real observed instant of the book, never the
+    wall clock (back-dating destroys Phase-6 no-look-ahead, D-08).
     """
-    value = snapshot.get("event_time")
-    if isinstance(value, datetime):
-        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
-    raw = snapshot.get("snapshot_for")
-    if isinstance(raw, str):
-        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
-    raise SystemExit(
-        "paper: orderbook snapshot carries no WS event time (event_time/snapshot_for) — "
-        "refusing to stamp a fill/snapshot with now() (D-08)."
-    )
+    try:
+        return clv.snapshot_event_time(snapshot)
+    except ValueError as exc:
+        raise SystemExit(f"paper: {exc} — refusing to stamp with now() (D-08).") from exc
 
 
 def run_paper(args: argparse.Namespace) -> dict[str, Any]:

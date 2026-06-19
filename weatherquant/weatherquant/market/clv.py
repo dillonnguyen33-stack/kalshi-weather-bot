@@ -52,13 +52,16 @@ class _HasAvgPrice(Protocol):
     avg_price_cents: float
 
 
-def _event_time(snapshot: Mapping[str, Any]) -> datetime:
+def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
     """Extract a snapshot's UTC event time, fail-loud on absence (absence = absence).
 
-    Prefers an explicit ``event_time`` / ``available_at`` ``datetime`` (the persisted row
-    shape); falls back to parsing the ``snapshot_for`` ISO string (the golden-fixture shape).
-    A naive datetime is assumed UTC. A missing/unparseable time is a caller bug — raise, never
-    silently drop the row from the window (which would skew the closing mid).
+    The SINGLE public snapshot event-time parse seam (DD-1): both the CLV closing-window
+    selector here AND ``cli._snapshot_event_time`` delegate to this one body so the D-08
+    stamping/parsing cannot drift across modules. Prefers an explicit ``event_time`` /
+    ``available_at`` ``datetime`` (the persisted row + ``fetch_snapshot`` stamp shape); falls
+    back to parsing the ``snapshot_for`` ISO string (the fixture / ISO-stamp shape). A naive
+    datetime is assumed UTC. A missing/unparseable time is a caller bug — raise, never silently
+    drop the row from the window (which would skew the closing mid).
     """
     for key in ("event_time", "available_at"):
         value = snapshot.get(key)
@@ -73,6 +76,11 @@ def _event_time(snapshot: Mapping[str, Any]) -> datetime:
         f"snapshot carries no usable event time (event_time/available_at/snapshot_for): "
         f"{snapshot!r}"
     )
+
+
+# Private alias kept so any internal call site / external import of the old name still resolves;
+# the PUBLIC ``snapshot_event_time`` is the single seam (DD-1).
+_event_time = snapshot_event_time
 
 
 def closing_window_snapshots(
@@ -104,7 +112,7 @@ def closing_window_snapshots(
     return [
         snap
         for snap in snapshots
-        if window_start <= _event_time(snap) < win.end_utc
+        if window_start <= snapshot_event_time(snap) < win.end_utc
     ]
 
 
@@ -174,4 +182,10 @@ def clv_cents(
     return edge if side == "buy" else -edge
 
 
-__all__ = ["CLV_WINDOW_MINUTES", "closing_window_snapshots", "vol_weighted_mid", "clv_cents"]
+__all__ = [
+    "CLV_WINDOW_MINUTES",
+    "snapshot_event_time",
+    "closing_window_snapshots",
+    "vol_weighted_mid",
+    "clv_cents",
+]
