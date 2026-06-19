@@ -169,8 +169,12 @@ def clv_cents(
     """Per-trade CLV in cents: a fill better than the close is POSITIVE (D-09).
 
     Both operands are CENTS: the closing mid (``vol_weighted_mid`` over snapshots whose ``mid``
-    is float-valued cents, CR-01) and the fill's ``avg_price_cents``. ``edge = closing_mid -
-    fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` (positive when we paid LESS than the
+    is float-valued cents, CR-01) and the fill's ``avg_price_cents``. The fill price here is the
+    un-rounded float ``avg_price_cents`` (off the Fill object / ``fills.detail['avg_price_cents']``),
+    NEVER the rounded integer ``fills.price`` column — reading the integer would re-introduce the
+    +/-0.5c rounding bias the float ``mid`` is deliberately kept ``Float`` to avoid (WR-05).
+    ``edge = closing_mid - fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` (positive when
+    we paid LESS than the
     volume-weighted closing mid — a good fill) and ``-edge`` for a ``"sell"`` (the sign flips:
     selling ABOVE the close is the good fill). No unit conversion is needed now that the
     persisted ``mid`` is cents. The closing mid is derived from ``closing_snapshots`` via

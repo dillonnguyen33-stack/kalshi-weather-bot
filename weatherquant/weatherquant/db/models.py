@@ -236,6 +236,14 @@ market_snapshots = sa.Table(
 # auditable against the forecast that produced it. ``detail`` (JSONB) carries the raw trade
 # payload, mirroring ``observations.detail``. The natural key (ticker, trade_id) is UNCHANGED
 # so ix_fills_latest is intact. Types mirror 0004 EXACTLY (metadata.create_all == migrated).
+#
+# PRECISION CONTRACT (WR-05): ``price`` is the ROUNDED whole-cent fill price — it exists for the
+# 1..99c band guard and human-readable display, NOT for derived money math. It carries a
+# +/-0.5c rounding bias, exactly the bias the ``market_snapshots.mid`` column was kept ``Float``
+# to avoid. Derived CLV MUST read the un-rounded size-weighted average from
+# ``detail['avg_price_cents']`` (float cents), never the integer ``price`` column — reconstructing
+# CLV from ``price`` would re-introduce the +/-0.5c bias the float ``mid`` deliberately avoids.
+# ``clv.clv_cents`` already consumes the float ``avg_price_cents`` off the Fill object / detail.
 fills = sa.Table(
     "fills",
     metadata,
