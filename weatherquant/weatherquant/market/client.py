@@ -1,25 +1,30 @@
-"""Signed Kalshi WS client + REST snapshot resync anchor (PAP-01).
+"""Signed Kalshi WS client + REST one-shot orderbook read (PAP-01).
 
 This is the live half of the orderbook feed:
 
 * :func:`fetch_snapshot` — a SIGNED REST ``GET /trade-api/v2/markets/{ticker}/orderbook``
-  that rebuilds a ticker's book from scratch. It signs the path WITHOUT the ``?depth`` query
-  (Pitfall 6 / threat T-05-06) and parses the ``orderbook_fp`` dollar-string pairs into the
-  ONE internal CENT representation the WS feed and the book also use
-  (:mod:`weatherquant.market.book`).
+  that reads a ticker's book from scratch for ``run_paper``'s ONE-SHOT use. It signs the path
+  WITHOUT the ``?depth`` query (Pitfall 6 / threat T-05-06) and parses the ``orderbook_fp``
+  dollar-string pairs into the ONE internal CENT representation via the SINGLE shared parser
+  :func:`weatherquant.market.book.parse_dollar_fp_side` (W1 — no second dollars→cents math
+  lives here). The verified live REST orderbook carries NO ``seq`` field, so
+  :func:`_resolve_seq` raises fail-loud ("no seq baseline", MED-5): REST is NOT a seq anchor.
 * :func:`run_feed` — the connection lifecycle: ``async for ws in connect(...)`` lets the
-  ``websockets`` iterator own socket reconnection + backoff, but on EVERY (re)connection the
-  loop body re-subscribes AND forces a REST re-snapshot of each ticker BEFORE resuming deltas
-  (the iterator reconnects the socket, not the book — threat T-05-09). A :class:`SeqGap` /
-  :class:`~weatherquant.ingest.errors.CorrectnessError` inside the delta loop discards the
-  affected book and re-snapshots (D-02); only genuinely transient errors log a structured
-  fallback and let the iterator reconnect.
+  ``websockets`` iterator own socket reconnection + backoff. On EVERY (re)connection the loop
+  body re-sends the subscribe command; the fresh WS ``orderbook_snapshot`` (seq=1) that
+  arrives after subscribe is what ANCHORS each book (B1 — run_feed does NOT REST-resnapshot on
+  connect; the seq-less REST payload would crash the feed on the first connect). A control
+  frame (``subscribed``/``ok``/``error``/``unsubscribed``) is skipped before book keying. A WS
+  seq gap (:class:`SeqGap` / :class:`~weatherquant.ingest.errors.CorrectnessError`) BREAKS the
+  delta loop so the ``async for ws`` iterator advances to the NEXT connection, which
+  re-subscribes for a FRESH WS snapshot (a new per-subscription seq baseline) — never a REST
+  resync for a seq the REST API does not return (D-02 redesign, live-verified).
 
 SSRF discipline (threat T-05-11, mirrors ``ingest/sources/_client.py``): the WS and REST
 hosts are FIXED prod/demo constants — never built from untrusted input — and are ``wss://`` /
 ``https://`` (TLS only, ASVS V9). The signed-handshake header builder, the WS connector, and
 the HTTP client are all INJECTABLE so the unit tests drive a mock WS that drops once and
-asserts the re-subscribe + re-snapshot happen on reconnect, with NO live network.
+asserts the re-subscribe + WS-snapshot re-anchor happen on reconnect, with NO live network.
 """
 
 from __future__ import annotations
@@ -35,7 +40,13 @@ import httpx
 import websockets
 
 from weatherquant.ingest.errors import CorrectnessError
-from weatherquant.market.book import OrderBook, SeqGap, apply
+from weatherquant.market.book import (
+    CONTROL_FRAME_TYPES,
+    OrderBook,
+    SeqGap,
+    apply,
+    parse_dollar_fp_side,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +64,6 @@ _WS_METHOD = "GET"
 _REST_ORDERBOOK_PATH = "/trade-api/v2/markets/{ticker}/orderbook"
 _REST_METHOD = "GET"
 
-# Dollars → cents: Kalshi REST returns price/size as dollar strings; converge to integer cents.
-_DOLLARS_TO_CENTS = 100
-
 # Type aliases for the injectable seams (so tests can supply mocks with no live network).
 SignerFn = Callable[[str, str], Mapping[str, str]]
 OnBookFn = Callable[[str, OrderBook], Any]
@@ -68,37 +76,17 @@ def _resolve_hosts(demo: bool) -> tuple[str, str]:
     return WS_URL_PROD, REST_HOST_PROD
 
 
-def _cents(dollar_string: str | float | int) -> int:
-    """Convert a dollar price/size string to integer cents (``round(p*100)``)."""
-    return round(float(dollar_string) * _DOLLARS_TO_CENTS)
-
-
 def _parse_fp_side(raw: Any) -> list[list[int]]:
-    """Parse one ``orderbook_fp`` side (``[[price_dollars, count], ...]``) to cent levels.
+    """Parse one ``orderbook_fp`` side to cent levels — delegates to the ONE shared parser (W1).
 
-    Only the PRICE is a dollar amount → converted to integer cents (``round(p*100)``); the
-    COUNT is a raw contract/share count, taken as an integer as-is (it is NOT a dollar amount,
-    so it must never be ×100 — that would inflate every resting size). Fails loud on a
-    malformed level (never coerce a fabricated level; ASVS V5, T-05-10). A missing side
-    (``None``) is an empty book side (absence = absence).
+    The dollar/fp side parse lives in exactly ONE home now:
+    :func:`weatherquant.market.book.parse_dollar_fp_side` (exported by 05-11). This thin wrapper
+    preserves the call sites in :func:`fetch_snapshot` while removing the duplicate dollars→cents
+    conversion that previously lived here — no second ``round(p*100)`` math survives in this
+    module (W1 grep gate). The price → integer cents and the count → ``round(float(...))``
+    fail-loud semantics are unchanged (they are the shared parser's, asserted by book's tests).
     """
-    if raw is None:
-        return []
-    levels: list[list[int]] = []
-    for level in raw:
-        # Validate the level is a 2-element [price, count] sequence BEFORE unpacking (mirror
-        # book._coerce_levels' len-2 guard) — a malformed level raises a descriptive ValueError,
-        # never a coerced/fabricated level or an opaque "not enough values to unpack" (HIGH-2).
-        if isinstance(level, (str, bytes, Mapping)):
-            raise ValueError(f"orderbook_fp level must be [price, count], got {level!r}")
-        items = list(level)
-        if len(items) != 2:
-            raise ValueError(
-                f"orderbook_fp level must be exactly [price, count], got {items!r}"
-            )
-        price_d, count = items
-        levels.append([_cents(price_d), round(float(count))])
-    return levels
+    return parse_dollar_fp_side(raw)
 
 
 def _observed_instant(response: Any) -> datetime:
@@ -237,29 +225,14 @@ def _subscribe_command(tickers: Sequence[str]) -> str:
     )
 
 
-async def _resnapshot_all(
-    books: Mapping[str, OrderBook],
-    http: Any,
-    signer: SignerFn,
-    tickers: Sequence[str],
-    *,
-    rest_host: str,
-) -> None:
-    """REST-resnapshot every ticker's book in place (the reconnect / seq-gap resync, D-02)."""
-    for ticker in tickers:
-        snapshot = await fetch_snapshot(http, signer, ticker, rest_host=rest_host)
-        apply(books[ticker], snapshot)
-
-
 async def _emit(on_book: OnBookFn, ticker: str, book: OrderBook) -> None:
     """Surface a book state to the downstream sink, awaiting a coroutine result (WR-04 wrapping).
 
     The ONE place the ``on_book(ticker, book) + await-if-awaitable`` contract lives, called from
-    all three emit sites (on-(re)connect re-snapshot, in-loop seq-gap re-snapshot, normal delta)
-    so the contract cannot drift again (CR-02). A raise from the downstream sink (e.g. a
-    transient DB write error in the persist sink) is caught and logged here rather than allowed
-    to tear down the whole live feed: a sink hiccup must NOT kill the orderbook feed; the caller
-    continues/reconnects (WR-04).
+    the per-message emit site (after each applied WS snapshot/delta) so the contract cannot
+    drift again (CR-02). A raise from the downstream sink (e.g. a transient DB write error in the
+    persist sink) is caught and logged here rather than allowed to tear down the whole live feed:
+    a sink hiccup must NOT kill the orderbook feed; the caller continues/reconnects (WR-04).
     """
     try:
         result = on_book(ticker, book)
@@ -279,26 +252,37 @@ async def run_feed(
     demo: bool = False,
     max_reconnects: int | None = None,
 ) -> None:
-    """Run the signed WS orderbook feed with auto-reconnect + re-subscribe + re-snapshot.
+    """Run the signed WS orderbook feed with auto-reconnect + re-subscribe + WS-snapshot anchor.
 
     The ``websockets`` iterator (``async for ws in connect(...)``) owns socket reconnection and
-    backoff. On EVERY (re)connection the loop body:
+    backoff. On EVERY (re)connection the loop body re-sends the ``orderbook_delta`` subscribe
+    command; the fresh WS ``orderbook_snapshot`` (seq=1) that arrives right after the subscribe
+    ANCHORS each book (B1 — run_feed does NOT REST-resnapshot on connect; the verified live REST
+    orderbook_fp carries no seq and would crash the feed via the "no seq baseline" raise). The
+    WS snapshot, not REST, is the per-subscription seq baseline.
 
-    1. re-sends the ``orderbook_delta`` subscribe command, AND
-    2. REST-re-snapshots every ticker's book (rebuilds the seq baseline from a fresh snapshot;
-       the reconnected socket must NOT reuse the stale local book — threat T-05-09),
+    Inside the delta loop:
 
-    BEFORE consuming any deltas. Inside the delta loop a :class:`SeqGap` /
-    :class:`~weatherquant.ingest.errors.CorrectnessError` discards + re-snapshots the affected
-    book (D-02); a malformed message fails loud; only ``websockets.ConnectionClosed`` (and
-    other transient socket errors) log a structured fallback and let the iterator reconnect.
+    * a control frame (``type`` in :data:`~weatherquant.market.book.CONTROL_FRAME_TYPES`) is
+      skipped (``continue``) BEFORE ticker keying — it is feed-level, not ticker-scoped;
+    * a WS ``orderbook_snapshot``/``orderbook_delta`` is routed through
+      :func:`~weatherquant.market.book.apply` and the book is surfaced to ``on_book``;
+    * a :class:`SeqGap` / :class:`~weatherquant.ingest.errors.CorrectnessError` BREAKS the delta
+      loop so the ``async for ws`` iterator advances to the NEXT connection, which re-subscribes
+      for a FRESH WS snapshot (a new per-subscription seq baseline) — the unknown book is never
+      carried forward and REST is never consulted for a seq it does not return (D-02 redesign);
+    * a malformed message fails loud; only ``websockets.ConnectionClosed`` (and other transient
+      socket errors) log a structured fallback and let the iterator reconnect.
 
     Args:
         tickers: the market tickers to subscribe to.
-        signer: ``signer(method, path) -> headers`` for the signed WS handshake + REST.
-        http: injectable async HTTP client for :func:`fetch_snapshot`.
-        on_book: optional callback ``on_book(ticker, book)`` invoked after each applied delta
-            (the downstream fill/snapshot sink); may be sync or async.
+        signer: ``signer(method, path) -> headers`` for the signed WS handshake.
+        http: injectable async HTTP client (kept for parity with :func:`fetch_snapshot`'s seam;
+            run_feed itself issues no REST call — the WS snapshot is the only seq anchor).
+        on_book: optional callback ``on_book(ticker, book)`` invoked after each applied WS
+            snapshot/delta (the downstream fill/snapshot sink); may be sync or async. The book
+            it receives carries the real WS event time on :attr:`OrderBook.event_time` after a
+            delta (PAP-03 carry+surface; the WS→persistence sink is deferred — B2).
         ws_connect: injectable WS connector returning an async iterator of connections (the
             ``websockets.connect`` async-iterator idiom); a mock in tests. Defaults to
             ``websockets.connect``.
@@ -306,81 +290,55 @@ async def run_feed(
         max_reconnects: optional bound on (re)connections — primarily for tests so a mock WS
             that always reconnects does not loop forever. ``None`` runs indefinitely.
     """
-    ws_url, rest_host = _resolve_hosts(demo)
+    ws_url, _ = _resolve_hosts(demo)
     connector = ws_connect or websockets.connect
     subscribe_cmd = _subscribe_command(tickers)
-    # One book object per ticker; re-snapshot rebuilds it, never replaced wholesale, so the
-    # downstream `on_book` reference stays stable across reconnects.
+    # One book object per ticker; the WS snapshot re-anchors it in place, never replaced
+    # wholesale, so the downstream `on_book` reference stays stable across reconnects.
     books: dict[str, OrderBook] = {t: OrderBook(t) for t in tickers}
 
     connections = 0
     async for ws in connector(ws_url, additional_headers=dict(signer(_WS_METHOD, WS_PATH))):
         connections += 1
         try:
-            # (Re)connect: re-subscribe AND force a REST re-snapshot BEFORE consuming deltas.
+            # (Re)connect: re-subscribe; the fresh WS snapshot (seq=1) re-anchors each book.
+            # No connect-time REST resnapshot (B1) — REST has no seq, the WS snapshot anchors.
             await ws.send(subscribe_cmd)
-            try:
-                await _resnapshot_all(books, http, signer, tickers, rest_host=rest_host)
-            except httpx.HTTPError as exc:
-                # A transient REST blip on (re)connection must NOT kill the feed: degrade to a
-                # reconnect so the `async for ws` iterator re-handshakes + retries the resync
-                # (WR-01). fetch_snapshot already logged + re-raised FAIL-LOUD at its boundary.
-                logger.warning(
-                    "[market error] on-reconnect re-snapshot failed (%s) — forcing WS reconnect",
-                    exc,
-                )
-                continue
-
-            # Surface every freshly re-anchored book to the sink IMMEDIATELY on (re)connect,
-            # mirroring the in-loop seq-gap path (CR-02). Otherwise a reconnect that re-anchors a
-            # book inside the CLV closing window — then disconnects before any delta — silently
-            # drops that snapshot from persistence (the states most likely to fall inside a
-            # closing window after a disruption), and the very first observed book is never
-            # persisted until a delta mutates it.
-            if on_book is not None:
-                for ticker in tickers:
-                    await _emit(on_book, ticker, books[ticker])
 
             async for raw in ws:
                 msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                # A control frame ('subscribed'/'ok'/'error'/'unsubscribed') is feed-level and
+                # carries no ticker key — skip it BEFORE _msg_ticker keys a book (the verified
+                # first frame after subscribe; one home for the set in book.py — W1).
+                if isinstance(msg, Mapping) and msg.get("type") in CONTROL_FRAME_TYPES:
+                    logger.debug("[ws] skipping control frame: %s", msg.get("type"))
+                    continue
                 ticker = _msg_ticker(msg, tickers)
                 book = books[ticker]
                 try:
                     apply(book, msg)
                 except (SeqGap, CorrectnessError) as gap:
-                    # The local book is unknown across the gap — discard + REST resync (D-02).
+                    # The local book is UNKNOWN across the gap — break to the reconnect iterator
+                    # so the NEXT connection re-subscribes for a FRESH WS snapshot (new seq
+                    # baseline), never REST-resyncing for a seq REST does not return (D-02
+                    # redesign, W2). Do NOT re-subscribe on this same socket; do NOT fetch.
                     logger.warning(
-                        "[orderbook error] seq gap on %s (%s) — re-snapshotting via REST (D-02)",
+                        "[orderbook error] seq gap on %s (%s) — re-subscribing for a fresh WS "
+                        "snapshot (D-02)",
                         ticker,
                         gap,
                     )
-                    try:
-                        snapshot = await fetch_snapshot(http, signer, ticker, rest_host=rest_host)
-                    except httpx.HTTPError as exc:
-                        # A transient REST blip during the exact moment the book must re-anchor
-                        # must NOT crash the feed: break the delta loop so the `async for ws`
-                        # iterator reconnects + re-snapshots (WR-01).
-                        logger.warning(
-                            "[market error] re-snapshot of %s failed (%s) — forcing WS reconnect",
-                            ticker,
-                            exc,
-                        )
-                        break
-                    apply(book, snapshot)
-                    # Surface the freshly re-anchored book to the sink BEFORE continuing —
-                    # otherwise every REST-resync book state (precisely the states most likely
-                    # to fall inside a CLV closing window after a disruption) is silently
-                    # dropped from persistence (WR-02 / PAP-04 cadence sufficiency). Routed
-                    # through the one _emit helper so a raising sink cannot kill the feed (WR-04).
-                    if on_book is not None:
-                        await _emit(on_book, ticker, book)
-                    continue
+                    break
+                # Surface the freshly applied book (snapshot or delta) to the sink. The book's
+                # .event_time is the real WS event time after a delta (PAP-03 carry+surface, B2);
+                # the WS→persistence sink is deferred (not wired here). Routed through the one
+                # _emit helper so a raising sink cannot kill the feed (WR-04).
                 if on_book is not None:
                     await _emit(on_book, ticker, book)
         except websockets.ConnectionClosed as exc:
             # EXPECTED transient: the iterator reconnects with backoff; structured fallback.
             logger.warning(
-                "[ws error] kalshi WS connection closed (%s) — reconnecting + re-snapshotting",
+                "[ws error] kalshi WS connection closed (%s) — reconnecting + re-subscribing",
                 exc,
             )
         if max_reconnects is not None and connections >= max_reconnects:
@@ -394,15 +352,24 @@ def _msg_ticker(msg: Mapping[str, Any], tickers: Sequence[str]) -> str:
     ``run_feed`` — the trust boundary (TS-1). A present ticker key whose value is not a str
     (e.g. an int ``market_id``) FAILS LOUD here rather than silently mis-keying or
     KeyErroring another ticker's book; the ``-> str`` annotation is now actually enforced.
+
+    The verified live WS envelope nests the ticker under the ``msg`` body
+    (``msg.market_ticker``), while the REST one-shot snapshot shape from :func:`fetch_snapshot`
+    carries it at the top level (``ticker``). So check the unwrapped ``msg`` body FIRST, then the
+    top level — mirroring :func:`weatherquant.market.book._ticker_of`'s envelope read so both
+    sides agree on where the ticker lives (one tolerated set of spellings, A1).
     """
-    for key in ("market_ticker", "market_id", "ticker"):
-        if key in msg:
-            value = msg[key]
-            if not isinstance(value, str):
-                raise ValueError(
-                    f"orderbook ticker under {key!r} is not a str: {value!r}"
-                )
-            return value
+    body = msg.get("msg") if isinstance(msg, Mapping) else None
+    scopes = [body, msg] if isinstance(body, Mapping) else [msg]
+    for scope in scopes:
+        for key in ("market_ticker", "market_id", "ticker"):
+            if key in scope:
+                value = scope[key]
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"orderbook ticker under {key!r} is not a str: {value!r}"
+                    )
+                return value
     if len(tickers) == 1:
         return tickers[0]
     raise ValueError(
