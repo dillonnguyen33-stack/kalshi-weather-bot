@@ -14,7 +14,7 @@ import pytest
 
 from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.market import reflect
-from weatherquant.market.book import OrderBook, SeqGap, apply
+from weatherquant.market.book import OrderBook, SeqGap, _ticker_of, apply
 
 
 def _levels_map(pairs):
@@ -106,6 +106,21 @@ def test_ticker_key_spelling_tolerated():
         book = OrderBook()
         apply(book, {"type": "orderbook_snapshot", "seq": 1, key: "KX-T", "yes": [], "no": []})
         assert book.ticker == "KX-T"
+
+
+def test_ticker_of_non_str_fails_loud():
+    """TS-1: a present non-str ticker key raises rather than returning a non-str (mis-keys).
+
+    ``_ticker_of`` is annotated ``-> str | None``; a present-but-non-str ticker value (an int
+    ``market_id``) must fail loud so the declared type is actually enforced, never coerced.
+    """
+    with pytest.raises(ValueError, match="is not a str"):
+        _ticker_of({"type": "orderbook_snapshot", "market_id": 123})
+
+
+def test_ticker_of_absent_key_returns_none():
+    """A1 tolerance preserved: an ABSENT ticker key still returns None (not a raise)."""
+    assert _ticker_of({"type": "orderbook_snapshot", "seq": 1}) is None
 
 
 def test_book_feeds_reflect_seam(orderbook_snapshot):

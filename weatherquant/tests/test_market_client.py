@@ -19,6 +19,7 @@ from weatherquant.market.client import (
     REST_HOST_PROD,
     WS_URL_DEMO,
     WS_URL_PROD,
+    _msg_ticker,
     fetch_snapshot,
     run_feed,
 )
@@ -262,7 +263,26 @@ async def test_fetch_snapshot_malformed_level_fails_loud():
         await fetch_snapshot(http, _signer, _TICKER)
 
 
-async def test_hosts_are_fixed_constants():
+async def test_msg_ticker_non_str_fails_loud():
+    """TS-1: a present non-str ticker (an int market_id) raises rather than mis-keying.
+
+    Driven with a MULTI-ticker feed so the single-ticker shortcut cannot short-circuit the
+    guard: the untrusted ``market_id`` crosses the WS/REST trust boundary and would key
+    ``books[ticker]`` — a non-str must fail loud, never silently mis-key/KeyError another
+    ticker's book.
+    """
+    msg = {"type": "orderbook_delta", "market_id": 123, "seq": 5}
+    with pytest.raises(ValueError, match="is not a str"):
+        _msg_ticker(msg, ["KX-A", "KX-B"])
+
+
+async def test_msg_ticker_str_passes_through():
+    """A well-formed str ticker still resolves unchanged (happy path preserved)."""
+    msg = {"type": "orderbook_delta", "market_id": "KX-A", "seq": 5}
+    assert _msg_ticker(msg, ["KX-A", "KX-B"]) == "KX-A"
+
+
+def test_hosts_are_fixed_constants():
     """The WS/REST hosts are fixed prod/demo constants (no host from untrusted input, T-05-11)."""
     assert WS_URL_PROD.startswith("wss://")
     assert WS_URL_DEMO.startswith("wss://")

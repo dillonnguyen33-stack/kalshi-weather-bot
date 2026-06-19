@@ -158,10 +158,22 @@ def _msg_get(msg: Mapping[str, Any], key: str) -> Any:
 
 
 def _ticker_of(msg: Mapping[str, Any]) -> str | None:
-    """Return the ticker under whichever documented key is present (A1 — tolerate spellings)."""
+    """Return the ticker under whichever documented key is present (A1 — tolerate spellings).
+
+    The ticker value is UNTRUSTED WS JSON; a present-but-non-str value FAILS LOUD so the
+    declared ``str | None`` is actually enforced (TS-1, mirror ``_msg_get``'s style) rather
+    than coercing a non-str into the book. An ABSENT ticker key still returns None — A1
+    tolerates a snapshot that omits the key (absence is the tolerated case; only a
+    present-but-malformed value raises).
+    """
     for key in _TICKER_KEYS:
         if key in msg:
-            return msg[key]
+            value = msg[key]
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"orderbook ticker under {key!r} is not a str: {value!r}"
+                )
+            return value
     return None
 
 

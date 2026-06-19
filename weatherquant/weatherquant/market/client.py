@@ -334,10 +334,21 @@ async def run_feed(
 
 
 def _msg_ticker(msg: Mapping[str, Any], tickers: Sequence[str]) -> str:
-    """Resolve the ticker a message belongs to (tolerant key; single-ticker shortcut)."""
+    """Resolve the ticker a message belongs to (tolerant key; single-ticker shortcut).
+
+    The ticker value is UNTRUSTED WS/REST JSON that immediately keys ``books[ticker]`` in
+    ``run_feed`` — the trust boundary (TS-1). A present ticker key whose value is not a str
+    (e.g. an int ``market_id``) FAILS LOUD here rather than silently mis-keying or
+    KeyErroring another ticker's book; the ``-> str`` annotation is now actually enforced.
+    """
     for key in ("market_ticker", "market_id", "ticker"):
         if key in msg:
-            return msg[key]
+            value = msg[key]
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"orderbook ticker under {key!r} is not a str: {value!r}"
+                )
+            return value
     if len(tickers) == 1:
         return tickers[0]
     raise ValueError(
