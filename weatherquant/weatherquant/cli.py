@@ -272,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument(
         "--demo",
         action="store_true",
-        help="Use the fixed Kalshi DEMO hosts for the orderbook snapshot (SSRF-safe const).",
+        help="Use the fixed Kalshi DEMO environment (REST + future WS hosts, SSRF-safe consts).",
     )
     return parser
 
@@ -800,12 +800,20 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
 
     import httpx
 
+    from weatherquant.market.client import _resolve_hosts
+
+    # Resolve the COMPLETE (ws_url, rest_host) environment pair from the single --demo flag via
+    # the one host-resolution seam (WR-06). Today run_paper does a one-shot REST fetch with no WS,
+    # so only rest_host is consumed here — but resolving BOTH from --demo through _resolve_hosts
+    # keeps the flag's meaning complete and stable: when a WS feed is wired into run_paper, ws_url
+    # is already the matching demo/prod host, never a cross-environment book on the money path.
+    demo = bool(getattr(args, "demo", False))
+    ws_url, rest_host = _resolve_hosts(demo)
+    del ws_url  # not consumed until the WS feed lands; resolved here so the flag stays complete.
+
     async def _fetch() -> dict[str, Any]:
         async with httpx.AsyncClient() as http:
-            rest_host = _demo_rest_host() if getattr(args, "demo", False) else None
-            if rest_host is not None:
-                return await fetch_snapshot(http, signer.sign, ticker, rest_host=rest_host)
-            return await fetch_snapshot(http, signer.sign, ticker)
+            return await fetch_snapshot(http, signer.sign, ticker, rest_host=rest_host)
 
     snapshot = asyncio.run(_fetch())
     event_time = _snapshot_event_time(snapshot)
@@ -1000,13 +1008,6 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         "fill": fill_summary,
         "persisted_snapshot_times": persisted_snapshot_times,
     }
-
-
-def _demo_rest_host() -> str:
-    """Return the fixed Kalshi DEMO REST host constant (SSRF guard; never untrusted input)."""
-    from weatherquant.market.client import REST_HOST_DEMO
-
-    return REST_HOST_DEMO
 
 
 def main(argv: list[str] | None = None) -> int:
