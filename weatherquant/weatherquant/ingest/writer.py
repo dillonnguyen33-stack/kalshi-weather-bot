@@ -28,13 +28,9 @@ import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
 
 from weatherquant.db.models import fills, forecasts, market_snapshots, observations
+from weatherquant.db.types import Bind
 from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.ingest.idempotency import row_exists
-
-# A SQLAlchemy execution target. Single-sourced here so every write path (writer +
-# the store_* helpers + the orchestrator) types its ``bind`` identically — a ``bind``
-# built by get_engine() carries the preserve_rowcount contract (D-11).
-Bind = Engine | Connection
 
 
 class WriteIntegrityError(CorrectnessError, RuntimeError):
@@ -49,7 +45,7 @@ class WriteIntegrityError(CorrectnessError, RuntimeError):
 
 
 def _insert_row(
-    bind: Engine | Connection,
+    bind: Bind,
     table: sa.Table,
     natural_key: Mapping[str, object],
     content: Mapping[str, object],
@@ -69,16 +65,21 @@ def _insert_row(
             return 0  # identical row already in the ledger — skip (D-10), no UPDATE.
         values = {**natural_key, **content, "available_at": available_at}
         result = conn.execute(table.insert().values(**values))
+        # Bind result.rowcount (typed ``Any`` by the SQLAlchemy stubs) to an int local on the
+        # ONE audited insert path whose whole purpose is the rowcount==1 integrity contract
+        # (TS-2, D-11): typing the guard's input means a future ``rowcount -> int | None``
+        # widening regression is caught by mypy rather than silently slipping past the check.
+        rowcount: int = result.rowcount
         # preserve_rowcount (engine.get_engine) makes a single-row insert report 1 despite
         # the implicit RETURNING id on the Identity() PK (D-11 contract). This integrity
         # guard is an explicit raise, NOT a bare assert: `python -O` / PYTHONOPTIMIZE strips
         # asserts, which would silently disable the only check that the single audited insert
         # actually landed a row (WR-06).
-        if result.rowcount != 1:
+        if rowcount != 1:
             raise WriteIntegrityError(
-                f"expected rowcount==1 inserting into {table.name}, got {result.rowcount}"
+                f"expected rowcount==1 inserting into {table.name}, got {rowcount}"
             )
-        return result.rowcount
+        return rowcount
 
     if isinstance(bind, Engine):
         with bind.begin() as conn:
@@ -87,7 +88,7 @@ def _insert_row(
 
 
 def insert_forecast(
-    bind: Engine | Connection,
+    bind: Bind,
     *,
     city: str,
     target_date: date,
@@ -129,7 +130,7 @@ def insert_forecast(
 
 
 def insert_observation(
-    bind: Engine | Connection,
+    bind: Bind,
     *,
     city: str,
     target_date: date,
@@ -169,7 +170,7 @@ def insert_observation(
 
 
 def insert_market_snapshot(
-    bind: Engine | Connection,
+    bind: Bind,
     *,
     ticker: str,
     snapshot_for: str,
@@ -218,7 +219,7 @@ def insert_market_snapshot(
 
 
 def insert_fill(
-    bind: Engine | Connection,
+    bind: Bind,
     *,
     ticker: str,
     trade_id: str,

@@ -55,10 +55,11 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
-from sqlalchemy.engine import Connection, Engine, RowMapping
+from sqlalchemy.engine import RowMapping
 
 from weatherquant.calibrate.emos import fit_stratum
 from weatherquant.db import queries
+from weatherquant.db.types import Bind
 
 __all__ = [
     "kelvin_to_fahrenheit",
@@ -413,7 +414,7 @@ def assemble_pairs_from_rows(
 
 
 def assemble_training_pairs(
-    bind: Engine | Connection,
+    bind: Bind,
     *,
     city: str,
     model: str,

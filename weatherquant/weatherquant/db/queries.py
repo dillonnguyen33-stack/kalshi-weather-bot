@@ -22,13 +22,14 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy.engine import Connection, Engine, RowMapping
+from sqlalchemy.engine import Engine, RowMapping
 
 from weatherquant.db.models import NATURAL_KEYS, metadata
+from weatherquant.db.types import Bind
 
 
 def latest(
-    bind: Engine | Connection,
+    bind: Bind,
     table_name: str,
     natural_key: Sequence[str] | None = None,
     where: Mapping[str, Any] | None = None,

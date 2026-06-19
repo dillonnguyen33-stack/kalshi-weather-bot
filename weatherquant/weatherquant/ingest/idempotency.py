@@ -26,9 +26,10 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Engine
 
 from weatherquant.db.models import metadata
+from weatherquant.db.types import Bind
 
 
 def _match_condition(column: sa.Column[Any], value: object) -> sa.ColumnElement[bool]:
@@ -52,7 +53,7 @@ def _match_condition(column: sa.Column[Any], value: object) -> sa.ColumnElement[
 
 
 def row_exists(
-    bind: Engine | Connection,
+    bind: Bind,
     table_name: str,
     natural_key_values: Mapping[str, object],
     content_cols: Mapping[str, object],

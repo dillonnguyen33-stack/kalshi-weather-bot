@@ -22,12 +22,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 
-from sqlalchemy.engine import Connection, Engine, RowMapping
+from sqlalchemy.engine import RowMapping
 
 from weatherquant.db import queries
+from weatherquant.db.types import Bind
 from weatherquant.ingest.writer import insert_fill, insert_market_snapshot
-
-Bind = Engine | Connection
 
 
 def persist_snapshot(
