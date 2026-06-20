@@ -1,34 +1,13 @@
-"""Blended CDF → Kalshi bucket probabilities + ticker parser (PRC-02, D-04/D-05/D-06).
+"""Blended CDF → Kalshi bucket probabilities + ticker parser (D-04/D-05/D-06).
 
-Map the continuous blended Gaussian onto the integer-°F Kalshi bucket ladder by CDF
-differencing — ``P(bucket) = Φ_blend(upper) − Φ_blend(lower)`` — reusing the erf-based
-normal CDF promoted public in :mod:`weatherquant.calibrate.crps` (``normal_cdf``), never a
-second erf implementation (D-04, RESEARCH Pitfall 6). Open buckets (``≤X``, ``≥Y``) use the
-one-sided tail. A full ladder's probabilities are asserted to sum to ~1 by
-``tests/test_buckets.py -k sum``.
+CDF differencing ``P(bucket) = Φ_blend(upper) − Φ_blend(lower)`` over the integer-°F ladder,
+reusing the erf-based ``normal_cdf`` from :mod:`weatherquant.calibrate.crps` (D-04, Pitfall 6);
+open buckets use the one-sided tail. Each integer degree ``k`` owns ``[k − _HALF, k + _HALF)``
+(D-05, Pitfall 1). The exact label coverage is LOW-confidence; the live KXHIGH cross-check is
+DEFERRED to Phase 5 (D-05; see docs/DECISIONS.md), and the principled mapping is retained
+as-is. ``parse_ticker`` is a pure, fail-loud string→edges parser (D-06).
 
-The settled value is a whole-°F NWS Daily Climate Report high, but the predictive
-distribution is continuous, so each integer degree ``k`` owns the half-open continuous
-interval ``[k − _HALF, k + _HALF)`` and a bucket's mass sums ``Φ(k+_HALF) − Φ(k−_HALF)`` over
-the integers it covers (D-05, RESEARCH Pitfall 1). The half-degree offset lives in ONE place
-(``_HALF``) and the inclusive-integer coverage in ONE helper (``integers_in_bucket``); the
-exact coverage of a label is LOW-confidence and was gated behind the 04-06
-``checkpoint:human-verify`` against a live ``KXHIGH`` market.
-
-That live cross-check was DEFERRED to Phase 5 by user decision (2026-06-17): no Kalshi API
-key / client is configured this session (the ``KXHIGH`` ingest is itself Phase-5 work), so the
-principled ``[k − _HALF, k + _HALF)`` mapping is RETAINED as-is and locked in Phase 5 when the
-live market record is available. The ``tests/test_buckets.py -k real_ladder`` case exercises a
-representative integer ``KXHIGH``-shaped ladder (open tails included) under this coverage:
-it tiles to ~1 and keeps the modal bucket on the blended μ (Pitfall 1's warning sign — a
-one-degree shift — is asserted absent). This remains a Phase-5 deferred item, NOT a value
-confirmed against a live market.
-
-``parse_ticker`` is a pure string→edges parser (no I/O, D-06): it fails loud on a malformed
-ticker (raise, never silently default an edge — ASVS V5) and prefers the structured
-``floor_strike``/``cap_strike`` the Kalshi API supplies over label parsing.
-
-Pure NumPy + stdlib ``math`` only — no scipy/sklearn (the AST guard enforces it).
+Pure NumPy + stdlib ``math`` only — no scipy/sklearn (AST guard).
 """
 
 from __future__ import annotations
@@ -44,12 +23,9 @@ from weatherquant.calibrate.crps import normal_cdf
 
 __all__ = ["integers_in_bucket", "bucket_prob", "bucket_probs", "parse_ticker"]
 
-# The single half-degree bucket-edge offset (D-05 / RESEARCH Pitfall 1): integer degree ``k``
-# owns the continuous interval ``[k − _HALF, k + _HALF)``. Centralized here so a one-place
-# change (when the live-market cross-check lands) re-maps every bucket consistently.
-# LOW-confidence value: the exact inclusive-integer coverage of a label is to be locked by the
-# live ``KXHIGH`` cross-check, DEFERRED to Phase 5 (no Kalshi API this session, user decision
-# 2026-06-17). Retained as the principled default — do not treat it as confirmed-against-live.
+# The single half-degree bucket-edge offset (D-05 / Pitfall 1): integer degree ``k`` owns
+# ``[k − _HALF, k + _HALF)``. LOW-confidence; the live KXHIGH cross-check is DEFERRED to
+# Phase 5 (see docs/DECISIONS.md) — do not treat as confirmed-against-live.
 _HALF = 0.5
 
 
@@ -59,21 +35,12 @@ def integers_in_bucket(
     open_lo: bool = False,
     open_hi: bool = False,
 ) -> tuple[float, float]:
-    """Continuous ``[k − _HALF, k + _HALF)`` span for a labeled bucket (D-05, Pitfall 1).
+    """Continuous ``[lo − _HALF, hi + _HALF)`` span for a labeled bucket (D-05, Pitfall 1).
 
-    Maps the inclusive integer degrees a bucket label covers (``lo``..``hi``) to the single
-    continuous interval used for CDF differencing: the lowest integer ``lo`` contributes its
-    lower edge ``lo − _HALF`` and the highest integer ``hi`` its upper edge ``hi + _HALF``, so
-    the whole label spans ``[lo − _HALF, hi + _HALF)``. Summing per-integer
-    ``[k − _HALF, k + _HALF)`` intervals over ``lo..hi`` collapses to exactly this span
-    because the integers are contiguous, which is what makes a full ladder tile the line
-    without gaps or overlaps.
-
-    ``open_lo`` / ``open_hi`` mark open-ended tail buckets (``≤X`` / ``≥Y``): the open end uses
-    the ∓∞ sentinel and only the closed end carries a ``±_HALF`` offset.
-
-    The edge offset lives in exactly one place (``_HALF``); see the module docstring on the
-    04-06 human-verify lock.
+    Maps the inclusive integer degrees ``lo``..``hi`` to the single continuous interval for CDF
+    differencing; contiguous integers collapse the per-integer spans to ``[lo − _HALF, hi + _HALF)``,
+    which is what tiles a full ladder without gaps or overlaps. ``open_lo`` / ``open_hi`` mark
+    tail buckets (``≤X`` / ``≥Y``): the open end is the ∓∞ sentinel, only the closed end offsets.
     """
     if open_lo:
         if hi is None:
@@ -104,19 +71,12 @@ def bucket_prob(
     open_lo: bool = False,
     open_hi: bool = False,
 ) -> float:
-    """Probability mass in one continuous bucket by CDF differencing (D-04, Pattern 2).
+    """Probability mass in one continuous bucket by CDF differencing (D-04).
 
-    Returns ``Φ_blend(hi) − Φ_blend(lo)`` with ``Φ_blend`` the blended-Gaussian CDF, computed
-    via the erf-based ``normal_cdf`` promoted public in :mod:`weatherquant.calibrate.crps`
-    (never a second erf — Pitfall 6). ``lo``/``hi`` are the CONTINUOUS edges already offset by
-    ``±_HALF`` (see :func:`integers_in_bucket`).
-
-    ``open_hi=True`` collapses the upper edge to the ``1.0`` tail (mass up to ``+∞``);
-    ``open_lo=True`` collapses the lower edge to the ``0.0`` tail (mass from ``−∞``).
-
-    Fails loud (ASVS V5 / threat T-04-09, mirroring commit ``93202d8``): ``sigma`` must be
-    strictly positive and finite, and ``mu`` finite — a non-finite or non-positive input
-    raises rather than silently returning a NaN probability.
+    ``Φ_blend(hi) − Φ_blend(lo)`` via the erf-based ``normal_cdf`` (Pitfall 6); ``lo``/``hi`` are
+    CONTINUOUS edges already offset by ``±_HALF`` (see :func:`integers_in_bucket`). ``open_hi``
+    collapses the upper edge to the ``1.0`` tail; ``open_lo`` the lower edge to ``0.0``. Fails
+    loud (ASVS V5 / T-04-09): ``mu`` finite, ``sigma`` finite and > 0.
     """
     if not math.isfinite(mu):
         raise ValueError(f"bucket_prob: mu must be finite, got {mu!r}.")
@@ -133,14 +93,11 @@ def bucket_probs(
     sigma: float,
     ladder: Sequence[tuple[float, float, bool, bool]],
 ) -> NDArray[np.float64]:
-    """Probabilities across a full bucket ladder, summing to ~1 (D-04, Pattern 2).
+    """Probabilities across a full bucket ladder, summing to ~1 (D-04).
 
     ``ladder`` is a sequence of ``(lo, hi, open_lo, open_hi)`` continuous buckets tiling the
-    line (including the open ``≤X`` / ``≥Y`` tails). Returns one probability per bucket as a
-    float array. When the ladder tiles ``(−∞, ∞)`` with no gaps or overlaps — the property
-    :func:`integers_in_bucket` guarantees — the array sums to ~1 (asserted by
-    ``tests/test_buckets.py -k sum`` within 1e-9). ``mu``/``sigma`` are guarded by
-    :func:`bucket_prob` per bucket (fail loud on non-finite / σ≤0).
+    line (open tails included); returns one float probability per bucket. A gapless tiling of
+    ``(−∞, ∞)`` sums to ~1. ``mu``/``sigma`` are guarded per bucket by :func:`bucket_prob`.
     """
     return np.array(
         [bucket_prob(mu, sigma, lo, hi, open_lo, open_hi) for lo, hi, open_lo, open_hi in ladder],
@@ -148,10 +105,8 @@ def bucket_probs(
     )
 
 
-# Kalshi ``KXHIGH{CITY}`` daily-high series → registry city key (RESEARCH §Market Structure,
-# A10): the ticker SUFFIX is Kalshi's market code and is NOT the repo's internal registry key
-# (``NY`` ≠ ``NYC``). Encoded as ONE named lookup with a docstring so the suffix↔key mapping
-# lives in a single auditable place; suffixes are LOW-confidence and verified live in 04-06.
+# Kalshi ``KXHIGH{CITY}`` ticker suffix → registry city key (A10): the suffix is Kalshi's
+# market code, NOT the internal registry key (``NY`` ≠ ``NYC``). Suffixes are LOW-confidence.
 TICKER_CITY_SUFFIX_TO_KEY: dict[str, str] = {
     "NY": "NYC",
     "CHI": "CHI",
@@ -162,20 +117,19 @@ TICKER_CITY_SUFFIX_TO_KEY: dict[str, str] = {
     "AUS": "AUS",
 }
 
-# ``KXHIGH<SUFFIX>-<lo>-<hi>`` closed-range ticker (e.g. ``KXHIGHNY-62-63``). The suffix is
-# alphabetic; the two strikes are integers. Open-tail tickers are parsed from the label form.
+# ``KXHIGH<SUFFIX>-<lo>-<hi>`` closed-range ticker (e.g. ``KXHIGHNY-62-63``); open-tail
+# tickers are parsed from the label form.
 _TICKER_RANGE_RE = re.compile(r"^KXHIGH(?P<suffix>[A-Z]+)-(?P<lo>-?\d+)-(?P<hi>-?\d+)$")
 
-# Human-label forms on ``yes_sub_title`` / ``subtitle`` (RESEARCH §Market Structure). The ``°``
-# is optional so both the unicode-degree and ASCII forms round-trip.
+# Human-label forms on ``yes_sub_title`` / ``subtitle``; the ``°`` is optional so unicode and
+# ASCII forms both round-trip.
 _LABEL_RANGE_RE = re.compile(r"^\s*(?P<lo>-?\d+)\s*°?\s*to\s*(?P<hi>-?\d+)\s*°?\s*$", re.IGNORECASE)
 _LABEL_LE_RE = re.compile(r"^\s*(?:≤|<=)\s*(?P<v>-?\d+)\s*°?\s*$")
 _LABEL_GE_RE = re.compile(r"^\s*(?:≥|>=)\s*(?P<v>-?\d+)\s*°?\s*$")
 _LABEL_BELOW_RE = re.compile(r"^\s*(?P<v>-?\d+)\s*°?\s*or\s*below\s*$", re.IGNORECASE)
 _LABEL_ABOVE_RE = re.compile(r"^\s*(?P<v>-?\d+)\s*°?\s*or\s*above\s*$", re.IGNORECASE)
 
-# Structured ``strike_type`` values that denote open tails (RESEARCH §Market Structure: the
-# Kalshi market record carries ``strike_type`` ∈ {between, greater, less, ...}).
+# Structured ``strike_type`` values from the Kalshi market record (∈ {between, greater, less, ...}).
 _STRIKE_TYPE_LESS = {"less", "less_or_equal", "below"}
 _STRIKE_TYPE_GREATER = {"greater", "greater_or_equal", "above"}
 _STRIKE_TYPE_BETWEEN = {"between", "range", "in_range"}
@@ -191,31 +145,21 @@ def parse_ticker(
 ) -> tuple[int | None, int | None, bool, bool]:
     """Pure ``ticker/strike → (lo, hi, open_lo, open_hi)`` edge parser, fail-loud (D-06).
 
-    A PURE function (no I/O): it never touches the DB, network, or filesystem — Phase 5 feeds
-    the raw ticker / strike fields in. Returns the inclusive integer-degree bounds plus the
-    open-tail markers. For an open-low (``≤X``) bucket ``lo`` is ``None`` and ``open_lo`` is
-    ``True``; for an open-high (``≥Y``) bucket ``hi`` is ``None`` and ``open_hi`` is ``True``.
-
-    Input precedence (RESEARCH §Market Structure): the STRUCTURED Kalshi strike fields
-    (``floor_strike`` / ``cap_strike`` + ``strike_type``) are preferred over a human ``label``
-    when present, because the structured strikes are authoritative and label text varies. The
-    positional ``ticker`` string (``KXHIGH{SUFFIX}-lo-hi``) is parsed when no structured
-    strikes are given; ``label`` is the final fallback.
-
-    Fails LOUD (ASVS V5 / threat T-04-07, mirroring ``cli._parse_date``): empty, non-numeric,
-    unrecognized, or inverted (``lo > hi``) input raises :class:`ValueError` — it NEVER
-    silently defaults an edge, which would mis-price every bucket. ``KXHIGH`` city-suffix
-    lookups go through :data:`TICKER_CITY_SUFFIX_TO_KEY` (suffix ≠ registry key, RESEARCH A10).
+    PURE (no I/O). Returns inclusive integer-degree bounds plus open-tail markers (open-low
+    ``≤X`` ⇒ ``lo=None, open_lo=True``; open-high ``≥Y`` ⇒ ``hi=None, open_hi=True``).
+    Precedence: structured strikes (``floor_strike``/``cap_strike`` + ``strike_type``, the
+    authoritative path) > positional ``ticker`` > ``label``. Fails LOUD (ASVS V5 / T-04-07):
+    empty, non-numeric, unrecognized, or inverted input raises rather than default an edge.
     """
-    # --- 1. Structured strikes win (authoritative; label only cross-checks). ---
+    # 1. Structured strikes win (authoritative).
     if strike_type is not None or floor_strike is not None or cap_strike is not None:
         return _parse_structured(floor_strike, cap_strike, strike_type)
 
-    # --- 2. Positional KXHIGH ticker. ---
+    # 2. Positional KXHIGH ticker.
     if ticker is not None:
         return _parse_ticker_string(ticker)
 
-    # --- 3. Human label fallback. ---
+    # 3. Human label fallback.
     if label is not None:
         return _parse_label(label)
 
@@ -236,7 +180,7 @@ def _parse_structured(
     cap_strike: int | None,
     strike_type: str | None,
 ) -> tuple[int | None, int | None, bool, bool]:
-    """Parse the structured Kalshi strike fields (preferred path, RESEARCH §Market Structure)."""
+    """Parse the structured Kalshi strike fields (preferred path)."""
     st = strike_type.strip().lower() if strike_type is not None else None
 
     if st in _STRIKE_TYPE_LESS:
