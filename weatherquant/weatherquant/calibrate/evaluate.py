@@ -1,40 +1,19 @@
 """Out-of-sample validation harness: temporal split + raw-ensemble baseline (criterion 4).
 
-This is Phase 3's SANITY gate (D-10/D-11/D-12) — it confirms EMOS/NGR calibration actually
-adds skill over the raw ensemble the system would otherwise price. It is emphatically NOT the
-pre-registered Gate-1 proof (Phase 6: walk-forward, v3 head-to-head, block-bootstrap CIs); it
-only answers "does the calibrated per-stratum predictive distribution beat the raw-ensemble
-baseline on held-out data?".
+Phase 3's SANITY gate (D-10/D-11/D-12): does the calibrated per-stratum distribution beat the
+raw-ensemble baseline on held-out data? NOT the pre-registered Gate-1 proof (that is Phase 6).
 
-**Temporal split (D-10, RESEARCH Pitfall 4).** :func:`temporal_split` orders a stratum's
-samples by ``target_date`` and partitions into an EARLIER train slice and a STRICTLY-LATER OOS
-slice. A random/shuffled split is explicitly wrong here: it leaks future information into the
-fit (look-ahead) and is inconsistent with Phase 6's walk-forward philosophy. The split is the
-structural no-look-ahead guard.
+* Temporal split (D-10): :func:`temporal_split` partitions by ``target_date`` into an EARLIER
+  train slice and a STRICTLY-LATER OOS slice — never shuffled, which would leak look-ahead.
+* Anti-p-hacking (D-12): fit hyperparameters are fixed research defaults, NOT tuned on this OOS
+  slice, which must stay disjoint from Phase 6's Gate-1 test set.
+* Raw-ensemble baseline (D-11): the no-EMOS Gaussian is ``(mu = m, sigma = sqrt(s2))``; a fully
+  deterministic stratum falls back to the TRAIN-slice residual std (train-only, no OOS peek).
+  Lives in one place: :func:`evaluate_stratum_oos_aggregated`.
+* :func:`evaluate_stratum_oos` is a thin wrapper collapsing raw members to ``(m, s2)`` and
+  delegating, so the two cannot drift.
 
-**Anti-p-hacking + scope (D-12).** The hyperparameters that drive the fit (``N_MIN``, ``KAPPA``,
-``SIGMA_FLOOR_F``, the Adam settings) are fixed by principled research defaults — they are NOT
-tuned against this OOS slice, and this slice must stay DISJOINT from the period Phase 6 reserves
-as its Gate-1 test set. ``trained_through`` (the last train ``target_date``) is recorded so
-Phase 6 can audit/re-derive any historical fit from its data cutoff (D-13).
-
-**Raw-ensemble baseline (D-11, RESEARCH §"Raw-ensemble baseline").** The baseline predictive
-Gaussian the system would price WITHOUT EMOS is ``(mu = m, sigma = sqrt(s2))`` — the ensemble's
-own mean and dispersion, consistent with the population variance ``s2`` the fit consumes. For a
-genuinely deterministic stratum (``s2 == 0`` everywhere) the spread falls back to the TRAIN-slice
-forecast-minus-obs **residual std** (Open Question #2 / D-11) — a σ that reflects the model's
-realized error, never a degenerate ``σ=0`` — computed from train only so the baseline never peeks
-at OOS labels. This baseline lives in exactly one place: :func:`evaluate_stratum_oos_aggregated`.
-
-**Evaluation (D-13 payload).** :func:`evaluate_stratum_oos_aggregated` is the single source of
-truth: it fits on the train slice (via ``emos.fit_stratum``), reconstructs the calibrated Gaussian
-on both slices with the shared ``link.predict``, scores calibrated and baseline OOS Gaussians with
-``crps.crps_norm``, and returns ``(crps_train, crps_oos, crps_baseline_oos)`` plus the split
-provenance (``trained_through`` / ``oos_from`` / ``n_train`` / ``n_oos``). :func:`evaluate_stratum_oos`
-is a thin wrapper that collapses raw members to ``(m, s2)`` and delegates, so the two cannot drift.
-
-Pure NumPy + stdlib only — no scipy/sklearn (the AST guard
-``tests/test_no_forbidden_calibration_deps.py`` enforces it).
+Pure NumPy + stdlib only — no scipy/sklearn (AST-guard enforced).
 """
 
 from __future__ import annotations
@@ -69,24 +48,17 @@ def temporal_split(
 ) -> tuple[NDArray[np.intp], NDArray[np.intp]]:
     """Partition sample indices into an EARLIER train slice + STRICTLY-LATER OOS slice (D-10).
 
-    Orders the samples by ``target_date`` (ascending) and assigns the latest
-    ``round(n * oos_fraction)`` samples to the OOS slice, the rest to train. NEVER shuffles —
-    a random split leaks future information into the fit (look-ahead, RESEARCH Pitfall 4) and
-    breaks the no-look-ahead invariant Phase 6's walk-forward depends on (D-10/D-12).
-
-    The returned index arrays point into the ORIGINAL sample order (so the caller's aligned
-    ``m``/``s2``/``y`` arrays are sliced consistently), and the split is guaranteed temporal:
-    every train ``target_date`` is ``<=`` every OOS ``target_date``. When dates tie across the
-    boundary the OOS slice may start on the same calendar date; callers asserting a *strict*
-    train-before-OOS boundary should use distinct per-sample dates (the synthetic harness does).
+    Orders by ``target_date`` and assigns the latest ``round(n * oos_fraction)`` to OOS. NEVER
+    shuffles — a random split leaks look-ahead (D-10/D-12). Returned indices point into the
+    ORIGINAL order; every train date is ``<=`` every OOS date. On a boundary tie the OOS slice
+    may start on the same date; callers needing a strict boundary use distinct per-sample dates.
 
     Args:
         target_dates: one ``date`` per sample (aligned with the stratum's ``m``/``s2``/``y``).
-        oos_fraction: fraction of the (date-sorted) samples reserved for the OOS slice.
+        oos_fraction: fraction of the date-sorted samples reserved for OOS.
 
     Returns:
-        ``(train_idx, oos_idx)`` — disjoint index arrays into the original order; together they
-        cover every sample. Both are non-empty for a stratum with ``n >= 2`` distinct samples.
+        ``(train_idx, oos_idx)`` — disjoint, covering every sample; both non-empty for ``n >= 2``.
     """
     n = len(target_dates)
     if n < 2:
@@ -108,21 +80,17 @@ def temporal_split(
 class OOSResult:
     """The criterion-4 evaluation result for one stratum (ready for the D-13 payload).
 
-    ``crps_train``/``crps_oos`` are the calibrated model's mean CRPS on the train/OOS slices;
-    ``crps_baseline_oos`` is the raw-ensemble baseline's mean OOS CRPS (the bar to beat, D-11).
-    ``trained_through`` is the LAST train ``target_date`` (the data cutoff Phase 6 re-derives
-    from, D-13); ``oos_from`` is the FIRST OOS ``target_date`` (``trained_through < oos_from`` is
-    the temporal-split guarantee, D-10). ``n_train``/``n_oos`` are the per-slice sample counts.
+    ``crps_train``/``crps_oos`` are the calibrated model's mean CRPS on train/OOS;
+    ``crps_baseline_oos`` is the raw-ensemble baseline's OOS CRPS (the bar to beat, D-11).
+    ``trained_through`` (last train date, D-13) ``< oos_from`` (first OOS date) by the D-10
+    temporal-split guarantee.
 
-    **These metrics describe THIS function's own unpooled fit, not the persisted params (WR-05).**
-    The three CRPS values come from an EMOS fit on the OOS *train slice* with NO pooling — a
-    generic "can a fresh per-stratum fit generalize?" diagnostic. The row written by
-    ``persist.store_calibration_params`` stores its own ``crps_train`` recomputed from the
-    *persisted* (possibly season-pooled) params, and pairs it with the ``crps_oos`` /
-    ``crps_baseline_oos`` from here. So on a persisted row those two held-out numbers describe a
-    DIFFERENT (unpooled, train-slice) fit than ``crps_train`` does — do not read the train↔OOS gap
-    on a persisted row as the pooled fit's generalization. A pooled-fit OOS score would need the
-    parent slice split too (deferred with the Phase-6 walk-forward harness).
+    WR-05 caveat (canonical copy; persist.py cross-references this): these metrics describe THIS
+    function's UNPOOLED train-slice fit, not the persisted (possibly season-pooled) params. A
+    persisted row pairs its own pooled ``crps_train`` with the ``crps_oos``/``crps_baseline_oos``
+    from here, so the held-out pair describes a DIFFERENT fit than ``crps_train`` — do not read the
+    train↔OOS gap on a persisted row as the pooled fit's generalization. A true pooled-fit OOS
+    score needs the parent slice split too (deferred to the Phase-6 walk-forward harness).
     """
 
     crps_train: float
@@ -144,13 +112,10 @@ def evaluate_stratum_oos(
 ) -> OOSResult:
     """Criterion-4 OOS evaluation from RAW ensemble members (D-10/D-11).
 
-    A thin convenience wrapper that collapses the raw members to the ``(mean m, population
-    variance s2)`` predictor per date — exactly the aggregation ``strata.assemble_pairs_from_rows``
-    performs (``s2 = 0`` for a single deterministic member, D-02) — and delegates to
-    :func:`evaluate_stratum_oos_aggregated`. Production never holds raw members (they are
-    collapsed at assembly), so the aggregated function is the single source of truth for the
-    temporal split, the train fit, and the raw-ensemble baseline; keeping the member path a
-    delegating wrapper means the two cannot drift (WR-03/WR-04).
+    Collapses raw members to the ``(mean m, population variance s2)`` predictor per date — the
+    same aggregation ``strata.assemble_pairs_from_rows`` performs (D-02) — and delegates to
+    :func:`evaluate_stratum_oos_aggregated` (the single source of truth; delegating means the two
+    cannot drift, WR-03/WR-04).
 
     Args:
         target_dates: one ``date`` per sample (aligned with ``ens_members_f``/``y``).
@@ -164,8 +129,8 @@ def evaluate_stratum_oos(
         raise ValueError(
             f"ens_members_f must be 2-D (n_dates, n_members), got shape {members.shape}"
         )
-    # Collapse to (mean, population variance) — ddof=0 so a single deterministic member gives
-    # s2=0, matching strata.py and the aggregated baseline's deterministic-fallback trigger.
+    # Collapse to (mean, population variance) — ddof=0 so a single member gives s2=0, matching
+    # strata.py and the aggregated baseline's deterministic-fallback trigger.
     m = members.mean(axis=1)
     s2 = members.var(axis=1)
     return evaluate_stratum_oos_aggregated(
@@ -185,20 +150,13 @@ def evaluate_stratum_oos_aggregated(
 ) -> OOSResult:
     """Criterion-4 OOS evaluation from PRE-AGGREGATED ``(m, s2)`` predictors (D-10/D-11).
 
-    The CLI assembles the ledger to one ``(m = ensemble mean, s2 = ensemble variance)`` row per
-    ``(city, model, lead, target_date)`` — the individual members are already gone. This is the
-    aggregated twin of :func:`evaluate_stratum_oos` (which takes raw members): the SAME temporal
-    split and the SAME calibrated train fit, but the raw-ensemble BASELINE spread is ``sqrt(s2)``
-    (the ensemble's own dispersion, consistent with the population-variance ``s2`` the fit
-    consumes) rather than a per-date member sample std. A genuinely deterministic stratum
-    (``s2 == 0`` everywhere) falls back to the TRAIN forecast-minus-obs residual std — computed
-    from train only so the baseline never peeks at OOS labels (anti-leakage, D-12) — never a
-    degenerate ``σ = 0``.
+    The aggregated twin of :func:`evaluate_stratum_oos`: same temporal split and train fit, but
+    the raw-ensemble BASELINE spread is ``sqrt(s2)`` (the ensemble's own dispersion). A fully
+    deterministic stratum (``s2 == 0`` everywhere) falls back to the TRAIN residual std —
+    train-only, never an OOS peek (D-12) — never a degenerate ``σ = 0``.
 
-    Args mirror :func:`evaluate_stratum_oos`, with ``ens_members_f`` replaced by the aligned
-    ``m``/``s2`` predictor arrays. Raises ``ValueError`` for ``< 2`` samples (via
-    :func:`temporal_split`); the caller must pass ``>= 2`` distinct target dates for the split
-    to be genuinely temporal rather than positional.
+    Args mirror :func:`evaluate_stratum_oos` with ``ens_members_f`` replaced by ``m``/``s2``.
+    Raises ``ValueError`` for ``< 2`` samples (via :func:`temporal_split`).
     """
     m = np.asarray(m, dtype=float)
     s2 = np.asarray(s2, dtype=float)
@@ -218,10 +176,8 @@ def evaluate_stratum_oos_aggregated(
     mu_oos, sig_oos = predict(params, m_oos, s2_oos)
     crps_oos = float(crps_norm(mu_oos, sig_oos, y_oos).mean())
 
-    # 5. Raw-ensemble baseline on the OOS slice: μ = m, σ = sqrt(s2) (the ensemble's own spread),
-    #    clamped to the σ-floor. A fully deterministic stratum (no ensemble spread anywhere) uses
-    #    the TRAIN residual std instead — train-only, so the baseline never peeks at OOS labels
-    #    (anti-leakage, D-12). Never σ = 0.
+    # 5. Raw-ensemble baseline on OOS: μ = m, σ = sqrt(s2) clamped to the floor. A fully
+    #    deterministic stratum uses the TRAIN residual std (train-only, no OOS peek; D-12).
     if bool(np.all(s2 <= 0.0)):
         resid_tr = y_tr - m_tr
         residual_std = max(
