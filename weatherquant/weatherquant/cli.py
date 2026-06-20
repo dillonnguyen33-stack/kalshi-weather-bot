@@ -1,18 +1,14 @@
-"""Idempotent ingestion CLI (D-15) — the historical backfill half of the one code path.
+"""The ``weatherquant`` CLI — four subcommands over the shared spine (stdlib argparse).
 
-``weatherquant ingest`` is a THIN argparse wrapper over
-:func:`weatherquant.ingest.orchestrator.ingest_range`: it validates the requested city
-codes (via :func:`weatherquant.registry.get_city` — raises on unknown, ASVS V5 / T-02-17)
-and dates (parsed to ``date``; a malformed value is rejected BEFORE any ingest call), then
-dispatches to the backfill path with ``mode="backfill"`` so each forecast's
-``available_at`` is ``cycle_init + PUBLISH_LATENCY`` — never the wall clock (D-09). Because
-the orchestrator routes every write through 02-02's skip-before-insert idempotency,
-re-running the same range is a NO-OP (D-10).
+* ``ingest``    — backfill via :func:`ingest.orchestrator.ingest_range` (``mode="backfill"``,
+  so ``available_at = cycle_init + PUBLISH_LATENCY``, never the wall clock; idempotent re-run
+  is a no-op). Same orchestrator the live scheduler calls, differing only in ``mode``
+  (D-09/D-10/D-15).
+* ``calibrate`` — fit + persist EMOS/NGR params per stratum.
+* ``price``     — latest → predict → blend → bucket/EV/Kelly against a mocked mid (D-16).
+* ``paper``     — paper-only book loop: snapshot + sized position to settlement (D-03/D-04/D-08).
 
-This is the SAME orchestrator the live scheduler (:mod:`weatherquant.scheduler`) calls — the
-only difference is the ``mode`` argument (D-15). The CLI uses stdlib ``argparse`` (no new
-``click``/``typer`` dependency) and ``asyncio.run`` to drive the async orchestrator. It is
-installed as the ``weatherquant`` console script via ``[project.scripts]`` in pyproject.
+Installed as the ``weatherquant`` console script via ``[project.scripts]``.
 """
 
 from __future__ import annotations

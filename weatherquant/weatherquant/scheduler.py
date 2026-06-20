@@ -1,27 +1,17 @@
 """AsyncIOScheduler wiring (D-15) — the LIVE half of the one ingestion code path.
 
-``build_scheduler`` returns a configured (NOT-yet-started) ``AsyncIOScheduler`` whose jobs
-call the SAME :func:`weatherquant.ingest.orchestrator.ingest_cycle` the backfill CLI calls
-— the only difference is ``mode="live"`` (so ``available_at`` is the decode-completion
-``now(UTC)``, D-09) versus the CLI's ``mode="backfill"``. There is no second, drifting live
-ingestion path the Phase-6 backtest could diverge from (D-15).
+``build_scheduler`` returns a configured, NOT-yet-started ``AsyncIOScheduler`` whose jobs call
+the SAME :func:`weatherquant.ingest.orchestrator.ingest_cycle` the backfill CLI calls, only
+with ``mode="live"`` (D-09/D-15) — no second drifting live path the backtest could diverge
+from.
 
-APSCHEDULER PIN (T-02-SC). This uses ``apscheduler.schedulers.asyncio.AsyncIOScheduler``
-from apscheduler **3.11.x** — never the in-flux 4.x rewrite (whose scheduler package and
-import paths differ entirely; pinned away in pyproject and proven by the scheduler unit
-test). ``AsyncIOScheduler`` shares the asyncio event loop with the httpx sources and
-(future) the Kalshi WebSocket feed.
+APSCHEDULER PIN (T-02-SC): apscheduler **3.11.x** ``AsyncIOScheduler`` — never the 4.x rewrite
+(different package / import paths). Shares the asyncio loop with the httpx sources and the
+(future) Kalshi WS feed.
 
-PER-MODEL CADENCE (RESEARCH Pattern 8). NWP cycles are deterministic:
-
-* HRRR / NBM — hourly (``CronTrigger(minute=...)``).
-* GFS / GEFS — the 00/06/12/18Z synoptic cycles (``CronTrigger(hour="0,6,12,18")``).
-* NWS gridpoint + Open-Meteo ensemble + ASOS obs + AFD — sensible supplementary cadences
-  (hourly NWS/obs, per-GFS-cycle Open-Meteo, hourly-ish AFD) without over-engineering.
-
-``build_scheduler`` does NOT start the scheduler at import or build time — it returns the
-configured object so it is unit-testable (``get_jobs()`` asserts the cadence) and the caller
-owns the lifecycle (``scheduler.start()`` inside a running loop, then ``asyncio.Event().wait()``).
+PER-MODEL CADENCE: HRRR/NBM hourly; GFS/GEFS the 00/06/12/18Z synoptic cycles; NWS/obs/AFD
+hourly, Open-Meteo per-GFS-cycle. Returned UNSTARTED so it is unit-testable and the caller
+owns ``start()``.
 """
 
 from __future__ import annotations
@@ -38,9 +28,8 @@ from weatherquant.registry import CITIES
 
 logger = logging.getLogger(__name__)
 
-# Cycle latency cushion: when a cadence fires we ingest the cycle that has had time to
-# publish (cycle_init = the firing hour). The orchestrator's per-source try/except handles a
-# not-yet-published cycle as a graceful fallback (D-11), so a small clock skew never crashes.
+# Cycle latency cushion: a cadence fires for the cycle that has had time to publish; the
+# orchestrator handles a not-yet-published cycle gracefully (D-11), so clock skew never crashes.
 
 
 def _latest_synoptic_cycle(now: datetime, step_hours: int) -> datetime:
@@ -55,11 +44,10 @@ def _latest_hourly_cycle(now: datetime) -> datetime:
 
 
 async def _ingest_grib_all_cities(model: str, step_hours: int) -> None:
-    """Live job body: ingest ``model`` for the latest cycle across EVERY registry city (D-15).
+    """Live job body: ingest ``model`` for the latest cycle across every registry city (D-15).
 
-    Calls the SAME :func:`orchestrator.ingest_cycle` the CLI backfill uses, with
-    ``mode="live"`` (D-15/D-09). Each city is independent — the orchestrator's graceful
-    degradation means one city's missing cycle never blocks the others (D-11).
+    Calls the SAME :func:`orchestrator.ingest_cycle` the CLI backfill uses with ``mode="live"``
+    (D-09/D-15); cities are independent under graceful degradation (D-11).
     """
     now = datetime.now(timezone.utc)
     cycle = (
@@ -96,15 +84,9 @@ async def _ingest_obs_all_cities() -> None:
 def build_scheduler() -> AsyncIOScheduler:
     """Build (but do NOT start) the live ingestion scheduler (D-15, apscheduler 3.11.x).
 
-    Registers one job per model cadence, each calling the SAME orchestrator function the CLI
-    backfill calls (``mode="live"``):
-
-    * ``hrrr`` / ``nbm`` — hourly ``CronTrigger`` (top of every hour).
-    * ``gfs`` / ``gefs`` — ``CronTrigger(hour="0,6,12,18")`` (the synoptic cycles).
-    * ``nws`` — hourly; ``openmeteo`` — per-GFS-cycle; obs/AFD — hourly.
-
-    The scheduler is returned UNSTARTED so it is unit-testable (``get_jobs()``) and the caller
-    owns ``start()``. Returns the configured :class:`AsyncIOScheduler`.
+    One job per cadence, each calling the orchestrator with ``mode="live"``: hrrr/nbm hourly;
+    gfs/gefs at 00/06/12/18Z; nws hourly, openmeteo per-GFS-cycle, obs/AFD hourly. Returned
+    UNSTARTED so it is unit-testable (``get_jobs()``) and the caller owns ``start()``.
     """
     scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -130,7 +112,7 @@ def build_scheduler() -> AsyncIOScheduler:
             replace_existing=True,
         )
 
-    # NWS gridpoint — hourly; Open-Meteo ensemble — per-GFS cycle (sensible, not over-engineered).
+    # NWS gridpoint — hourly; Open-Meteo ensemble — per-GFS cycle.
     scheduler.add_job(
         _ingest_source_all_cities,
         CronTrigger(minute=15, timezone="UTC"),
@@ -148,8 +130,7 @@ def build_scheduler() -> AsyncIOScheduler:
         replace_existing=True,
     )
 
-    # ASOS obs + AFD — hourly (the daily-high label refines through the day; AFD is cheap
-    # thanks to the keyword pre-filter, D-13).
+    # ASOS obs + AFD — hourly (the daily-high label refines through the day; AFD pre-filtered, D-13).
     scheduler.add_job(
         _ingest_obs_all_cities,
         CronTrigger(minute=45, timezone="UTC"),
