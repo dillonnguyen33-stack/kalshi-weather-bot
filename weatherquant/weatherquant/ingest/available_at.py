@@ -11,7 +11,7 @@ feed's own report time (see docs/DECISIONS.md).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from typing import Literal
 
 # Per-model publish latency after cycle init (RESEARCH Pitfall 5). Each value is
@@ -49,7 +49,7 @@ def available_at(
     if mode == "live":
         # LIVE branch ONLY — the single sanctioned datetime.now in this module. When the
         # system actually held the decoded datum (D-09).
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
     # BACKFILL branch — NO datetime.now (Pitfall 5). Realistic historical availability =
     # the cycle's publish instant. KeyError on an unknown model, never a silent default.
     return cycle_init + PUBLISH_LATENCY[model]

@@ -12,7 +12,7 @@ docs/DECISIONS.md).
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from typing import Any
 
 import httpx
@@ -272,7 +272,7 @@ def store_afd_signal(
                 f"stamp now() on a historical row (CR-01/D-09)"
             )
         # Live: now(UTC) is the instant the running system actually held the product (D-09).
-        available_at = datetime.now(timezone.utc)
+        available_at = datetime.now(UTC)
     return insert_observation(
         bind,
         city=city,
@@ -284,13 +284,13 @@ def store_afd_signal(
 
 
 __all__ = [
+    "AFD_MODEL",
     "AFD_ROUTINE_PHRASES",
     "AFD_SIGNAL_KEYWORDS",
+    "CITY_WFO",
+    "SOURCE",
     "afd_should_classify",
     "classify_afd",
     "fetch_afd_text",
     "store_afd_signal",
-    "CITY_WFO",
-    "AFD_MODEL",
-    "SOURCE",
 ]

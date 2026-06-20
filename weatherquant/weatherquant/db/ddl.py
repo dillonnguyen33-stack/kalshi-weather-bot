@@ -64,9 +64,9 @@ def drop_trigger_sql(table: str) -> tuple[str, ...]:
 
 
 __all__ = [
-    "LEDGER_TABLES",
     "CREATE_RAISE_FUNCTION_SQL",
     "DROP_RAISE_FUNCTION_SQL",
+    "LEDGER_TABLES",
     "create_trigger_sql",
     "drop_trigger_sql",
 ]

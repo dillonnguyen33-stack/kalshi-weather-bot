@@ -26,8 +26,15 @@ from weatherquant.db.engine import DEFAULT_POSITION_FRACTION  # single source fo
 from weatherquant.price.ev import _require_prob  # one prob/price validator for the whole money path
 from weatherquant.price.fee import exact_fee  # fee-aware Kelly reuses the exact integer-cent fee
 
-__all__ = ["KELLY_LAMBDA", "SIGMA0_F", "AFD_HAIRCUT", "N_REF",
-           "kelly_fraction", "sufficiency_ramp", "stake_fraction"]
+__all__ = [
+    "AFD_HAIRCUT",
+    "KELLY_LAMBDA",
+    "N_REF",
+    "SIGMA0_F",
+    "kelly_fraction",
+    "stake_fraction",
+    "sufficiency_ramp",
+]
 
 # Base fractional-Kelly multiplier (D-10, RESEARCH Operational Defaults): quarter-Kelly is
 # the standard conservative choice — full Kelly is high-variance and amplifies prob error.

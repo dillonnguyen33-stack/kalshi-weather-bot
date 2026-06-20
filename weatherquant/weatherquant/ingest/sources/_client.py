@@ -96,4 +96,4 @@ async def request_with_retry(
     return response
 
 
-__all__ = ["USER_AGENT", "DEFAULT_TIMEOUT", "get_client", "request_with_retry"]
+__all__ = ["DEFAULT_TIMEOUT", "USER_AGENT", "get_client", "request_with_retry"]

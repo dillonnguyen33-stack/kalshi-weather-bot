@@ -17,7 +17,7 @@ import argparse
 import asyncio
 import logging
 from collections.abc import Mapping
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from typing import Any
 
 from weatherquant.db.engine import get_engine, get_settings
@@ -379,7 +379,7 @@ def run_calibrate(args: argparse.Namespace) -> dict[str, int]:
     oos_fraction = args.oos_fraction
 
     bind = get_engine()
-    available_at = datetime.now(timezone.utc)  # training-run completion instant (D-13)
+    available_at = datetime.now(UTC)  # training-run completion instant (D-13)
     persisted: dict[str, int] = {}
 
     for city in cities:

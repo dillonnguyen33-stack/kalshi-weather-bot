@@ -76,4 +76,4 @@ def row_exists(
 already_ingested = row_exists
 
 
-__all__ = ["row_exists", "already_ingested"]
+__all__ = ["already_ingested", "row_exists"]

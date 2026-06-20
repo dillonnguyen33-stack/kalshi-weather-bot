@@ -17,7 +17,7 @@ owns ``start()``.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -49,7 +49,7 @@ async def _ingest_grib_all_cities(model: str, step_hours: int) -> None:
     Calls the SAME :func:`orchestrator.ingest_cycle` the CLI backfill uses with ``mode="live"``
     (D-09/D-15); cities are independent under graceful degradation (D-11).
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cycle = (
         _latest_hourly_cycle(now) if step_hours == 1 else _latest_synoptic_cycle(now, step_hours)
     )
@@ -61,7 +61,7 @@ async def _ingest_grib_all_cities(model: str, step_hours: int) -> None:
 
 async def _ingest_source_all_cities(source: str, step_hours: int) -> None:
     """Live job body for a supplementary source (nws/openmeteo) across every city (D-15)."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cycle = (
         _latest_hourly_cycle(now) if step_hours == 1 else _latest_synoptic_cycle(now, step_hours)
     )
@@ -73,7 +73,7 @@ async def _ingest_source_all_cities(source: str, step_hours: int) -> None:
 
 async def _ingest_obs_all_cities() -> None:
     """Live job body: ASOS daily-high + AFD signal for today across every city (02-03)."""
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now(UTC).date()
     bind = get_engine()
     for city in CITIES:
         await orchestrator.ingest_obs(bind, city, today)

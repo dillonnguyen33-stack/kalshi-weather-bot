@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
@@ -281,7 +281,7 @@ def fetch_t2m(
     # Herbie's _validate() compares against a tz-naive Timestamp, so an aware ``cycle_init``
     # raises "Cannot compare tz-naive and tz-aware"; normalize to a naive UTC instant first.
     if cycle_init.tzinfo is not None:
-        herbie_date = cycle_init.astimezone(timezone.utc).replace(tzinfo=None)
+        herbie_date = cycle_init.astimezone(UTC).replace(tzinfo=None)
     else:
         herbie_date = cycle_init
 
@@ -316,8 +316,8 @@ __all__ = [
     "T2MField",
     "decode_t2m",
     "fetch_t2m",
-    "snap_to_station",
-    "snap_city",
     "lead0_sanity_check",
     "member_to_axis",
+    "snap_city",
+    "snap_to_station",
 ]

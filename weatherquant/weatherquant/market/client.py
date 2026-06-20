@@ -25,7 +25,7 @@ import email.utils
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 import httpx
@@ -96,8 +96,8 @@ def _observed_instant(response: Any) -> datetime:
             parsed = None
         if parsed is not None:
             # A naive RFC-1123 date is GMT/UTC.
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc)
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return datetime.now(UTC)
 
 
 def _require_fp(payload: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -342,4 +342,4 @@ def _msg_ticker(msg: Mapping[str, Any], tickers: Sequence[str]) -> str:
     )
 
 
-__all__ = ["run_feed", "fetch_snapshot", "WS_URL_PROD", "WS_URL_DEMO", "REST_HOST_PROD", "REST_HOST_DEMO"]
+__all__ = ["REST_HOST_DEMO", "REST_HOST_PROD", "WS_URL_DEMO", "WS_URL_PROD", "fetch_snapshot", "run_feed"]

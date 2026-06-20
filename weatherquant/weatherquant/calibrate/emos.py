@@ -33,14 +33,14 @@ from weatherquant.calibrate.link import param_grads, predict
 from weatherquant.ingest.errors import CalibrationError
 
 __all__ = [
-    "fit_stratum",
-    "ADAM_LR",
     "ADAM_B1",
     "ADAM_B2",
     "ADAM_EPS",
     "ADAM_ITERS",
+    "ADAM_LR",
     "ADAM_TOL",
     "D0_INIT",
+    "fit_stratum",
 ]
 
 logger = logging.getLogger(__name__)

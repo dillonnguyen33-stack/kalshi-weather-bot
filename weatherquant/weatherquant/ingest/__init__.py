@@ -17,9 +17,9 @@ from weatherquant.ingest.orchestrator import (
 )
 
 __all__ = [
+    "ingest_afd",
     "ingest_all_models",
     "ingest_cycle",
-    "ingest_range",
     "ingest_obs",
-    "ingest_afd",
+    "ingest_range",
 ]

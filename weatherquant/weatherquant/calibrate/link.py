@@ -21,7 +21,7 @@ from numpy.typing import NDArray
 
 from weatherquant.calibrate.crps import crps_norm_grad
 
-__all__ = ["predict", "param_grads"]
+__all__ = ["param_grads", "predict"]
 
 # A params bundle is (a, b, c, d, sigma_floor): the 4 fitted EMOS params plus the σ-floor.
 Params = tuple[float, float, float, float, float]

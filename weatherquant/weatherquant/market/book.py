@@ -29,7 +29,7 @@ coerced into a fabricated level. The ticker key is ``market_ticker`` / ``market_
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from weatherquant.ingest.errors import CorrectnessError
@@ -122,10 +122,10 @@ def _parse_event_time(msg: Mapping[str, Any]) -> datetime | None:
         if not isinstance(ts, str):
             raise ValueError(f"orderbook msg.ts must be an ISO-8601 string, got {ts!r}")
         parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
     ts_ms = msg.get("ts_ms")
     if ts_ms is not None:
-        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc)
+        return datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC)
     return None
 
 
@@ -283,9 +283,9 @@ def apply(book: OrderBook, msg: Mapping[str, Any]) -> None:
 
 
 __all__ = [
+    "CONTROL_FRAME_TYPES",
     "OrderBook",
     "SeqGap",
     "apply",
     "parse_dollar_fp_side",
-    "CONTROL_FRAME_TYPES",
 ]

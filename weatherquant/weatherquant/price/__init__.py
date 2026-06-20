@@ -28,19 +28,19 @@ __all__ = [
     # blend (PRC-01, D-01/D-02/D-03)
     "accuracy_weights",
     "blend_gaussians",
+    # ev (PRC-03, D-08)
+    "bucket_ev",
     # buckets (PRC-02, D-04/D-05/D-06)
     "bucket_prob",
     "bucket_probs",
-    "integers_in_bucket",
-    "parse_ticker",
     # fee (PRC-03, D-07/D-09)
     "exact_fee",
-    "maker_fee",
-    # ev (PRC-03, D-08)
-    "bucket_ev",
-    "p_used",
+    "integers_in_bucket",
     # kelly (PRC-04/PRC-05, D-10–D-13)
     "kelly_fraction",
-    "sufficiency_ramp",
+    "maker_fee",
+    "p_used",
+    "parse_ticker",
     "stake_fraction",
+    "sufficiency_ramp",
 ]

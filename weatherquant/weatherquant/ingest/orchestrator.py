@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 from typing import Literal
 
 from weatherquant.ingest import afd as afd_mod
@@ -53,10 +53,10 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
     city = get_city(city_code)
     valid = cycle_init + timedelta(hours=lead)
     if valid.tzinfo is None:
-        valid = valid.replace(tzinfo=timezone.utc)
+        valid = valid.replace(tzinfo=UTC)
     # Valid instant is within ~1 civil day of its UTC date for any US offset; check the UTC
     # date and its neighbours so the half-open window assignment is exact.
-    base = valid.astimezone(timezone.utc).date()
+    base = valid.astimezone(UTC).date()
     for candidate in (base - timedelta(days=1), base, base + timedelta(days=1)):
         win = settlement_window(city, candidate)
         if win.start_utc <= valid < win.end_utc:
@@ -314,7 +314,7 @@ async def ingest_afd(
 
 def target_date_to_dt(target_date: date) -> datetime:
     """Coerce a ``date`` to a UTC-midnight ``datetime`` for structured fallback logging."""
-    return datetime(target_date.year, target_date.month, target_date.day, tzinfo=timezone.utc)
+    return datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
 
 
 async def ingest_all_models(
@@ -400,7 +400,7 @@ async def ingest_range(
     while day <= end_date:
         for hour in hours:
             cycle_init = datetime(
-                day.year, day.month, day.day, hour, tzinfo=timezone.utc
+                day.year, day.month, day.day, hour, tzinfo=UTC
             )
             for city in cities:
                 for model in models:
@@ -434,12 +434,12 @@ ALL_CITIES: tuple[str, ...] = tuple(CITIES)
 
 
 __all__ = [
+    "ALL_CITIES",
     "GRIB_MODELS",
     "SUPPLEMENTARY_SOURCES",
-    "ALL_CITIES",
-    "ingest_cycle",
-    "ingest_range",
-    "ingest_all_models",
-    "ingest_obs",
     "ingest_afd",
+    "ingest_all_models",
+    "ingest_cycle",
+    "ingest_obs",
+    "ingest_range",
 ]

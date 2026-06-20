@@ -16,7 +16,7 @@ shifted one civil-clock hour (TIME-02) — a consequence of the standard offset,
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 
 from weatherquant.registry import City
 
@@ -60,7 +60,7 @@ def settlement_window(city: City, day: date) -> SettlementWindow:
     # class Phase 1 exists to prevent. Switch registry.City to minutes before adding
     # any such city; do not coerce a fractional offset into this int.
     off = timedelta(hours=city.std_offset_hours)
-    start_utc = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - off
+    start_utc = datetime(day.year, day.month, day.day, tzinfo=UTC) - off
     end_utc = start_utc + timedelta(days=1)  # half-open [start, end); always 24h (no DST)
     return SettlementWindow(
         day, start_utc, end_utc, city.std_offset_hours, city.cli_station

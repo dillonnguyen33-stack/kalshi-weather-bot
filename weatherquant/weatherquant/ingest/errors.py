@@ -58,10 +58,10 @@ class CalibrationError(CorrectnessError, ValueError):
 
 
 __all__ = [
-    "CorrectnessError",
-    "UnitError",
-    "SanityError",
-    "TargetDateError",
     "AvailabilityError",
     "CalibrationError",
+    "CorrectnessError",
+    "SanityError",
+    "TargetDateError",
+    "UnitError",
 ]

@@ -21,7 +21,7 @@ from numpy.typing import NDArray
 
 from weatherquant.calibrate.crps import normal_cdf
 
-__all__ = ["integers_in_bucket", "bucket_prob", "bucket_probs", "parse_ticker"]
+__all__ = ["bucket_prob", "bucket_probs", "integers_in_bucket", "parse_ticker"]
 
 # The single half-degree bucket-edge offset (D-05 / Pitfall 1): integer degree ``k`` owns
 # ``[k − _HALF, k + _HALF)``. LOW-confidence; the live KXHIGH cross-check is DEFERRED to

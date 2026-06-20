@@ -233,9 +233,9 @@ def insert_fill(
 
 
 __all__ = [
-    "insert_forecast",
-    "insert_observation",
-    "insert_market_snapshot",
-    "insert_fill",
     "WriteIntegrityError",
+    "insert_fill",
+    "insert_forecast",
+    "insert_market_snapshot",
+    "insert_observation",
 ]

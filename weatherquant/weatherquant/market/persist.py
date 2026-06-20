@@ -126,4 +126,4 @@ def latest_snapshots(bind: Bind, ticker: str) -> list[RowMapping]:
     return queries.latest(bind, "market_snapshots", where={"ticker": ticker})
 
 
-__all__ = ["persist_snapshot", "persist_fill", "latest_snapshots"]
+__all__ = ["latest_snapshots", "persist_fill", "persist_snapshot"]

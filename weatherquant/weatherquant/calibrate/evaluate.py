@@ -32,10 +32,10 @@ from weatherquant.calibrate.link import predict
 from weatherquant.calibrate.strata import SIGMA_FLOOR_F
 
 __all__ = [
-    "temporal_split",
+    "OOSResult",
     "evaluate_stratum_oos",
     "evaluate_stratum_oos_aggregated",
-    "OOSResult",
+    "temporal_split",
 ]
 
 logger = logging.getLogger(__name__)

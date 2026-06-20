@@ -18,7 +18,7 @@ PURE: imports only :func:`weatherquant.time.settlement_window`.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 from typing import Any, Protocol, runtime_checkable
 
 from weatherquant.registry import City
@@ -49,14 +49,14 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
     for key in ("event_time", "available_at"):
         value = snapshot.get(key)
         if isinstance(value, datetime):
-            return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
     raw = snapshot.get("snapshot_for")
     if isinstance(raw, str):
         # Strip an optional ``#<seq>`` disambiguation suffix before parsing (WR-03).
         iso = raw.split("#", 1)[0]
         # Accept a trailing 'Z' (the fixture shape) as UTC.
         parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
     raise ValueError(
         f"snapshot carries no usable event time (event_time/available_at/snapshot_for): "
         f"{snapshot!r}"
@@ -155,8 +155,8 @@ def clv_cents(
 
 __all__ = [
     "CLV_WINDOW_MINUTES",
-    "snapshot_event_time",
     "closing_window_snapshots",
-    "vol_weighted_mid",
     "clv_cents",
+    "snapshot_event_time",
+    "vol_weighted_mid",
 ]

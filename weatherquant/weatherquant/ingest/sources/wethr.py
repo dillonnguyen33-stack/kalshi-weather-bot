@@ -11,7 +11,7 @@ is read from ``Settings`` (redacted, never logged) and sent only to the fixed en
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 
 import httpx
 
@@ -143,7 +143,7 @@ def store_wethr_forecast(
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
     """
     station = get_city(city)
-    cycle = cycle or datetime.now(timezone.utc)
+    cycle = cycle or datetime.now(UTC)
     return insert_forecast(
         bind,
         city=city,
@@ -165,7 +165,7 @@ __all__ = [
     "WETHR_FORECAST_BASE",
     "WETHR_MODELS",
     "fahrenheit_to_kelvin",
-    "model_label",
     "fetch_wethr_forecast",
+    "model_label",
     "store_wethr_forecast",
 ]

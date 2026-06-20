@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from typing import Any, cast
 
 import httpx
@@ -109,8 +109,8 @@ def _coerce_ts(ts_raw: object) -> datetime | None:
     else:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 def daily_high(
@@ -201,7 +201,7 @@ def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
             continue
         try:
             ts = datetime.strptime(valid.strip(), "%Y-%m-%d %H:%M").replace(
-                tzinfo=timezone.utc
+                tzinfo=UTC
             )
             tmpf = float(tmpf_s)
         except ValueError:
@@ -319,11 +319,11 @@ def store_daily_high(
 
 
 __all__ = [
+    "SOURCE",
     "DailyHigh",
+    "celsius_to_fahrenheit",
     "daily_high",
     "daily_high_from_obs",
     "fetch_asos_obs",
     "store_daily_high",
-    "celsius_to_fahrenheit",
-    "SOURCE",
 ]

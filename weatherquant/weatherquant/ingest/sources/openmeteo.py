@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from typing import Any, cast
 
 import httpx
@@ -75,8 +75,8 @@ def _window_max_kelvin(
         except ValueError:
             continue
         if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        ts = ts.astimezone(timezone.utc)
+            ts = ts.replace(tzinfo=UTC)
+        ts = ts.astimezone(UTC)
         if not (win.start_utc <= ts < win.end_utc):
             continue  # half-open bucket — a wrong-LST-day hour cannot raise the member high
         try:
@@ -174,7 +174,7 @@ def store_members(
     orchestrator refuses backfill, WR-02). Returns rows inserted (skips identical, D-10).
     """
     station = get_city(city)
-    cycle = cycle or datetime.now(timezone.utc)
+    cycle = cycle or datetime.now(UTC)
     inserted = 0
     for member, temp_kelvin in sorted(members.items()):
         inserted += insert_forecast(
@@ -196,13 +196,13 @@ def store_members(
 
 
 __all__ = [
-    "OPEN_METEO_ENS_BASE",
     "ENSEMBLE_MODEL",
     "MODEL_BASE",
     "N_MEMBERS",
+    "OPEN_METEO_ENS_BASE",
     "celsius_to_kelvin",
+    "fetch_openmeteo_ensemble",
     "member_label",
     "parse_members",
-    "fetch_openmeteo_ensemble",
     "store_members",
 ]

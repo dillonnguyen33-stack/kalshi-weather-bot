@@ -12,7 +12,7 @@ the namespaced label ``nws`` (D-12; see docs/DECISIONS.md).
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, UTC
 from typing import Any
 
 import httpx
@@ -65,9 +65,9 @@ def _parse_valid_interval(valid_time: str) -> tuple[datetime, datetime]:
     instant_s, _, duration_s = valid_time.partition("/")
     start = datetime.fromisoformat(instant_s.replace("Z", "+00:00"))
     if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
+        start = start.replace(tzinfo=UTC)
     end = start + _parse_iso_duration(duration_s) if duration_s else start
-    return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+    return start.astimezone(UTC), end.astimezone(UTC)
 
 
 def _parse_iso_duration(duration: str) -> "datetime.timedelta":  # type: ignore[name-defined]
@@ -196,7 +196,7 @@ def store_nws_forecast(
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
     """
     station = get_city(city)
-    cycle = cycle or datetime.now(timezone.utc)
+    cycle = cycle or datetime.now(UTC)
     return insert_forecast(
         bind,
         city=city,
@@ -216,8 +216,8 @@ def store_nws_forecast(
 
 
 __all__ = [
-    "NWS_API_BASE",
     "MODEL",
+    "NWS_API_BASE",
     "fetch_nws_forecast",
     "store_nws_forecast",
     "window_max_kelvin",
