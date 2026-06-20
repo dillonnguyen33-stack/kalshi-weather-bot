@@ -1,28 +1,12 @@
 """The SINGLE point-in-time-of-knowledge helper (D-09) — the worst landmine in Phase 2.
 
-``available_at(cycle_init, model, mode)`` is the ONE place the codebase decides *when a
-datum became available to the system*. Every forecast write routes its ``available_at``
-through here so the backfill-vs-live distinction lives in exactly one place.
-
-THE LANDMINE (RESEARCH Pitfall 5, D-09). For a *backfill* the answer is NOT the wall
-clock — it is ``cycle_init + PUBLISH_LATENCY[model]`` (the realistic instant the model
-run actually became downloadable). Stamping a backfilled row with ``datetime.now()``
-makes every historical forecast appear to have been "unavailable" until the backfill ran,
-which silently destroys Phase 6's no-look-ahead walk-forward backtest. The inverse error
-(stamping the nominal cycle time, with zero latency) leaks future information. The
-asymmetry is deliberate and load-bearing: a slightly **too-late** ``available_at`` is
-SAFE (it only withholds data); a **too-early** one LEAKS. So the latency table below is a
-set of conservative lower bounds with a completeness buffer — err late, never early.
-
-For a *live* fetch the answer IS ``datetime.now(timezone.utc)`` — the moment the running
-system actually held the decoded datum. That ``now()`` call appears in this module's LIVE
-branch ONLY; the backfill branch must contain no ``datetime.now`` reference (enforced by
-``tests/test_available_at.py`` via source inspection).
-
-OBSERVATIONS DO NOT USE THIS HELPER. An observation's ``available_at`` is its report /
-availability time (set by the obs path in 02-03 from the feed's own timestamp), NOT
-``now()`` and NOT the LST settlement-window edge. This helper governs the FORECAST point-
-in-time only; mixing the obs report time in here would conflate two different clocks.
+The one place the codebase decides when a forecast datum became available. Backfill returns
+``cycle_init + PUBLISH_LATENCY[model]``, never ``now()`` (Pitfall 5): too-late only withholds
+data while too-early leaks, so the latencies are conservative lower bounds — err late, never
+early. The live branch returns ``datetime.now(timezone.utc)`` and is the ONLY ``datetime.now``
+in this module (the backfill branch must have none — enforced by source inspection in
+tests/test_available_at.py). Observations do not use this helper; their ``available_at`` is the
+feed's own report time (see docs/DECISIONS.md).
 """
 
 from __future__ import annotations
@@ -51,17 +35,13 @@ def available_at(
     """Return the point-in-time-of-knowledge for a forecast row (D-09).
 
     Args:
-        cycle_init: the model run's init time (tz-aware UTC). Used only in the backfill
-            branch as the anchor for ``cycle_init + PUBLISH_LATENCY[model]``.
-        model: the NOAA model label — one of ``"hrrr"``, ``"gfs"``, ``"gefs"``, ``"nbm"``.
-            An unknown model raises ``KeyError`` (never a silent default — ASVS V5).
-        mode: ``"backfill"`` reconstructs the realistic historical availability;
-            ``"live"`` returns the current instant the running system held the datum.
+        cycle_init: the model run's init time (tz-aware UTC); the backfill latency anchor.
+        model: NOAA model label; an unknown one raises ``KeyError`` (no silent default — ASVS V5).
+        mode: ``"backfill"`` reconstructs historical availability; ``"live"`` returns now.
 
     Returns:
-        A tz-aware UTC ``datetime``. For ``"backfill"``: ``cycle_init +
-        PUBLISH_LATENCY[model]`` (deterministic, NEVER ``now()``). For ``"live"``:
-        ``datetime.now(timezone.utc)``.
+        A tz-aware UTC ``datetime``: backfill = ``cycle_init + PUBLISH_LATENCY[model]`` (never
+        ``now()``); live = ``datetime.now(timezone.utc)``.
 
     Raises:
         KeyError: if ``model`` is not in :data:`PUBLISH_LATENCY` (backfill mode).

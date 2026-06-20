@@ -1,24 +1,11 @@
 """Wethr.net deterministic forecast outputs (ING-06) — optional key, graceful skip.
 
-Pulls a deterministic model's forecast high from Wethr.net's bearer-authenticated REST API
-(``https://wethr.net/api/v2/forecasts.php``), maps the station by the Phase-1 registry
-``cli_station`` (NOT v3's stale per-city station map ``NY``/``DAL``/``KDFW``), retries ONCE on
-HTTP 429 (Pitfall 7), converts the returned °F high to Kelvin, and stores it under the
-provider-namespaced label ``wethr:<model>`` (e.g. ``wethr:hrrr``, ``wethr:nbm``).
-
-GRACEFUL DEGRADATION (D-11). ``Settings.wethr_api_key`` is OPTIONAL (nullable, from 02-01).
-When it is unset this module logs a structured skip and returns ``None`` WITHOUT making any
-HTTP call — the system proceeds without Wethr. The tests assert the mock client is never
-touched in that path (a real key is never required to run the suite).
-
-PROVIDER NAMESPACING (D-12). ``wethr:hrrr`` is a DISTINCT blend input from the NOAA-decoded
-``hrrr`` — the two are NEVER deduped/merged, so the same underlying model from two providers
-stays two inputs. Rows route through 02-02's :func:`weatherquant.ingest.writer.insert_forecast`
-+ :func:`weatherquant.ingest.available_at.available_at` (the single audited write path).
-
-SECRET HYGIENE (T-02-14). The key is read from ``Settings`` (redacted repr, ASVS V14), never
-from the environment inline and never logged; the bearer header is sent only to the fixed
-wethr.net endpoint (SSRF guard T-02-15).
+Pulls a deterministic model's high from Wethr.net's bearer API, keyed by the registry
+``cli_station`` (not v3's stale map), retries once on 429 (Pitfall 7), converts °F → Kelvin,
+and stores under the namespaced label ``wethr:<model>`` (distinct from NOAA ``hrrr``, D-12).
+An unset ``wethr_api_key`` logs a skip and returns ``None`` with no HTTP call (D-11). The key
+is read from ``Settings`` (redacted, never logged) and sent only to the fixed endpoint
+(T-02-14/T-02-15; see docs/DECISIONS.md).
 """
 
 from __future__ import annotations
@@ -46,11 +33,7 @@ _KELVIN_OFFSET = 273.15
 
 
 def fahrenheit_to_kelvin(temp_f: float) -> float:
-    """The ONE °F->K conversion on the Wethr path (Pitfall 3 / D-07).
-
-    Wethr returns highs in °F; forecasts are Kelvin-only. Centralizing the conversion keeps
-    the units boundary auditable and prevents an accidental °F store into ``temp_kelvin``.
-    """
+    """The ONE °F->K conversion on the Wethr path, keeping the units boundary auditable (D-07)."""
     return (temp_f - 32.0) * 5.0 / 9.0 + _KELVIN_OFFSET
 
 
@@ -60,12 +43,10 @@ def model_label(model: str) -> str:
 
 
 def _extract_high_f(rows: object, target_date: date) -> float | None:
-    """Extract the °F high for ``target_date`` from the Wethr ``forecasts.php`` payload (T-02-12).
+    """Extract the °F high for ``target_date`` from the Wethr payload, else ``None`` (T-02-12).
 
-    The payload is a list of ``{valid_time, temperature_f}`` rows (v3 shape). Rows whose
-    ``valid_time`` date matches ``target_date`` contribute their ``temperature_f``; the MAX
-    is the daily high. Malformed/None values are skipped (never store garbage). Returns
-    ``None`` when no row matches.
+    Rows are ``{valid_time, temperature_f}``; the max over date-matching rows is the high,
+    malformed values skipped.
     """
     if not isinstance(rows, list):
         return None
@@ -95,18 +76,12 @@ async def fetch_wethr_forecast(
 ) -> float | None:
     """Fetch the Wethr forecast high (Kelvin) for ``city``/``model``/``target_date`` (ING-06).
 
-    Reads ``wethr_api_key`` from :func:`get_settings`; if unset, logs a structured skip and
-    returns ``None`` WITHOUT any HTTP call (graceful degrade, D-11). Otherwise GETs
-    :data:`WETHR_FORECAST_BASE` with ``location_name`` = the registry ``cli_station`` (NOT v3's
-    stale per-city station codes), ``model``, ``run=latest``, and ``Authorization: Bearer``;
-    a 429 triggers exactly one backoff retry (Pitfall 7). The returned °F high is converted to
-    Kelvin. Pure fetch+parse so the unit test injects a ``MockTransport`` client and runs
-    offline; the caller persists via :func:`store_wethr_forecast`.
+    Unset ``wethr_api_key`` → skip + ``None`` with no HTTP call (degrade, D-11). Otherwise GETs
+    keyed by the registry ``cli_station`` with one 429 retry (Pitfall 7), converting °F → Kelvin.
+    Pure fetch+parse so the unit test injects a ``MockTransport`` client offline.
 
     Args:
-        city: Kalshi city code (resolved via :func:`get_city` to its ``cli_station``).
         model: the Wethr model name (stored namespaced as ``wethr:<model>``).
-        target_date: the LST settlement (civil) date to forecast the high for.
         client: optional injected ``httpx.AsyncClient`` (the unit test passes a mock).
     """
     api_key = get_settings().wethr_api_key
@@ -160,13 +135,9 @@ def store_wethr_forecast(
 ) -> int:
     """Persist one Wethr forecast row via the SINGLE audited writer path (D-10/D-11).
 
-    Routes through :func:`weatherquant.ingest.writer.insert_forecast` under the provider-
-    namespaced label :func:`model_label` (``wethr:<model>``, D-12), ``member=0``, ``lead=0``,
-    Kelvin payload, and ``available_at`` threaded with ``mode`` (WR-01 — not hardcoded
-    ``"live"``, so the live/backfill seam is genuinely single, D-15). The station snap fields
-    are the registry station's own lat/lon with ``grid_distance_m=0.0`` (Wethr returns a
-    station forecast). Wethr is live-forward only, so the orchestrator refuses to run it in
-    backfill (WR-02).
+    Stores under :func:`model_label` (``wethr:<model>``, D-12), ``member=0``, ``lead=0``, Kelvin
+    payload, station snap = registry lat/lon with ``grid_distance_m=0.0``, and ``available_at``
+    threaded with ``mode`` (WR-01, seam stays single — D-15; orchestrator refuses backfill, WR-02).
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).

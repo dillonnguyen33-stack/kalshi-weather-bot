@@ -1,25 +1,12 @@
 """Open-Meteo ensemble members -> per-member Celsius->Kelvin (ING-05, D-05/D-07).
 
-Pulls the GFS-seamless ensemble (31 members, ``temperature_2m_member00..member30``) from
-``ensemble-api.open-meteo.com/v1/ensemble`` in ONE request (all members batched to stay
-inside the free-tier budget — A3), buckets each member's hourly values into the LST
-:func:`weatherquant.time.settlement_window`, takes each member's in-window MAX, and stores
-each member as a SEPARATE ``forecasts`` row keyed by its member index.
-
-THE V3 TRAP (Pitfall 3 / D-07). v3 requested the °F temperature unit and would have
-written °F into a Kelvin column. This module takes the API-DEFAULT Celsius (no
-``temperature_unit`` param) and converts each member value to Kelvin via the centralized
-:func:`celsius_to_kelvin` converter. The tests assert the stored value lands in the
-~280-320 K band, catching any accidental °F store (a °F daily-high would be ~50-110).
-
-MEMBER AXIS (D-05). ``member00`` -> ``member=0`` (the control / primary), ``member01..member30``
--> ``member=1..30``. The provider-namespaced label is ``openmeteo`` for the control member
-(0) and ``openmeteo:<member>`` for the perturbations (D-12) — never deduped with NOAA-decoded
-``gfs``/``gefs`` or with ``wethr:*``.
-
-LIVE-FORWARD ONLY (Open Question 2, RESOLVED). The free Open-Meteo ensemble exposes only
-~3 ``past_days``; the deep historical calibration corpus comes exclusively from the NOAA
-GRIB archive. This module fetches in LIVE mode and makes NO multi-year backfill attempt.
+Pulls the GFS-seamless ensemble (31 members) in ONE request (batched for budget — A3), buckets
+each member into the LST window, takes its in-window max, and stores each as a separate
+``forecasts`` row keyed by member index. Takes the API-default Celsius and converts via
+:func:`celsius_to_kelvin` (never the v3 °F trap, Pitfall 3 / D-07). Members map member00→0 /
+member01..member30→1..30 under namespaced labels ``openmeteo`` / ``openmeteo:<member>`` (D-05/
+D-12). Live-forward only: the free tier exposes ~3 past_days, so no backfill (see
+docs/DECISIONS.md).
 """
 
 from __future__ import annotations
@@ -54,40 +41,24 @@ _KELVIN_OFFSET = 273.15
 
 
 def celsius_to_kelvin(temp_c: float) -> float:
-    """The ONE °C->K conversion on the Open-Meteo path (Pitfall 3 / D-07).
-
-    Open-Meteo returns the API-default Celsius; forecasts are Kelvin-only. Centralizing the
-    conversion here means no caller inlines ``+ 273.15`` and the units boundary stays
-    auditable — and the v3 °F-unit request is never reintroduced.
-    """
+    """The ONE °C->K conversion on the Open-Meteo path, keeping the units boundary auditable (D-07)."""
     return temp_c + _KELVIN_OFFSET
 
 
 def member_label(member: int) -> str:
-    """Provider-namespaced model label for an Open-Meteo ensemble member (D-05/D-12).
-
-    Member 0 (the control) -> ``"openmeteo"``; members 1..30 -> ``"openmeteo:<member>"``.
-    Keeps the same underlying model from two providers as two distinct blend inputs.
-    """
+    """Namespaced label for a member: 0 → ``"openmeteo"``, 1..30 → ``"openmeteo:<member>"`` (D-05/D-12)."""
     return MODEL_BASE if member == 0 else f"{MODEL_BASE}:{member}"
 
 
-# The base hourly variable requested from the /ensemble endpoint. The ensemble API expands
-# this ONE requested variable into the full member set in the response: the bare
-# ``temperature_2m`` series is the CONTROL (member 0), and ``temperature_2m_member01`` ..
-# ``temperature_2m_member30`` are the 30 perturbations. There is NO ``temperature_2m_member00``
-# variable — requesting it (or the explicit member00..member30 list) is a 400 "Data corrupted"
-# error, so the request asks for the base variable and the response is demultiplexed below.
+# The base variable requested from /ensemble; the API expands it into all members in the
+# response (bare ``temperature_2m`` = control, ``_member01..30`` = perturbations). There is no
+# ``_member00`` and requesting the explicit list 400s, so the request asks for the base and the
+# response is demultiplexed below.
 HOURLY_VAR = "temperature_2m"
 
 
 def _member_var(member: int) -> str:
-    """The Open-Meteo RESPONSE key for a member index in the ``/ensemble`` payload.
-
-    Member 0 (the control) is the bare ``temperature_2m`` series; members 1..30 are
-    ``temperature_2m_member01`` .. ``temperature_2m_member30``. (Open-Meteo has no
-    ``temperature_2m_member00`` key — the control is unsuffixed.)
-    """
+    """Response key for a member: 0 → bare ``temperature_2m``, 1..30 → ``temperature_2m_memberNN``."""
     return HOURLY_VAR if member == 0 else f"{HOURLY_VAR}_member{member:02d}"
 
 
@@ -120,10 +91,7 @@ def _window_max_kelvin(
 def parse_members(payload: dict[str, Any], win: SettlementWindow) -> dict[int, float]:
     """Parse the ``/ensemble`` payload into ``{member_index: in-window-max Kelvin}`` (D-05).
 
-    Reads ``hourly.time`` once and each ``temperature_2m_memberNN`` series, bucketing each
-    member through ``win`` and converting its in-window max from Celsius to Kelvin. Members
-    with no in-window reading are omitted (graceful degrade, D-11). The ``memberNN`` suffix
-    maps directly to the integer member axis (member00 -> 0 ... member30 -> 30).
+    Members with no in-window reading are omitted (degrade, D-11).
     """
     hourly = payload.get("hourly", {}) or {}
     times = hourly.get("time", []) or []
@@ -146,15 +114,11 @@ async def fetch_openmeteo_ensemble(
 ) -> dict[int, float]:
     """Fetch the Open-Meteo ensemble high per member for ``city``/``target_date`` (ING-05).
 
-    Issues ONE request to ``/ensemble`` for ALL 31 members (batched — A3), taking the
-    API-default Celsius (NEVER the °F temperature unit — Pitfall 3) and converting
-    each member's in-window max to Kelvin. Returns ``{member_index: temp_kelvin}``. Live-
-    forward only (Open Question 2 RESOLVED — no deep backfill). Pure fetch+parse so the unit
-    test injects a ``MockTransport`` client and runs offline.
+    One request for all 31 members (batched — A3), API-default Celsius → Kelvin (never °F,
+    Pitfall 3). Returns ``{member_index: temp_kelvin}``. Live-forward only; pure fetch+parse so
+    the unit test injects a ``MockTransport`` client offline.
 
     Args:
-        city: Kalshi city code (resolved via :func:`get_city`).
-        target_date: the LST settlement (civil) date to forecast each member's high for.
         client: optional injected ``httpx.AsyncClient`` (the unit test passes a mock).
     """
     station = get_city(city)
@@ -162,10 +126,8 @@ async def fetch_openmeteo_ensemble(
     params = {
         "latitude": station.lat,
         "longitude": station.lon,
-        # Request the BASE variable; the /ensemble endpoint expands it into all 31 members in
-        # the response (control = bare temperature_2m, member01..member30 the perturbations).
-        # Requesting the explicit member00..member30 list 400s ("Data corrupted"). ONE request
-        # still returns every member (A3 — stay in budget).
+        # Base variable; /ensemble expands it into all 31 members (see HOURLY_VAR), one request
+        # (A3 — stay in budget).
         "hourly": HOURLY_VAR,
         "models": ENSEMBLE_MODEL,
         "start_date": ds,
@@ -207,14 +169,9 @@ def store_members(
 ) -> int:
     """Persist each ensemble member as a SEPARATE forecast row via the audited path (D-05).
 
-    Each ``{member: temp_kelvin}`` entry routes through
-    :func:`weatherquant.ingest.writer.insert_forecast` under the provider-namespaced label
-    :func:`member_label` (``openmeteo`` / ``openmeteo:<member>``), the integer member axis,
-    ``lead=0`` (the daily-high quantity), Kelvin payload, and ``available_at`` threaded with
-    ``mode`` (WR-01 — not hardcoded ``"live"``, so the live/backfill seam is genuinely single,
-    D-15). Open-Meteo is live-forward only (the free tier exposes ~3 past_days), so the
-    orchestrator refuses to run it in backfill (WR-02). Returns the count of rows actually
-    inserted (skips already-present identical rows, D-10).
+    Each entry stores under :func:`member_label`, the member axis, ``lead=0``, Kelvin payload,
+    and ``available_at`` threaded with ``mode`` (WR-01, so the seam stays single — D-15;
+    orchestrator refuses backfill, WR-02). Returns rows inserted (skips identical, D-10).
     """
     station = get_city(city)
     cycle = cycle or datetime.now(timezone.utc)
