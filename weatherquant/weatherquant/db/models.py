@@ -173,13 +173,49 @@ calibration_params = sa.Table(
 # ``snapshot_for`` is the market time-bucket key. It is typed ``Text`` (a stable string
 # key, e.g. an ISO instant or market period label) rather than ``timestamptz`` so the
 # natural key stays a simple, comparable identifier; the point-in-time-of-knowledge axis
-# is ``available_at`` (D-12). Phase-5/6 may refine the encoding via a migration.
+# is ``available_at`` (D-12).
+#
+# Phase-5 (05-00, D-11) adds the Kalshi orderbook payload columns — all ``nullable=True`` so
+# the column-add is non-breaking. ``best_yes_bid``/``best_no_bid`` are the top-of-book bids in
+# integer cents (the only side Kalshi quotes — the ask side is reflected as ``100 - opposite
+# bid`` in market/reflect.py, PAP-02); ``mid`` is the derived midpoint (Float, the real market
+# midpoint fed into the Phase-4 EV/Kelly path, closing the D-08/D-16 loop); ``seq`` is the WS
+# orderbook_delta sequence number (BigInteger — a gap triggers a resnapshot, PAP-01); and
+# ``detail`` (JSONB) carries the raw book payload, mirroring ``observations.detail``. The
+# natural key is (ticker, snapshot_for) so ix_market_snapshots_latest keys the latest snapshot.
+# Column types must equal the applied migration so metadata.create_all reproduces the migrated
+# schema (the migration test, not this comment, enforces that parity).
+#
+# MONEY-UNIT LANDMARK: ``mid`` is FLOAT-VALUED CENTS — the half-cent bid/ask midpoint,
+# unit-consistent with ``best_yes_bid``/``best_no_bid`` (integer cents) and with the fill's
+# ``avg_price_cents`` (cents). It is NOT [0,1] dollars. Keeping one unit lets
+# ``clv.vol_weighted_mid``/``clv_cents`` subtract ``avg_price_cents`` directly with no
+# conversion (``run_paper`` persists the un-divided ``mid_cents`` here and keeps the [0,1]
+# ``mid_unit`` only for the p_used/EV/Kelly pricing math). ``mid`` MUST stay ``sa.Float`` (NOT
+# Integer) — rounding to an int would inject +/-0.5c bias into every derived CLV. ``volume`` is
+# the per-snapshot book-liquidity signal in WHOLE CONTRACTS (Integer) consumed by
+# ``vol_weighted_mid`` to weight the closing mid: it is the top-of-book size SUPPORTING the
+# persisted yes mid — ``min(best_yes_bid_size, best_no_bid_size)``, the liquidity BEHIND THIS
+# mid (the best-no-bid size IS the reflected best-yes-ask size, reflect.py). It is the
+# supporting size, NOT the two-sided UNION depth, which would over-weight an opposite-side-deep
+# but thinly-supported mid while still being a REAL feed signal (not a fixture).
 market_snapshots = sa.Table(
     "market_snapshots",
     metadata,
     _id_column(),
     sa.Column("ticker", sa.Text, nullable=False),
     sa.Column("snapshot_for", sa.Text, nullable=False),
+    sa.Column("best_yes_bid", sa.Integer, nullable=True),
+    sa.Column("best_no_bid", sa.Integer, nullable=True),
+    # mid is FLOAT-VALUED CENTS (the half-cent midpoint, unit-consistent with best_*_bid and
+    # avg_price_cents) — NOT [0,1] dollars; stays Float so no +/-0.5c rounding bias.
+    sa.Column("mid", sa.Float, nullable=True),
+    # volume: per-snapshot book-liquidity signal in WHOLE CONTRACTS — the top-of-book size
+    # SUPPORTING the persisted yes mid (min(best_yes_bid_size, best_no_bid_size)), the liquidity
+    # behind THIS mid; weights the CLV closing mid.
+    sa.Column("volume", sa.Integer, nullable=True),
+    sa.Column("seq", sa.BigInteger, nullable=True),
+    sa.Column("detail", postgresql.JSONB, nullable=True),
     _available_at_column(),
     sa.Index(
         "ix_market_snapshots_latest",
@@ -190,12 +226,40 @@ market_snapshots = sa.Table(
 )
 
 # --- fills: natural key = ticker, trade_id (order/leg identity) --------------------
+# Phase-5 (05-00, D-11) adds the simulated-fill payload columns — all ``nullable=True``. The
+# execution payload: ``side`` (Text, yes/no), ``price`` (Integer cents), ``count`` (Integer
+# contracts), ``fee`` (Integer cents — the exact_fee per order), ``is_maker`` (Boolean —
+# maker queue vs taker sweep, PAP-02/PAP-03), and ``event_time`` (timestamptz — the REAL WS
+# event time the fill occurred at, never now()/back-dated, D-08, PAP-03). The intent linkage
+# back to the Phase-4 money path: ``bucket_prob``/``ev``/``kelly_stake`` (Float) record the
+# model probability, expected value, and Kelly stake that motivated the order, so each fill is
+# auditable against the forecast that produced it. ``detail`` (JSONB) carries the raw trade
+# payload, mirroring ``observations.detail``. The natural key (ticker, trade_id) is UNCHANGED
+# so ix_fills_latest is intact. Types mirror 0004 EXACTLY (metadata.create_all == migrated).
+#
+# PRECISION CONTRACT (WR-05): ``price`` is the ROUNDED whole-cent fill price — it exists for the
+# 1..99c band guard and human-readable display, NOT for derived money math. It carries a
+# +/-0.5c rounding bias, exactly the bias the ``market_snapshots.mid`` column was kept ``Float``
+# to avoid. Derived CLV MUST read the un-rounded size-weighted average from
+# ``detail['avg_price_cents']`` (float cents), never the integer ``price`` column — reconstructing
+# CLV from ``price`` would re-introduce the +/-0.5c bias the float ``mid`` deliberately avoids.
+# ``clv.clv_cents`` already consumes the float ``avg_price_cents`` off the Fill object / detail.
 fills = sa.Table(
     "fills",
     metadata,
     _id_column(),
     sa.Column("ticker", sa.Text, nullable=False),
     sa.Column("trade_id", sa.Text, nullable=False),
+    sa.Column("side", sa.Text, nullable=True),
+    sa.Column("price", sa.Integer, nullable=True),
+    sa.Column("count", sa.Integer, nullable=True),
+    sa.Column("fee", sa.Integer, nullable=True),
+    sa.Column("is_maker", sa.Boolean, nullable=True),
+    sa.Column("event_time", sa.TIMESTAMP(timezone=True), nullable=True),
+    sa.Column("bucket_prob", sa.Float, nullable=True),
+    sa.Column("ev", sa.Float, nullable=True),
+    sa.Column("kelly_stake", sa.Float, nullable=True),
+    sa.Column("detail", postgresql.JSONB, nullable=True),
     _available_at_column(),
     sa.Index(
         "ix_fills_latest",

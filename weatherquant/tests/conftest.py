@@ -293,3 +293,160 @@ def synthetic_gaussians() -> SyntheticGaussians:
         mu_blend=mu_blend,
         sigma_blend=sigma_blend,
     )
+
+
+# --- Phase-5 paper-fill-simulator synthetic fixtures (05-11 verified live schema) -----------
+# Orderbook/stream fixtures encoding the Kalshi V2 WS protocol VERIFIED LIVE in 05-UAT.md
+# (## Gaps → verified_live_schema): an ENVELOPE (top-level ``type``/``sid``/``seq``; the book
+# data nested under ``msg``) with DOLLAR/FIXED-POINT STRING levels and a PER-SUBSCRIPTION seq
+# (snapshot=1, first delta=2, +1 each). A snapshot side is ``[[price_dollar_string,
+# count_fp_string], ...]`` under ``msg.yes_dollars_fp``/``msg.no_dollars_fp``; a delta carries
+# ``msg.side``/``msg.price_dollars``/``msg.delta_fp`` plus the real WS event time
+# (``msg.ts``/``msg.ts_ms``). Dollar string × 100 → integer cents; count/delta via
+# ``round(float(...))``. These are import-light (no websockets/cryptography import here) so the
+# no-leak boundary is never crossed by the fixtures. The dollar-string values below were chosen
+# so they parse to the SAME integer-cent top-of-book the flat fixtures used, keeping the
+# reflect-seam numeric expectations identical (only the wire shape changed): yes 47¢×120 best,
+# no 49¢×80 best → reflected yes-ask 51¢, mid 49¢.
+
+
+@pytest.fixture
+def orderbook_snapshot() -> dict:
+    """A VERIFIED enveloped Kalshi ``orderbook_snapshot`` with a known top-of-book.
+
+    The book data is nested under ``msg`` as dollar/fixed-point STRING levels
+    (``[[price_dollars, count_fp], ...]``); the per-subscription ``seq`` anchor is 1. Parsed to
+    cents/int the best yes bid is 47¢ (size 120) and the best no bid is 49¢ (size 80) — so the
+    reflected yes-ask is ``100 - 49 = 51¢`` and the implied mid is ``(47 + 51) / 2 = 49¢``.
+    """
+    return {
+        "type": "orderbook_snapshot",
+        "sid": 1,
+        "seq": 1,
+        "msg": {
+            "market_ticker": "KXHIGHNY-26JUN18-T72",
+            "market_id": "ec1f8e9a-0000-0000-0000-000000000000",
+            "yes_dollars_fp": [["0.47", "120.00"], ["0.46", "200.00"], ["0.45", "350.00"]],
+            "no_dollars_fp": [["0.49", "80.00"], ["0.48", "150.00"], ["0.47", "260.00"]],
+        },
+    }
+
+
+@pytest.fixture
+def orderbook_delta_stream() -> list[dict]:
+    """A CONTIGUOUS enveloped ``orderbook_delta`` stream (seq 2, 3, 4) over the snapshot.
+
+    Each delta is a single-level change under ``msg``: ``delta_fp`` is the signed size change at
+    ``(msg.side, msg.price_dollars)``, and each carries the real WS event time
+    (``msg.ts``/``msg.ts_ms``). The net level changes match the old flat stream (yes 47 −20; no
+    50 +60; yes 48 +40) so the post-apply book assertions stay numerically identical. Applied in
+    order onto :func:`orderbook_snapshot` (seq 1) they keep the book consistent (no gap).
+    """
+    return [
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "yes",
+                "price_dollars": "0.47", "delta_fp": "-20.00",
+                "ts": "2026-06-18T19:55:00.000000Z", "ts_ms": 1781812500000,
+            },
+        },
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 3,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "no",
+                "price_dollars": "0.50", "delta_fp": "60.00",
+                "ts": "2026-06-18T19:55:01.000000Z", "ts_ms": 1781812501000,
+            },
+        },
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 4,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "yes",
+                "price_dollars": "0.48", "delta_fp": "40.00",
+                "ts": "2026-06-18T19:55:02.000000Z", "ts_ms": 1781812502000,
+            },
+        },
+    ]
+
+
+@pytest.fixture
+def orderbook_delta_stream_with_gap() -> list[dict]:
+    """An enveloped delta stream with an INJECTED seq gap (2 then 5 — 3/4 missing).
+
+    The book module must detect the discontinuity (next seq != last seq + 1) and raise the
+    ``SeqGap`` correctness error (book-level raise only; the gap-RECOVERY mechanism is 05-12's
+    concern) rather than silently applying the out-of-order delta — a gap means the local book
+    is unknown and must be re-snapshotted (PAP-01, D-02).
+    """
+    return [
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "yes",
+                "price_dollars": "0.47", "delta_fp": "-20.00",
+                "ts": "2026-06-18T19:55:00.000000Z", "ts_ms": 1781812500000,
+            },
+        },
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 5,
+            "msg": {
+                "market_ticker": "KXHIGHNY-26JUN18-T72", "side": "no",
+                "price_dollars": "0.49", "delta_fp": "-30.00",
+                "ts": "2026-06-18T19:55:03.000000Z", "ts_ms": 1781812503000,
+            },
+        },
+    ]
+
+
+@pytest.fixture
+def control_frame() -> dict:
+    """The VERIFIED Kalshi control frame (first message after a subscribe).
+
+    A ``subscribed`` acknowledgement carrying no book data; ``book.apply`` must IGNORE it
+    (mutate nothing, never fail loud) rather than treating it as an unknown data type.
+    """
+    return {"type": "subscribed", "id": 1, "msg": {"channel": "orderbook_delta", "sid": 1}}
+
+
+@pytest.fixture
+def scripted_book() -> dict:
+    """A scripted resting book with KNOWN size-ahead for queue/partial-fill credit.
+
+    ``yes`` / ``no`` are bid level lists ``[price_cents, size]`` best-first. ``size_ahead``
+    records, per (side, price), the resting size sitting AHEAD of a hypothetical maker order
+    joining that level — the maker queue must not advance on cancels-ahead, only on
+    trade-through (05-02/05-03, PAP-02). A taker sweep against the yes bids walks 50¢×100 then
+    49¢×60: a 130-contract taker sell fills 100@50 + 30@49, a size-weighted avg of
+    ``(100*50 + 30*49) / 130 = 49.77¢``; a 200-contract order partial-fills the 160 available
+    (PAP-03).
+    """
+    return {
+        "ticker": "KXHIGHNY-26JUN18-T72",
+        "yes": [[50, 100], [49, 60]],
+        "no": [[48, 90], [47, 140]],
+        "size_ahead": {("yes", 50): 100, ("yes", 49): 60, ("no", 48): 90},
+    }
+
+
+@pytest.fixture
+def closing_window_snapshots() -> list[dict]:
+    """A golden closing-window snapshot series with a KNOWN volume-weighted mid (PAP-04).
+
+    Each row is ``market_snapshots``-shaped and MIRRORS THE PRODUCTION PERSISTED ROW SHAPE
+    (05-06, CR-01/WR-01): ``mid`` in float-valued CENTS (unit-consistent with the persisted
+    best_*_bid/avg_price_cents) + an integer ``volume`` (the real per-snapshot resting
+    top-of-book liquidity the audited writer now persists) — NO LONGER a contradictory
+    dollars-vs-cents convention versus the persist path. The volume-weighted closing mid is
+    ``(50*100 + 52*300 + 51*100) / (100+300+100) = (5000+15600+5100)/500 = 51.4¢``.
+    A fill at 48¢ (better than the 51.4¢ closing mid, for a yes BUY) yields POSITIVE CLV;
+    a fill at 55¢ yields NEGATIVE CLV. The window itself is anchored on
+    ``time.settlement_window(...).end_utc`` (the half-open EXCLUSIVE end), never re-derived.
+    The end-to-end persist→CLV path on these same units is exercised by
+    ``tests/test_clv_integration.py`` (the production-shaped integration test).
+    """
+    return [
+        {"snapshot_for": "2026-06-18T19:55Z", "mid": 50.0, "volume": 100},
+        {"snapshot_for": "2026-06-18T19:57Z", "mid": 52.0, "volume": 300},
+        {"snapshot_for": "2026-06-18T19:59Z", "mid": 51.0, "volume": 100},
+    ]
