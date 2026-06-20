@@ -1,18 +1,15 @@
 """Kalshi market edge for the paper-fill simulator (Phase 5).
 
-``weatherquant.market`` is the I/O edge that talks to Kalshi (the live orderbook WS feed,
-the REST snapshot, RSA-PSS request signing) and the pure correctness seams the fill
-simulator prices against. It is fenced OUT of the pure ``weatherquant.price`` money path by
-the ``tests/test_no_market_leak_into_price.py`` AST guard — ``price/`` never imports
-``market``/``websockets``/``cryptography``.
+The I/O edge that talks to Kalshi (live orderbook WS feed, REST snapshot, RSA-PSS signing)
+plus the pure correctness seams the fill simulator prices against. Fenced OUT of the pure
+``weatherquant.price`` money path by ``tests/test_no_market_leak_into_price.py``.
 
-Public surface (grows over 05-02..05-04):
+Public surface:
 
 * ``auth`` — :class:`KalshiSigner`, :func:`load_key`, :func:`sign`: the ONE RSA-PSS signer
   shared by the WS handshake and the REST snapshot (PAP-01, D-01).
 * ``reflect`` — :func:`yes_ask_levels`, :func:`no_ask_levels`: the ONE yes/no bid-only
-  reflection seam (``ask = 100 - opposite bid``) every fill price/size routes through
-  (PAP-02, the central correctness landmine).
+  reflection seam (``ask = 100 - opposite bid``) every fill price/size routes through (PAP-02).
 * ``book`` — :class:`OrderBook`, :class:`SeqGap`, :func:`apply`: the in-memory per-ticker
   book + ``seq`` integrity (a gap raises ``SeqGap``, a ``CorrectnessError``, triggering a
   REST re-snapshot — never a silent carry-forward, PAP-01, D-02).
@@ -20,11 +17,11 @@ Public surface (grows over 05-02..05-04):
   reconnect loop (re-subscribe AND REST re-snapshot on every reconnection) and the signed
   REST orderbook snapshot resync anchor (PAP-01).
 * ``persist`` — :func:`persist_snapshot`, :func:`persist_fill`, :func:`latest_snapshots`:
-  the THIN snapshot/fill write+read adapter over the one audited append-only writer path and
-  ``queries.latest`` (no Core insert here — D-13, threat T-05-15).
+  the THIN snapshot/fill adapter over the audited append-only writer + ``queries.latest``
+  (no Core insert here — D-13, T-05-15).
 * ``clv`` — :func:`clv_cents`, :func:`vol_weighted_mid`, :func:`closing_window_snapshots`,
-  :data:`CLV_WINDOW_MINUTES`: the PURE derived per-trade CLV against a volume-weighted closing
-  mid, anchored on the one LST ``settlement_window`` clock (PAP-04, D-09/D-10/D-12).
+  :data:`CLV_WINDOW_MINUTES`: the PURE per-trade CLV against a volume-weighted closing mid on
+  the LST ``settlement_window`` clock (PAP-04, D-09/D-10/D-12).
 """
 
 from __future__ import annotations

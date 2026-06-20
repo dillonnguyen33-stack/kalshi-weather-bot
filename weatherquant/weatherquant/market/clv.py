@@ -1,31 +1,18 @@
 """Derived per-trade closing-line value (CLV) — PAP-04, pure, on the one LST clock.
 
-CLV measures a fill against the volume-weighted CLOSING mid over the final window before the
-market settles. It is a DERIVED post-settlement computation, NEVER a stamped column on the
-fill row (D-12): the closing mid does not exist at fill time, and the ledger is append-only,
-so a stamped CLV would back-date a value that depends on later data. Instead this module is a
-PURE function over the fill plus the closing-window ``market_snapshots`` rows.
+CLV scores a fill against the volume-weighted CLOSING mid over the final window before
+settlement. DERIVED post-settlement, NEVER a stamped fill column (D-12; see docs/DECISIONS.md):
+a PURE function over the fill plus the closing-window ``market_snapshots`` rows.
 
-Three correctness landmines are encoded here:
+Correctness landmines (see docs/DECISIONS.md):
 
-* **Settlement-clock anchor (D-10, the v3 founding bug).** :func:`closing_window_snapshots`
-  selects the final :data:`CLV_WINDOW_MINUTES` before ``settlement_window(city, date).end_utc``
-  — the ONE fixed-offset LST clock in :mod:`weatherquant.time`, the half-open EXCLUSIVE end.
-  The window is ``[end_utc - CLV_WINDOW_MINUTES, end_utc)`` (half-open, mirroring
-  ``orchestrator._target_date_for``): a snapshot AT or after ``end_utc`` is EXCLUDED, and one
-  before the window start is excluded. NEVER a re-derived civil-time clock.
+* Settlement-clock anchor (D-10, the v3 founding bug): the half-open LST window
+  ``[end_utc - CLV_WINDOW_MINUTES, end_utc)`` off :mod:`weatherquant.time`, never a re-derived
+  civil-time clock.
+* Volume-weighted mid (D-09): ``Σ(mid_i·vol_i)/Σvol_i`` in cents; empty/zero-volume fails loud.
+* Sign orientation (D-09): ``closing_mid - fill_price`` for a ``"buy"``, flipped for a ``"sell"``.
 
-* **Volume-weighted mid (D-09).** :func:`vol_weighted_mid` is ``Σ(mid_i·vol_i)/Σvol_i`` in
-  cent space — the principled, reversible default. An empty window or zero total volume FAILS
-  LOUD (raises) rather than returning a fabricated mid (no fillable closing data → no CLV,
-  never a silent 0).
-
-* **Sign orientation (D-09).** :func:`clv_cents` returns ``closing_mid - fill_price`` for a
-  ``"buy"`` (positive when we paid LESS than the close — a good fill) and flips the sign for
-  a ``"sell"``.
-
-PURE: no ``websockets``/``cryptography``/SDK import; it imports only
-:func:`weatherquant.time.settlement_window` for the clock anchor.
+PURE: imports only :func:`weatherquant.time.settlement_window`.
 """
 
 from __future__ import annotations
@@ -37,11 +24,8 @@ from typing import Any, Protocol, runtime_checkable
 from weatherquant.registry import City
 from weatherquant.time import settlement_window
 
-# The closing window length: the final N minutes before settlement (D-09). A principled,
-# reversible config CONSTANT — long enough to hold real closing liquidity, short enough that
-# the mid reflects the genuine pre-settlement consensus rather than mid-session noise. The
-# run_paper snapshot cadence (PAPER_SNAPSHOT_CADENCE_SECONDS) MUST stay strictly finer than
-# this so the window holds >= 1 persisted snapshot (PAP-04 cadence sufficiency, T-05-20).
+# Closing window length: the final N minutes before settlement (D-09). run_paper's snapshot
+# cadence MUST stay strictly finer so the window holds >= 1 snapshot (PAP-04, T-05-20).
 CLV_WINDOW_MINUTES = 30
 
 
@@ -53,25 +37,14 @@ class _HasAvgPrice(Protocol):
 
 
 def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
-    """Extract a snapshot's UTC event time, fail-loud on absence (absence = absence).
+    """Extract a snapshot's UTC event time, fail-loud on absence (DD-1, IN-01).
 
-    The SINGLE public snapshot event-time parse seam (DD-1): both the CLV closing-window
-    selector here AND ``cli._snapshot_event_time`` delegate to this one body so the D-08
-    stamping/parsing cannot drift across modules. Prefers an explicit ``event_time`` /
-    ``available_at`` ``datetime`` (the persisted row + ``fetch_snapshot`` stamp shape); falls
-    back to parsing the ``snapshot_for`` ISO string (the fixture / ISO-stamp shape). A naive
-    datetime is assumed UTC. A missing/unparseable time is a caller bug — raise, never silently
-    drop the row from the window (which would skew the closing mid).
-
-    CLOSING-WINDOW AXIS CONTRACT (IN-01): for persisted ``market_snapshots`` rows the
-    closing-window selection axis is ``available_at`` — the real observed book instant. The
-    preference order above (``event_time`` then ``available_at`` then ``snapshot_for``) is a
-    contract, not an accident: ``run_paper`` sets all three from the SAME observed instant
-    (``available_at=event_time`` and ``snapshot_for`` is that instant's ISO string), and asserts
-    their agreement at persist time. A FUTURE writer that sets ``available_at`` to ingest time
-    while ``snapshot_for`` keeps the observation instant would select the window on the wrong
-    axis; the persist-time assertion in ``run_paper`` is what catches that divergence at the
-    write boundary rather than letting it silently skew the CLV window.
+    The SINGLE public snapshot event-time parse seam (``cli._snapshot_event_time`` delegates
+    here too, so D-08 stamping cannot drift). Preference order ``event_time`` then
+    ``available_at`` then ``snapshot_for`` ISO string is a contract, not an accident — the
+    closing-window axis is ``available_at`` (the observed book instant); run_paper sets all
+    three from that instant and asserts agreement at persist time. Naive datetimes are UTC;
+    a missing/unparseable time raises (never silently drop a row and skew the mid).
     """
     for key in ("event_time", "available_at"):
         value = snapshot.get(key)
@@ -79,9 +52,7 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
             return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
     raw = snapshot.get("snapshot_for")
     if isinstance(raw, str):
-        # Strip an optional ``#<seq>`` disambiguation suffix (WR-03): run_paper appends the WS seq
-        # to snapshot_for so two distinct same-second book states stay distinct natural-key rows;
-        # the suffix is not part of the ISO instant, so drop it before parsing.
+        # Strip an optional ``#<seq>`` disambiguation suffix before parsing (WR-03).
         iso = raw.split("#", 1)[0]
         # Accept a trailing 'Z' (the fixture shape) as UTC.
         parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
@@ -99,11 +70,8 @@ def closing_window_snapshots(
 ) -> list[Mapping[str, Any]]:
     """Select the snapshots in the half-open closing window on the LST clock (D-10).
 
-    The window is ``[end_utc - CLV_WINDOW_MINUTES, end_utc)`` where ``end_utc`` is
-    ``settlement_window(city, day).end_utc`` — the ONE fixed-offset LST clock, half-open
-    EXCLUSIVE end (mirroring ``orchestrator._target_date_for``: ``start <= t < end``). A
-    snapshot AT ``end_utc`` is EXCLUDED; one before the window start is excluded. NEVER a
-    re-derived civil-time clock (the v3 founding bug, D-10).
+    Window ``[end_utc - CLV_WINDOW_MINUTES, end_utc)`` off ``settlement_window(city, day)``;
+    a snapshot AT ``end_utc`` is EXCLUDED.
 
     Args:
         snapshots: ``market_snapshots``-shaped rows (each must carry a usable event time:
@@ -128,19 +96,10 @@ def closing_window_snapshots(
 def vol_weighted_mid(closing_snapshots: Sequence[Mapping[str, Any]]) -> float:
     """Volume-weighted closing mid ``Σ(mid_i·vol_i)/Σvol_i`` in CENTS (D-09), fail-loud on empty.
 
-    Each snapshot must carry a ``mid`` in CENTS (the float-valued half-cent midpoint persisted
-    by ``run_paper`` — unit-consistent with ``best_yes_bid``/``best_no_bid``/``avg_price_cents``,
-    NOT [0,1] dollars, CR-01) and a real ``volume``. ``volume`` is the per-snapshot top-of-book
-    size SUPPORTING the persisted mid — the liquidity BEHIND THIS mid, ``min`` of the best-yes-bid
-    size and the reflected best-yes-ask size (= the best-no-bid size, reflect.py) — in whole
-    contracts, persisted via the audited writer (WR-01, CORR-MED-3). It is NOT the two-sided UNION
-    depth (05-06 MD-01): weighting by union depth would over-weight a snapshot deep on the OPPOSITE
-    side whose yes-mid is thinly supported, biasing the closing mid toward opposite-side-heavy
-    instants; weighting by the supporting size makes the weight track the liquidity that genuinely
-    backs each mid. The math here is UNCHANGED — only the meaning of ``vol`` is the supporting
-    size. The returned mid is therefore in CENTS, so ``clv_cents`` subtracts ``avg_price_cents``
-    directly with no conversion. An empty window or a zero total volume RAISES (no fillable closing
-    data → no CLV; never a fabricated mid/silent 0).
+    Each snapshot carries a ``mid`` in CENTS (float-valued, CR-01) and a ``volume`` that is the
+    top-of-book size SUPPORTING this mid — ``min`` of best-yes-bid and reflected best-yes-ask
+    size — NOT the two-sided union depth (05-06 MD-01; see docs/DECISIONS.md). Returned mid is
+    in cents, so ``clv_cents`` subtracts ``avg_price_cents`` directly. Empty/zero-volume raises.
 
     Raises:
         ValueError: if ``closing_snapshots`` is empty or the total volume is non-positive.
@@ -173,17 +132,10 @@ def clv_cents(
 ) -> float:
     """Per-trade CLV in cents: a fill better than the close is POSITIVE (D-09).
 
-    Both operands are CENTS: the closing mid (``vol_weighted_mid`` over snapshots whose ``mid``
-    is float-valued cents, CR-01) and the fill's ``avg_price_cents``. The fill price here is the
-    un-rounded float ``avg_price_cents`` (off the Fill object / ``fills.detail['avg_price_cents']``),
-    NEVER the rounded integer ``fills.price`` column — reading the integer would re-introduce the
-    +/-0.5c rounding bias the float ``mid`` is deliberately kept ``Float`` to avoid (WR-05).
-    ``edge = closing_mid - fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` (positive when
-    we paid LESS than the
-    volume-weighted closing mid — a good fill) and ``-edge`` for a ``"sell"`` (the sign flips:
-    selling ABOVE the close is the good fill). No unit conversion is needed now that the
-    persisted ``mid`` is cents. The closing mid is derived from ``closing_snapshots`` via
-    :func:`vol_weighted_mid` (which fails loud on an empty/zero-volume window — no fabricated CLV).
+    Both operands are CENTS. The fill price is the un-rounded float ``avg_price_cents``, NEVER
+    the rounded integer ``fills.price`` column (which re-introduces the +/-0.5c rounding bias,
+    WR-05). ``edge = closing_mid - fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` and
+    ``-edge`` for a ``"sell"``. The closing mid comes from :func:`vol_weighted_mid`.
 
     Args:
         fill: the executed fill (carries the size-weighted ``avg_price_cents``).
