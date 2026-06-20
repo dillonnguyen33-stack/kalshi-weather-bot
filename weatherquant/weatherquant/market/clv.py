@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, UTC
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol
 
 from weatherquant.registry import City
 from weatherquant.time import settlement_window
@@ -29,7 +29,6 @@ from weatherquant.time import settlement_window
 CLV_WINDOW_MINUTES = 30
 
 
-@runtime_checkable
 class _HasAvgPrice(Protocol):
     """Structural type for a fill carrying a size-weighted ``avg_price_cents`` (D-07)."""
 

@@ -21,7 +21,7 @@ from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
 from weatherquant.ingest.writer import Bind, insert_forecast
-from weatherquant.registry import CITIES, get_city
+from weatherquant.registry import get_city
 from weatherquant.time import settlement_window
 
 logger = logging.getLogger(__name__)
@@ -430,11 +430,7 @@ async def ingest_range(
     return totals
 
 
-ALL_CITIES: tuple[str, ...] = tuple(CITIES)
-
-
 __all__ = [
-    "ALL_CITIES",
     "GRIB_MODELS",
     "SUPPLEMENTARY_SOURCES",
     "ingest_afd",

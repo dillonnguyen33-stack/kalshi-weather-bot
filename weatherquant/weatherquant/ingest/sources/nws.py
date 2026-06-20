@@ -129,7 +129,6 @@ async def fetch_nws_forecast(
     target_date: date,
     *,
     client: httpx.AsyncClient | None = None,
-    mode: str = "live",
 ) -> float | None:
     """Fetch the NWS gridpoint forecast high for ``city``/``target_date`` (ING-04, Pattern 4).
 
@@ -139,7 +138,6 @@ async def fetch_nws_forecast(
 
     Args:
         client: optional injected ``httpx.AsyncClient`` (the unit test passes a mock).
-        mode: unused here (kept for signature symmetry with the writer-routing helper).
     """
     station = get_city(city)
     owns_client = client is None

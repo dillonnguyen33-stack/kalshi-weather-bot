@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 WETHR_FORECAST_BASE = "https://wethr.net/api/v2/forecasts.php"
 
 # Deterministic Wethr models in scope (v3 WETHR_MODELS L531). Each stores under wethr:<model>.
-WETHR_MODELS = ["hrrr", "nbm", "rap", "nam4km", "gfs", "ecmwf-ifs"]
+WETHR_MODELS = ("hrrr", "nbm", "rap", "nam4km", "gfs", "ecmwf-ifs")
 
 _KELVIN_OFFSET = 273.15
 
@@ -96,7 +96,9 @@ async def fetch_wethr_forecast(
 
     station = get_city(city).cli_station  # re-map by registry cli_station, NOT v3's station map
     owns_client = client is None
-    client = client or get_client(headers={"Authorization": f"Bearer {api_key}"})
+    # Auth rides the per-request header below (covers both an injected client and one we own),
+    # so the owned client needs no duplicate default Authorization header.
+    client = client or get_client()
     try:
         resp = await request_with_retry(
             client,
