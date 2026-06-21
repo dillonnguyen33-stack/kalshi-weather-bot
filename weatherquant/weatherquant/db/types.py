@@ -25,11 +25,14 @@ def exec_bind(bind: Bind, *, write: bool) -> Iterator[Connection]:
     An owned ``Engine`` opens ``begin()`` (write) or ``connect()`` (read); a caller-supplied
     ``Connection`` is used as-is so the caller keeps owning its transaction.
     """
-    if isinstance(bind, Engine):
-        with (bind.begin() if write else bind.connect()) as conn:
+    if not isinstance(bind, Engine):
+        yield bind  # caller-supplied Connection; it owns its transaction.
+    elif write:
+        with bind.begin() as conn:
             yield conn
     else:
-        yield bind
+        with bind.connect() as conn:
+            yield conn
 
 
 __all__ = ["Bind", "exec_bind"]
