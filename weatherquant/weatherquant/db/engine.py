@@ -131,8 +131,13 @@ class Settings(BaseSettings):
     __str__ = __repr__
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Construct ``Settings`` from the environment / ``.env`` (fails loud if unset)."""
+    """Construct ``Settings`` from the environment / ``.env`` once per process (fails loud if unset).
+
+    Memoized (like :func:`get_engine`) so callers share one parsed config and the ``.env`` is read
+    once, not on every key lookup. ``cache_clear()`` is available for tests that repoint the env.
+    """
     return Settings()  # type: ignore[call-arg]  # populated from env by pydantic-settings
 
 
