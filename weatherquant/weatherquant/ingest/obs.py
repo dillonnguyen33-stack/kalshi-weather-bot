@@ -18,6 +18,7 @@ from typing import Any, cast
 
 import httpx
 
+from weatherquant.ingest.sources._client import get_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, parse_utc, settlement_window
@@ -226,7 +227,7 @@ async def fetch_asos_obs(
     iem_station = station[1:] if station.startswith("K") and len(station) == 4 else station
 
     owns_client = client is None
-    client = client or httpx.AsyncClient(timeout=15.0, headers={"User-Agent": _USER_AGENT})
+    client = client or get_client()
     try:
         try:
             resp = await client.get(

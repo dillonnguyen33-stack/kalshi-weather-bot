@@ -15,11 +15,14 @@ from collections.abc import Sequence
 from datetime import date, datetime, timedelta, UTC
 from typing import Literal
 
+import httpx
+
 from weatherquant.ingest import afd as afd_mod
 from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
+from weatherquant.ingest.sources._client import get_client
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import settlement_window
@@ -161,6 +164,7 @@ async def ingest_cycle(
     *,
     mode: Mode,
     lead: int,
+    client: httpx.AsyncClient | None = None,
 ) -> int:
     """Ingest a single (model, city, cycle) on the ONE code path, dispatching by model (ING-08).
 
@@ -184,10 +188,12 @@ async def ingest_cycle(
                 _log_live_only_skip(model, city, cycle_init)
                 return 0
             if model == "nws":
-                return await _ingest_nws(bind, city, cycle_init, lead, mode=mode)
+                return await _ingest_nws(bind, city, cycle_init, lead, mode=mode, client=client)
             if model == "openmeteo":
-                return await _ingest_openmeteo(bind, city, cycle_init, lead, mode=mode)
-            return await _ingest_wethr(bind, city, cycle_init, mode=mode)
+                return await _ingest_openmeteo(
+                    bind, city, cycle_init, lead, mode=mode, client=client
+                )
+            return await _ingest_wethr(bind, city, cycle_init, mode=mode, client=client)
         raise ValueError(f"unknown ingest model/source: {model!r}")
     except KeyError:
         # Unknown city code (ASVS V5) is a caller error, not graceful degradation — never swallow.
@@ -204,11 +210,12 @@ async def ingest_cycle(
 
 
 async def _ingest_nws(
-    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode
+    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode,
+    client: httpx.AsyncClient | None = None,
 ) -> int:
     """NWS gridpoint -> in-window max -> one ``nws`` forecast row (02-04, live-forward)."""
     target_date = _target_date_for(city, cycle_init, lead)
-    temp_kelvin = await nws.fetch_nws_forecast(city, target_date)
+    temp_kelvin = await nws.fetch_nws_forecast(city, target_date, client=client)
     if temp_kelvin is None:
         _log_fallback("nws", city, cycle_init, "no in-window NWS forecast")
         return 0
@@ -218,11 +225,12 @@ async def _ingest_nws(
 
 
 async def _ingest_openmeteo(
-    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode
+    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode,
+    client: httpx.AsyncClient | None = None,
 ) -> int:
     """Open-Meteo ensemble -> per-member rows (02-04, live-forward)."""
     target_date = _target_date_for(city, cycle_init, lead)
-    members = await openmeteo.fetch_openmeteo_ensemble(city, target_date)
+    members = await openmeteo.fetch_openmeteo_ensemble(city, target_date, client=client)
     if not members:
         _log_fallback("openmeteo", city, cycle_init, "no in-window ensemble members")
         return 0
@@ -232,13 +240,14 @@ async def _ingest_openmeteo(
 
 
 async def _ingest_wethr(
-    bind: Bind, city: str, cycle_init: datetime, *, mode: Mode
+    bind: Bind, city: str, cycle_init: datetime, *, mode: Mode,
+    client: httpx.AsyncClient | None = None,
 ) -> int:
     """Wethr deterministic models -> per-model rows; graceful skip when key unset (02-04)."""
     target_date = _target_date_for(city, cycle_init, 0)
     inserted = 0
     for model in wethr.WETHR_MODELS:
-        temp_kelvin = await wethr.fetch_wethr_forecast(city, model, target_date)
+        temp_kelvin = await wethr.fetch_wethr_forecast(city, model, target_date, client=client)
         if temp_kelvin is None:
             continue  # absent key / no row is a graceful skip, logged inside fetch (D-11).
         inserted += wethr.store_wethr_forecast(
@@ -338,10 +347,19 @@ async def ingest_all_models(
     get_city(city)  # ASVS V5 up front.
     targets = list(models) if models is not None else [*GRIB_MODELS, *SUPPLEMENTARY_SOURCES]
 
-    async def _one(model: str) -> tuple[str, int]:
-        return model, await ingest_cycle(bind, model, city, cycle_init, mode=mode, lead=lead)
+    # One shared httpx client for the whole concurrent fan-out (D-14): the supplementary
+    # sources reuse it instead of each opening/closing its own; closed once here.
+    client = get_client()
+    try:
 
-    results = await asyncio.gather(*(_one(m) for m in targets))
+        async def _one(model: str) -> tuple[str, int]:
+            return model, await ingest_cycle(
+                bind, model, city, cycle_init, mode=mode, lead=lead, client=client
+            )
+
+        results = await asyncio.gather(*(_one(m) for m in targets))
+    finally:
+        await client.aclose()
     summary = dict(results)
     logger.info(
         "ingest_all_models city=%s cycle=%s mode=%s -> %s",

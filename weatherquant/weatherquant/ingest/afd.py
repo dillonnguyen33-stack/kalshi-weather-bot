@@ -19,6 +19,7 @@ import httpx
 
 from weatherquant.db.engine import get_settings
 from weatherquant.ingest.errors import AvailabilityError
+from weatherquant.ingest.sources._client import get_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import CITIES
 
@@ -211,7 +212,7 @@ async def fetch_afd_text(
     ``productText``. Fixed host + static ``wfo`` map (no SSRF, T-02-11). ``None`` on error (D-11).
     """
     owns_client = client is None
-    client = client or httpx.AsyncClient(timeout=15.0, headers={"User-Agent": _USER_AGENT})
+    client = client or get_client()
     try:
         list_resp = await client.get(
             f"{_NWS_API_BASE}/products/types/AFD/locations/{wfo}",
