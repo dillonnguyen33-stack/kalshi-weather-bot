@@ -828,7 +828,6 @@ dependencies = [
     { name = "numpy" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic-settings" },
-    { name = "python-dotenv" },
     { name = "sqlalchemy" },
     { name = "websockets" },
     { name = "xarray" },
@@ -838,6 +837,7 @@ dependencies = [
 dev = [
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "python-dotenv" },
     { name = "timezonefinder" },
 ]
 
@@ -854,7 +854,6 @@ requires-dist = [
     { name = "numpy", specifier = "==2.4.6" },
     { name = "psycopg", extras = ["binary"], specifier = "==3.3.4" },
     { name = "pydantic-settings", specifier = "==2.14.1" },
-    { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "sqlalchemy", specifier = "==2.0.50" },
     { name = "websockets", specifier = "==16.0" },
     { name = "xarray", specifier = "==2026.4.0" },
@@ -864,6 +863,7 @@ requires-dist = [
 dev = [
     { name = "pytest", specifier = ">=8.0" },
     { name = "pytest-asyncio", specifier = "==1.4.0" },
+    { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "timezonefinder", specifier = "==8.2.4" },
 ]
 
