@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, UTC
+from datetime import date, datetime, timedelta, UTC
 from typing import Any, cast
 
 import httpx
@@ -29,6 +29,9 @@ logger = logging.getLogger(__name__)
 _IEM_ASOS_CGI = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 # v3 AWC_METAR_BASE — the recent-~14h *live fallback* only (kalshi_weather_bot_v3.py L53).
 _AWC_METAR_BASE = "https://aviationweather.gov/api/data/metar"
+# AWC lookback: the feed returns only the most recent ~N hours of METARs, so it can serve a
+# live/today window only — a window ending older than this predates the feed (backfill, skip).
+_AWC_FALLBACK_HOURS = 14
 # v3 NWS_UA (L77) — a descriptive User-Agent is required/courteous for these feeds.
 _USER_AGENT = "weatherquant/0.1 (kalshi daily-high paper-trading)"
 
@@ -244,27 +247,40 @@ async def fetch_asos_obs(
                 },
             )
             resp.raise_for_status()
-            rows = _parse_iem_csv(resp.text)
-            if rows:
-                return rows
+            # A successful response is authoritative — empty rows mean "no obs for this window"
+            # (a real answer), NOT a failure. Only a genuine fetch error falls back to AWC.
+            return _parse_iem_csv(resp.text)
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("IEM ASOS fetch failed for %s (%s); trying AWC fallback", city, exc)
-
-        # Graceful live fallback (D-11): v3 AWC_METAR_BASE, recent window, °C temps.
-        return await _fetch_awc_fallback(station, client)
+            return await _fetch_awc_fallback(station, client, win)
     finally:
         if owns_client:
             await client.aclose()
 
 
 async def _fetch_awc_fallback(
-    station: str, client: httpx.AsyncClient
+    station: str, client: httpx.AsyncClient, win: SettlementWindow
 ) -> list[tuple[datetime, float]]:
-    """v3 aviationweather.gov METAR fallback (recent ~14h window, °C temps → °F)."""
+    """aviationweather.gov METAR fallback — LIVE/recent windows only (°C → °F).
+
+    The feed returns only the most recent ~``_AWC_FALLBACK_HOURS`` of METARs, so it can cover a
+    today/live window. A window ending older than that lookback (a historical backfill) is
+    skipped — fetching the recent feed would stamp today's obs onto a past date. Returned obs
+    are filtered to ``win`` so nothing outside the target window leaks in.
+    """
+    if win.end_utc <= datetime.now(UTC) - timedelta(hours=_AWC_FALLBACK_HOURS):
+        logger.info(
+            "AWC fallback skipped for %s: window ending %s predates the ~%dh recent feed "
+            "(backfill — no wrong-date obs)",
+            station,
+            win.end_utc.isoformat(),
+            _AWC_FALLBACK_HOURS,
+        )
+        return []
     try:
         resp = await client.get(
             _AWC_METAR_BASE,
-            params={"ids": station, "format": "json", "hours": 14},
+            params={"ids": station, "format": "json", "hours": _AWC_FALLBACK_HOURS},
             headers={"User-Agent": _USER_AGENT},
         )
         resp.raise_for_status()
@@ -277,8 +293,8 @@ async def _fetch_awc_fallback(
     for ob in data or []:
         temp_c = ob.get("temp")
         ts = _coerce_ts(ob.get("reportTime") or ob.get("obsTime"))
-        if temp_c is None or ts is None:
-            continue
+        if temp_c is None or ts is None or not win.contains(ts):
+            continue  # filter to the target window — no wrong-date leak
         try:
             rows.append((ts, celsius_to_fahrenheit(float(temp_c))))
         except (TypeError, ValueError):
