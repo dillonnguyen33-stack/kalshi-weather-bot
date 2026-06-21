@@ -18,7 +18,8 @@ import logging
 from datetime import date, datetime
 
 from weatherquant.db.models import calibration_params
-from weatherquant.ingest.writer import Bind, WriteIntegrityError
+from weatherquant.db.types import Bind, exec_bind
+from weatherquant.ingest.writer import WriteIntegrityError
 
 __all__ = ["store_calibration_params"]
 
@@ -54,7 +55,7 @@ def store_calibration_params(
     distinguished by its later ``available_at`` (append-only — no skip-before-insert).
 
     Args:
-        bind: a SQLAlchemy ``Engine`` or ``Connection`` (``writer.Bind``). Built by
+        bind: a SQLAlchemy ``Engine`` or ``Connection`` (``db.types.Bind``). Built by
             :func:`weatherquant.db.engine.get_engine` so ``preserve_rowcount`` holds (D-11).
         city, model, lead, month: the natural key (``month`` = calendar month of the strata).
         mean_intercept, mean_slope: EMOS mean params (a, b: μ = a + b·m).
@@ -100,11 +101,5 @@ def store_calibration_params(
             )
         return int(result.rowcount)
 
-    # Match the writer's bind handling: an Engine opens its own transaction; a Connection is used
-    # directly (the caller owns it). Imported here to keep the module import-light.
-    from sqlalchemy.engine import Engine
-
-    if isinstance(bind, Engine):
-        with bind.begin() as conn:
-            return _do(conn)
-    return _do(bind)
+    with exec_bind(bind, write=True) as conn:
+        return _do(conn)

@@ -14,10 +14,9 @@ from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.engine import Engine
 
 from weatherquant.db.models import metadata
-from weatherquant.db.types import Bind
+from weatherquant.db.types import Bind, exec_bind
 
 
 def _match_condition(column: sa.Column[Any], value: object) -> sa.ColumnElement[bool]:
@@ -63,10 +62,8 @@ def row_exists(
     ]
     stmt = sa.select(sa.literal(1)).select_from(table).where(*conditions).limit(1)
 
-    if isinstance(bind, Engine):
-        with bind.connect() as conn:
-            return conn.execute(stmt).first() is not None
-    return bind.execute(stmt).first() is not None
+    with exec_bind(bind, write=False) as conn:
+        return conn.execute(stmt).first() is not None
 
 
 # Test-facing alias (the Wave-0 RED stub imports ``already_ingested``). It IS the

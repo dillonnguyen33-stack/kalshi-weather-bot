@@ -13,10 +13,10 @@ from collections.abc import Mapping
 from datetime import date, datetime
 
 import sqlalchemy as sa
-from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.engine import Connection
 
 from weatherquant.db.models import fills, forecasts, market_snapshots, observations
-from weatherquant.db.types import Bind
+from weatherquant.db.types import Bind, exec_bind
 from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.ingest.idempotency import row_exists
 
@@ -55,10 +55,8 @@ def _insert_row(
             )
         return rowcount
 
-    if isinstance(bind, Engine):
-        with bind.begin() as conn:
-            return _do(conn)
-    return _do(bind)
+    with exec_bind(bind, write=True) as conn:
+        return _do(conn)
 
 
 def insert_forecast(

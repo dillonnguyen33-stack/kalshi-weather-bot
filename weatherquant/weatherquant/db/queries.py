@@ -17,10 +17,10 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import sqlalchemy as sa
-from sqlalchemy.engine import Engine, RowMapping
+from sqlalchemy.engine import RowMapping
 
 from weatherquant.db.models import NATURAL_KEYS, metadata
-from weatherquant.db.types import Bind
+from weatherquant.db.types import Bind, exec_bind
 
 
 def latest(
@@ -79,7 +79,5 @@ def latest(
         # Same validated-handle resolution as the key columns; values are bound params.
         stmt = stmt.where(*(table.c[name] == value for name, value in where.items()))
 
-    if isinstance(bind, Engine):
-        with bind.connect() as conn:
-            return list(conn.execute(stmt).mappings().all())
-    return list(bind.execute(stmt).mappings().all())
+    with exec_bind(bind, write=False) as conn:
+        return list(conn.execute(stmt).mappings().all())
