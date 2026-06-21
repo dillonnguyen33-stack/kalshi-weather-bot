@@ -140,6 +140,18 @@ def test_build_scheduler_registers_per_model_jobs():
     assert scheduler.running is False
 
 
+def test_scheduler_jobs_have_explicit_misfire_policy():
+    """Each live job sets an explicit misfire_grace_time + coalesce so a late/overrunning cycle
+    is handled deliberately, not silently dropped under apscheduler's 1-second default."""
+    from weatherquant.scheduler import build_scheduler
+
+    jobs = build_scheduler().get_jobs()
+    assert jobs
+    for job in jobs:
+        assert job.misfire_grace_time is not None and job.misfire_grace_time >= 60
+        assert job.coalesce is True
+
+
 def test_scheduler_is_asyncio_3x_not_4x():
     """The scheduler uses the apscheduler 3.11.x AsyncIOScheduler, not the 4.x API."""
     from apscheduler.schedulers.asyncio import AsyncIOScheduler

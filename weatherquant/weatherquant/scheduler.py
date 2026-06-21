@@ -16,6 +16,7 @@ owns ``start()``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, UTC
 
@@ -54,8 +55,11 @@ async def _ingest_grib_all_cities(model: str, step_hours: int) -> None:
         _latest_hourly_cycle(now) if step_hours == 1 else _latest_synoptic_cycle(now, step_hours)
     )
     bind = get_engine()
-    for city in CITIES:
-        await orchestrator.ingest_cycle(bind, model, city, cycle, mode="live", lead=0)
+    # Cities are independent (per-city graceful degradation, D-11) — run concurrently so the job
+    # finishes well within its cadence and never overruns into the next firing.
+    await asyncio.gather(
+        *(orchestrator.ingest_cycle(bind, model, city, cycle, mode="live", lead=0) for city in CITIES)
+    )
     logger.info("live grib job model=%s cycle=%s ran across %d cities", model, cycle, len(CITIES))
 
 
@@ -66,8 +70,9 @@ async def _ingest_source_all_cities(source: str, step_hours: int) -> None:
         _latest_hourly_cycle(now) if step_hours == 1 else _latest_synoptic_cycle(now, step_hours)
     )
     bind = get_engine()
-    for city in CITIES:
-        await orchestrator.ingest_cycle(bind, source, city, cycle, mode="live", lead=0)
+    await asyncio.gather(
+        *(orchestrator.ingest_cycle(bind, source, city, cycle, mode="live", lead=0) for city in CITIES)
+    )
     logger.info("live source job source=%s cycle=%s ran across %d cities", source, cycle, len(CITIES))
 
 
@@ -75,10 +80,20 @@ async def _ingest_obs_all_cities() -> None:
     """Live job body: ASOS daily-high + AFD signal for today across every city (02-03)."""
     today = datetime.now(UTC).date()
     bind = get_engine()
-    for city in CITIES:
+
+    async def _one(city: str) -> None:
         await orchestrator.ingest_obs(bind, city, today)
         await orchestrator.ingest_afd(bind, city, today)
+
+    await asyncio.gather(*(_one(city) for city in CITIES))
     logger.info("live obs/afd job ran for %s across %d cities", today, len(CITIES))
+
+
+# Explicit misfire policy on every job (vs apscheduler's silent 1s default): a firing up to
+# 30 min late STILL runs, coalesce collapses a backlog of missed firings into one, and
+# max_instances=1 + idempotent re-runs (D-10) keep concurrent same-job runs from double-writing.
+# The gather'd bodies finish fast, so a job never overruns into the next cycle.
+_JOB_POLICY = {"misfire_grace_time": 1800, "coalesce": True, "max_instances": 1}
 
 
 def build_scheduler() -> AsyncIOScheduler:
@@ -99,6 +114,7 @@ def build_scheduler() -> AsyncIOScheduler:
             id=f"grib-{model}-hourly",
             name=f"live ingest {model} (hourly)",
             replace_existing=True,
+            **_JOB_POLICY,
         )
 
     # GFS / GEFS — the 00/06/12/18Z synoptic cycles (D-15).
@@ -110,6 +126,7 @@ def build_scheduler() -> AsyncIOScheduler:
             id=f"grib-{model}-synoptic",
             name=f"live ingest {model} (00/06/12/18Z)",
             replace_existing=True,
+            **_JOB_POLICY,
         )
 
     # NWS gridpoint — hourly; Open-Meteo ensemble — per-GFS cycle.
@@ -120,6 +137,7 @@ def build_scheduler() -> AsyncIOScheduler:
         id="source-nws-hourly",
         name="live ingest nws (hourly)",
         replace_existing=True,
+        **_JOB_POLICY,
     )
     scheduler.add_job(
         _ingest_source_all_cities,
@@ -128,6 +146,7 @@ def build_scheduler() -> AsyncIOScheduler:
         id="source-openmeteo-synoptic",
         name="live ingest openmeteo (00/06/12/18Z)",
         replace_existing=True,
+        **_JOB_POLICY,
     )
 
     # ASOS obs + AFD — hourly (the daily-high label refines through the day; AFD pre-filtered, D-13).
@@ -137,6 +156,7 @@ def build_scheduler() -> AsyncIOScheduler:
         id="obs-afd-hourly",
         name="live ingest asos obs + afd (hourly)",
         replace_existing=True,
+        **_JOB_POLICY,
     )
 
     logger.info("built live scheduler with %d jobs (mode=live, D-15)", len(scheduler.get_jobs()))
