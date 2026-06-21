@@ -141,7 +141,7 @@ def daily_high(
             continue
         ts, tmpf = coerced
         # Half-open [start, end): end_utc is EXCLUSIVE (no double-count, no flat window).
-        if not (win.start_utc <= ts < win.end_utc):
+        if not win.contains(ts):
             continue
         count += 1
         if best_f is None or tmpf > best_f:

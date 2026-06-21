@@ -75,7 +75,7 @@ def _window_max_kelvin(
         except ValueError:
             continue
         ts = ts.astimezone(UTC)
-        if not (win.start_utc <= ts < win.end_utc):
+        if not win.contains(ts):
             continue  # half-open bucket — a wrong-LST-day hour cannot raise the member high
         try:
             value = float(cast(Any, temp))

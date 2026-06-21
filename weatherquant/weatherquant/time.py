@@ -55,6 +55,10 @@ class SettlementWindow:
     std_offset_hours: int
     station: str
 
+    def contains(self, ts: datetime) -> bool:
+        """Whether ``ts`` falls in this half-open ``[start_utc, end_utc)`` window."""
+        return self.start_utc <= ts < self.end_utc
+
 
 def settlement_window(city: City, day: date) -> SettlementWindow:
     """Return the fixed-offset half-open UTC settlement window for ``day``.
