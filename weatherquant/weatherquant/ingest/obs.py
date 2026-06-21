@@ -20,7 +20,7 @@ import httpx
 
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
-from weatherquant.time import SettlementWindow, settlement_window
+from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +103,7 @@ def _coerce_ts(ts_raw: object) -> datetime | None:
         ts = ts_raw
     elif isinstance(ts_raw, str):
         try:
-            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts = parse_utc(ts_raw)
         except ValueError:
             return None
     else:

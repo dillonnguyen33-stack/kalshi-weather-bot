@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, UTC
 from typing import Any, Protocol
 
 from weatherquant.registry import City
-from weatherquant.time import settlement_window
+from weatherquant.time import parse_utc, settlement_window
 
 # Closing window length: the final N minutes before settlement (D-09). run_paper's snapshot
 # cadence MUST stay strictly finer so the window holds >= 1 snapshot (PAP-04, T-05-20).
@@ -53,9 +53,7 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
     if isinstance(raw, str):
         # Strip an optional ``#<seq>`` disambiguation suffix before parsing (WR-03).
         iso = raw.split("#", 1)[0]
-        # Accept a trailing 'Z' (the fixture shape) as UTC.
-        parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        return parse_utc(iso)
     raise ValueError(
         f"snapshot carries no usable event time (event_time/available_at/snapshot_for): "
         f"{snapshot!r}"

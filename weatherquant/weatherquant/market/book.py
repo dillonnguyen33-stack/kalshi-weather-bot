@@ -33,6 +33,7 @@ from datetime import datetime, UTC
 from typing import Any
 
 from weatherquant.ingest.errors import CorrectnessError
+from weatherquant.time import parse_utc
 
 # The documented data message types.
 _TYPE_SNAPSHOT = "orderbook_snapshot"
@@ -121,8 +122,7 @@ def _parse_event_time(msg: Mapping[str, Any]) -> datetime | None:
     if ts is not None:
         if not isinstance(ts, str):
             raise ValueError(f"orderbook msg.ts must be an ISO-8601 string, got {ts!r}")
-        parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        return parse_utc(ts)
     ts_ms = msg.get("ts_ms")
     if ts_ms is not None:
         return datetime.fromtimestamp(int(ts_ms) / 1000, tz=UTC)

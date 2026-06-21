@@ -22,7 +22,7 @@ from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.sources._client import get_client, request_with_retry
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
-from weatherquant.time import SettlementWindow, settlement_window
+from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +71,9 @@ def _window_max_kelvin(
         if temp is None:
             continue
         try:
-            ts = datetime.fromisoformat(str(ts_s).replace("Z", "+00:00"))
+            ts = parse_utc(str(ts_s))
         except ValueError:
             continue
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=UTC)
         ts = ts.astimezone(UTC)
         if not (win.start_utc <= ts < win.end_utc):
             continue  # half-open bucket — a wrong-LST-day hour cannot raise the member high

@@ -22,7 +22,7 @@ from weatherquant.ingest.errors import UnitError
 from weatherquant.ingest.sources._client import get_client, request_with_retry
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
-from weatherquant.time import SettlementWindow, settlement_window
+from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +63,7 @@ def _to_kelvin(value: float, uom: str) -> float:
 def _parse_valid_interval(valid_time: str) -> tuple[datetime, datetime]:
     """Parse an NWS ``validTime`` (``<ISO instant>/<ISO-8601 duration>``) to half-open ``[start, end)``."""
     instant_s, _, duration_s = valid_time.partition("/")
-    start = datetime.fromisoformat(instant_s.replace("Z", "+00:00"))
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=UTC)
+    start = parse_utc(instant_s)
     end = start + _parse_iso_duration(duration_s) if duration_s else start
     return start.astimezone(UTC), end.astimezone(UTC)
 

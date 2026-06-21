@@ -21,6 +21,17 @@ from datetime import date, datetime, timedelta, UTC
 from weatherquant.registry import City
 
 
+def parse_utc(iso: str) -> datetime:
+    """Parse an ISO-8601 string to a tz-aware datetime (trailing ``Z`` accepted; naive → UTC).
+
+    The one ``fromisoformat`` + ``Z``-normalize + naive-as-UTC parse the ingest/market timestamp
+    paths share. Keeps any explicit offset; callers wanting a UTC instant chain ``.astimezone``.
+    Stdlib-only — no DST tooling on the runtime path.
+    """
+    parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
 @dataclass(frozen=True)
 class SettlementWindow:
     """The UTC window for a city's local-standard-time settlement day (D-03).
