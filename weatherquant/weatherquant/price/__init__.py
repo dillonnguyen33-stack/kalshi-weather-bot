@@ -4,8 +4,8 @@ Pure NumPy + stdlib ``math`` only — no scipy/sklearn (AST guard); the normal C
 from :mod:`weatherquant.calibrate.crps` (D-15). Public surface:
 
 * ``blend``   — ``accuracy_weights``, ``blend_gaussians`` (D-01/D-02/D-03).
-* ``buckets`` — ``parse_ticker``, ``integers_in_bucket``, ``bucket_prob``, ``bucket_probs``
-  (D-04/D-05/D-06).
+* ``buckets`` — ``integers_in_bucket``, ``bucket_prob``, ``bucket_probs`` (D-04/D-05).
+* ``ticker``  — ``parse_ticker`` (D-06).
 * ``fee``     — ``exact_fee``, ``maker_fee`` (D-07/D-09).
 * ``ev``      — ``p_used``, ``bucket_ev`` (D-08).
 * ``kelly``   — ``kelly_fraction``, ``sufficiency_ramp``, ``stake_fraction`` (D-10–D-13).
@@ -18,11 +18,11 @@ from weatherquant.price.buckets import (
     bucket_prob,
     bucket_probs,
     integers_in_bucket,
-    parse_ticker,
 )
 from weatherquant.price.ev import bucket_ev, p_used
 from weatherquant.price.fee import exact_fee, maker_fee
 from weatherquant.price.kelly import kelly_fraction, stake_fraction, sufficiency_ramp
+from weatherquant.price.ticker import parse_ticker
 
 __all__ = [
     # blend (PRC-01, D-01/D-02/D-03)
