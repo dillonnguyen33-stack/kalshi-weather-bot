@@ -11,11 +11,14 @@ Public surface:
 * ``reflect`` — :func:`yes_ask_levels`, :func:`no_ask_levels`: the ONE yes/no bid-only
   reflection seam (``ask = 100 - opposite bid``) every fill price/size routes through (PAP-02).
 * ``book`` — :class:`OrderBook`, :class:`SeqGap`, :func:`apply`: the in-memory per-ticker
-  book + ``seq`` integrity (a gap raises ``SeqGap``, a ``CorrectnessError``, triggering a
-  REST re-snapshot — never a silent carry-forward, PAP-01, D-02).
-* ``client`` — :func:`run_feed`, :func:`fetch_snapshot`: the signed WS connect + auto-
-  reconnect loop (re-subscribe AND REST re-snapshot on every reconnection) and the signed
-  REST orderbook snapshot resync anchor (PAP-01).
+  book + ``seq`` integrity. A gap raises ``SeqGap`` (a ``CorrectnessError``) — never a silent
+  carry-forward; it breaks the delta loop so the feed reconnects and re-anchors on a fresh WS
+  snapshot (PAP-01, D-02).
+* ``client`` — :func:`run_feed`, :func:`fetch_snapshot`: the signed WS connect + manual
+  reconnect loop. Each (re)connection re-signs the handshake and re-subscribes; the fresh WS
+  ``orderbook_snapshot`` (seq=1) is the ONLY integrity anchor — NO REST re-snapshot on
+  reconnect (B1/D-02). :func:`fetch_snapshot` is a separate signed one-shot REST read for
+  ``run_paper`` (REST carries no ``seq``, so it is not a seq anchor — MED-5). (PAP-01)
 * ``persist`` — :func:`persist_snapshot`, :func:`persist_fill`, :func:`latest_snapshots`:
   the THIN snapshot/fill adapter over the audited append-only writer + ``queries.latest``
   (no Core insert here — D-13, T-05-15).
