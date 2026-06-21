@@ -57,6 +57,17 @@ def test_routine_text_makes_zero_anthropic_calls():
     result = classify_afd(_routine(), wfo="OKX", client=client)
     client.messages.create.assert_not_called()  # the pre-filter short-circuited
     assert result["disagreement"] is False
+
+
+def test_anthropic_error_degrades_to_no_signal():
+    """An SDK/API error during classify degrades to the no-signal shape (D-11), never propagates."""
+    client = MagicMock()
+    client.messages.create.side_effect = RuntimeError("anthropic api unavailable")
+    result = classify_afd(_signal(), wfo="OKX", client=client)
+    client.messages.create.assert_called_once()
+    assert result["disagreement"] is False
+    assert result["direction"] == ""
+    assert result["summary"] == ""
     assert "reason" in result  # carries the pre-filter reason
 
 

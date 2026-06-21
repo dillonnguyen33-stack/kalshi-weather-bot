@@ -173,18 +173,24 @@ def classify_afd(
 
         client = Anthropic(api_key=api_key)
 
-    message = client.messages.create(  # type: ignore[attr-defined]
-        model=AFD_MODEL,
-        max_tokens=256,
-        tools=[_AFD_TOOL],
-        tool_choice={"type": "tool", "name": "record_afd_signal"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"WFO: {wfo}\n\nAFD excerpt:\n{text[:1500]}",
-            }
-        ],
-    )
+    try:
+        message = client.messages.create(  # type: ignore[attr-defined]
+            model=AFD_MODEL,
+            max_tokens=256,
+            tools=[_AFD_TOOL],
+            tool_choice={"type": "tool", "name": "record_afd_signal"},
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"WFO: {wfo}\n\nAFD excerpt:\n{text[:1500]}",
+                }
+            ],
+        )
+    except Exception as exc:  # noqa: BLE001 - any Anthropic/SDK error degrades to no-signal (D-11).
+        logger.warning(
+            "AFD classify failed for WFO=%s (%s); degrading to no-signal (D-11)", wfo, exc
+        )
+        return {**_NO_SIGNAL, "reason": "anthropic_error"}
 
     # Forced tool_choice → the response carries exactly one tool_use block whose `input`
     # is the schema-shaped dict. The text body is never decoded as JSON (v3 fragility, D-13).
