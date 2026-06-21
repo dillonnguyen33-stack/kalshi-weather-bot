@@ -40,6 +40,11 @@ _LEAD0_TOLERANCE_C_DEN = 4.0
 #   c00 (control) -> 0 ; p01..p30 -> 1..30 ; deterministic models -> 0.
 _GEFS_DETERMINISTIC_MEMBER = 0
 
+# Egress guard: the ``:TMP:2 m`` .idx search normally matches exactly ONE record (~1 MB). A
+# Herbie default/search regression that matched the whole inventory would silently pull the
+# ~700 MB full file. Refuse the download above this many records (a little slack for variants).
+_MAX_T2M_RECORDS = 4
+
 
 @dataclass(frozen=True)
 class T2MField:
@@ -257,6 +262,22 @@ def lead0_sanity_check(
     )
 
 
+def _assert_subset_inventory(inventory: object, model: str) -> int:
+    """Guard that the ``:TMP:2 m`` .idx match is a small byte-range subset, not the whole file.
+
+    Returns the record count (for logging). Raises :class:`SanityError` when the match is empty
+    or implausibly large — a broad match would pull the ~700 MB full file, not the ~1 MB subset.
+    """
+    n = len(inventory)  # type: ignore[arg-type]  # a list / pandas DataFrame of matched .idx records
+    if not 0 < n <= _MAX_T2M_RECORDS:
+        raise SanityError(
+            f"refusing GRIB fetch for model={model}: ':TMP:2 m' .idx matched {n} records "
+            f"(expected 1..{_MAX_T2M_RECORDS}) — a broad match would pull the full ~700 MB file, "
+            "not the ~1 MB byte-range subset (egress guard)"
+        )
+    return n
+
+
 def fetch_t2m(
     model: str,
     cycle_init: datetime,
@@ -290,21 +311,25 @@ def fetch_t2m(
         h_kwargs["member"] = member
     herbie = Herbie(herbie_date, **h_kwargs)
 
-    # Log the resolved S3 key + the selected .idx record / byte range (D-01) before fetch.
+    # Probe the .idx, GUARD the subset size (egress), then log — before the byte-range fetch.
     try:
         inventory = herbie.inventory(":TMP:2 m")
+    except Exception:  # noqa: BLE001 - a transient .idx probe failure must not block the fetch.
+        logger.warning(
+            "herbie .idx inventory probe failed for model=%s; proceeding without egress guard",
+            model,
+        )
+    else:
+        n_records = _assert_subset_inventory(inventory, model)  # raises on a broad/empty match
         logger.info(
-            "herbie resolved model=%s cycle=%s fxx=%s member=%s grib_source=%s "
-            "idx_records=%d",
+            "herbie resolved model=%s cycle=%s fxx=%s member=%s grib_source=%s idx_records=%d",
             model,
             cycle_init.isoformat(),
             fxx,
             member if model == "gefs" else _GEFS_DETERMINISTIC_MEMBER,
             getattr(herbie, "grib", None),
-            len(inventory),
+            n_records,
         )
-    except Exception:  # noqa: BLE001 - logging probe must never block the fetch.
-        logger.warning("herbie .idx inventory probe failed for model=%s; proceeding", model)
 
     # Download ONLY the :TMP:2 m byte-range subset (~1 MB). herbie-data 2026.3.0 dropped the
     # old ``remove_grib`` kwarg, so the subset file is kept by default and decoded below.
