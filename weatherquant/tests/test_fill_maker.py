@@ -10,6 +10,7 @@ Gate-1 path, D-05). ``fills.py`` is PURE.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 
 import pytest
@@ -93,13 +94,27 @@ def test_maker_queue_fill_fail_loud_inputs():
         fills.maker_queue_fill(size_ahead=-1, our_size=50, events=[])
 
 
-# The maker_queue_fill above returns avg_price_cents=0.0 as an OUT-OF-BAND placeholder (the
-# queue model proves the COUNT; the caller supplies the real resting price, taker is the credited
-# Gate-1 path). The audited write path (writer.insert_fill, D-11) must therefore REFUSE a maker
-# fill whose price is the un-supplied 0c placeholder — persisting price=0 would corrupt CLV as
-# closing_mid - 0 (CORR-MED-4). These precondition tests fire BEFORE any DB touch, so they need
-# no live bind (the raise short-circuits _insert_row); bind=None is never reached.
-@pytest.mark.parametrize("bad_price", [0, None])
+def test_maker_fill_price_placeholder_is_nan_not_silent_zero():
+    """A maker fill carries a NON-FINITE price placeholder, never a silent 0.0.
+
+    The caller stamps the real resting price; an un-stamped 0.0 would corrupt CLV as
+    ``closing_mid - 0`` (CORR-MED-4). NaN poisons any downstream arithmetic loudly instead.
+    """
+    events = [
+        BookEvent(kind="trade", size=200, crosses_our_level=True, event_time=WS_T2),
+    ]
+    fill = fills.maker_queue_fill(size_ahead=100, our_size=50, events=events)
+    assert fill is not None
+    assert math.isnan(fill.avg_price_cents)
+
+
+# maker_queue_fill returns avg_price_cents=NaN as the un-stamped placeholder (the queue model
+# proves the COUNT; the caller supplies the real resting price, taker is the credited Gate-1
+# path). The audited write path (writer.insert_fill, D-11) must therefore REFUSE a maker fill
+# whose price is None/0/non-finite — persisting it would corrupt CLV as closing_mid - 0
+# (CORR-MED-4). These precondition tests fire BEFORE any DB touch, so they need no live bind
+# (the raise short-circuits _insert_row); bind=None is never reached.
+@pytest.mark.parametrize("bad_price", [0, None, float("nan")])
 def test_insert_fill_rejects_maker_zero_price(bad_price):
     """A maker fill with a fabricated 0c (or None) price fails loud (WriteIntegrityError)."""
     with pytest.raises(WriteIntegrityError, match="maker.*real resting price"):

@@ -19,6 +19,7 @@ A PURE function over a book snapshot (no I/O), unit-testable offline. Correctnes
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -192,9 +193,11 @@ def maker_queue_fill(
 
     return Fill(
         count=our_filled,
-        # A maker clears at its resting price; the caller supplies it out of band (the queue
-        # model proves the COUNT — taker is the credited Gate-1 path, D-05).
-        avg_price_cents=0.0,
+        # A maker clears at its resting price, supplied out of band (the queue model proves the
+        # COUNT; taker is the credited Gate-1 path, D-05). The placeholder is NaN, not 0.0, so a
+        # forgotten stamp fails loud: the writer rejects a non-finite maker price and CLV poisons
+        # to NaN rather than silently reading closing_mid - 0 (CORR-MED-4; see docs/DECISIONS.md).
+        avg_price_cents=math.nan,
         partial=our_filled < our_size,
         shortfall=our_size - our_filled,
         is_maker=True,

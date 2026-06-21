@@ -9,6 +9,7 @@ from :func:`get_engine` so ``preserve_rowcount`` holds (see docs/DECISIONS.md).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from datetime import date, datetime
 
@@ -201,14 +202,14 @@ def insert_fill(
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
     """
-    # A maker rests at a real price; price in {None, 0} is maker_queue_fill's out-of-band
-    # placeholder and would corrupt CLV as closing_mid - 0 (CORR-MED-4). Fail loud with the
-    # money-path alarm rather than persist it. Taker fills are unaffected (see docs/DECISIONS.md).
-    if is_maker is True and (price is None or price == 0):
+    # A maker rests at a real price; price in {None, 0, non-finite} is maker_queue_fill's
+    # un-stamped placeholder (NaN) and would corrupt CLV as closing_mid - 0 (CORR-MED-4). Fail
+    # loud with the money-path alarm rather than persist it. Taker fills are unaffected.
+    if is_maker is True and (price is None or price == 0 or not math.isfinite(price)):
         raise WriteIntegrityError(
             f"refusing to persist a maker fill (ticker={ticker}, trade_id={trade_id}) with "
-            f"price={price!r}: a maker rests at a real resting price; price in {{None, 0}} is "
-            "the out-of-band maker_queue_fill placeholder and would corrupt CLV as "
+            f"price={price!r}: a maker rests at a real resting price; a None/0/non-finite price "
+            "is the un-stamped maker_queue_fill placeholder and would corrupt CLV as "
             "closing_mid - 0 (CORR-MED-4)."
         )
     natural_key = {
