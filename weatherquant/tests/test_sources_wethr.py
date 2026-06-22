@@ -120,6 +120,34 @@ async def test_429_triggers_exactly_one_retry(monkeypatch):
     assert result == fahrenheit_to_kelvin(77.0)
 
 
+async def test_utc_valid_time_buckets_into_lst_settlement_day(monkeypatch):
+    """1.3: a UTC valid_time past the UTC calendar day still lands in the right LST window.
+
+    CHI (KMDW) is std offset -6, so the 2026-06-15 settlement window is
+    [06:00Z 6/15, 06:00Z 6/16). A row at 2026-06-16 04:00Z is the NEXT UTC calendar day but
+    STILL inside the 6/15 LST window — the OLD lexical ``[:10]`` match dropped it; the
+    settlement_window bucketing keeps it. The 07:00Z row is past end_utc and must be excluded.
+    """
+    _set_key(monkeypatch, "secret-token")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {"valid_time": "2026-06-16 04:00", "temperature_f": 99.0},  # in 6/15 LST window
+                {"valid_time": "2026-06-16 07:00", "temperature_f": 50.0},  # past end → excluded
+            ],
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        result = await fetch_wethr_forecast(CITY, MODEL, TARGET, client=client)
+    finally:
+        await client.aclose()
+    # The in-window high is the 99 °F row; the out-of-window 50 °F row is excluded.
+    assert result == fahrenheit_to_kelvin(99.0)
+
+
 def test_store_uses_wethr_label_and_kelvin(monkeypatch):
     captured: dict = {}
 

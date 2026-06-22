@@ -36,6 +36,12 @@ Mode = Literal["backfill", "live"]
 GRIB_MODELS: tuple[str, ...] = ("nbm", "hrrr", "gfs", "gefs")
 _GEFS_MEMBERS: tuple[str, ...] = ("c00",) + tuple(f"p{i:02d}" for i in range(1, 31))
 
+# Snap-distance sane bound (Pitfall 2) wired into the live path so grib.snap_city's SanityError
+# can actually fire. Covers the coarsest grid we decode (GEFS 0.5° ≈ 56 km nearest cell) with
+# headroom; a bad station coord / grid mislabel snaps thousands of km off, far past this.
+# ponytail: one bound for all models; tighten per-model only if a mislabel ever slips under 80km.
+_MAX_SNAP_DISTANCE_M = 80_000.0
+
 # The supplementary live-forward sources (02-04) are defined as the {name: handler} dispatch
 # table _SUPPLEMENTARY_HANDLERS below (the single source of truth); SUPPLEMENTARY_SOURCES is
 # derived from its keys so the set, the ingest_cycle dispatch, and the CLI selector never drift.
@@ -95,14 +101,25 @@ async def _ingest_grib_model(
     stamp = available_at(cycle_init, model, mode)
 
     inserted = 0
-    for member_label in _gefs_members(model):
+    for i, member_label in enumerate(_gefs_members(model)):
         # D-14: run the sync, CPU-bound Herbie+cfgrib decode off the async loop.
         field = await loop.run_in_executor(
             None, grib.fetch_t2m, model, cycle_init, lead, member_label
         )
         temp_kelvin, station_lat, station_lon, grid_distance_m = grib.snap_city(
-            field, city_code
+            field, city_code, max_distance_m=_MAX_SNAP_DISTANCE_M
         )
+        # D-04 / Pitfall 4: the lead-0 control snap must track contemporaneous ASOS, else a
+        # wrong snap / unit / grid error fails LOUD (SanityError → ingest_cycle re-raises, never
+        # a silent skip that corrupts every downstream fit). Checked once per model on the c00
+        # control member (i==0); the grid is shared across members so one probe covers them all.
+        # ASOS unavailable → skip the probe (can't verify), only a real breach raises.
+        if lead == 0 and i == 0:
+            asos_k = await obs.asos_lead0_kelvin(city_code, target_date, cycle_init)
+            if asos_k is not None:
+                grib.lead0_sanity_check(
+                    forecast_k=temp_kelvin, asos_k=asos_k, city_code=city_code
+                )
         inserted += insert_forecast(
             bind,
             city=city_code,

@@ -24,6 +24,7 @@ from weatherquant.ingest.sources._client import (
 )
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
+from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -44,20 +45,28 @@ def model_label(model: str) -> str:
     return f"wethr:{model.lower()}"
 
 
-def _extract_high_f(rows: object, target_date: date) -> float | None:
-    """Extract the °F high for ``target_date`` from the Wethr payload, else ``None`` (T-02-12).
+def _extract_high_f(rows: object, win: SettlementWindow) -> float | None:
+    """Extract the °F high inside the LST settlement window ``win`` from the payload (T-02-12).
 
-    Rows are ``{valid_time, temperature_f}``; the max over date-matching rows is the high,
-    malformed values skipped.
+    Rows are ``{valid_time, temperature_f}``. Buckets each ``valid_time`` through the SAME
+    half-open ``settlement_window`` + ``parse_utc`` path nws/openmeteo use, NOT a lexical UTC-day
+    match — a UTC ``valid_time`` near a day boundary must land in the correct LST settlement day
+    (the v3 wrong-day settlement bug class ``time.py`` exists to prevent). Malformed rows skipped.
     """
     if not isinstance(rows, list):
         return None
-    ds = target_date.isoformat()
     highs: list[float] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
-        if str(row.get("valid_time", ""))[:10] != ds:
+        valid_time = row.get("valid_time")
+        if valid_time is None:
+            continue
+        try:
+            ts = parse_utc(str(valid_time))
+        except ValueError:
+            continue
+        if not win.contains(ts):
             continue
         temp_f = row.get("temperature_f")
         if temp_f is None:
@@ -119,7 +128,8 @@ async def fetch_wethr_forecast(
             )
             return None
 
-    high_f = _extract_high_f(rows, target_date)
+    win = settlement_window(get_city(city), target_date)
+    high_f = _extract_high_f(rows, win)
     return fahrenheit_to_kelvin(high_f) if high_f is not None else None
 
 
