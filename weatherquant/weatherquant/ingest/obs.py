@@ -18,10 +18,10 @@ from typing import Any, cast
 
 import httpx
 
-from weatherquant.ingest.sources._client import managed_client
+from weatherquant.ingest.sources._client import KELVIN_OFFSET, managed_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
-from weatherquant.time import SettlementWindow, parse_utc, settlement_window
+from weatherquant.time import SettlementWindow, coerce_utc, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +112,7 @@ def _coerce_ts(ts_raw: object) -> datetime | None:
             return None
     else:
         return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return ts.astimezone(UTC)
+    return coerce_utc(ts).astimezone(UTC)
 
 
 def daily_high(
@@ -297,6 +295,39 @@ async def _fetch_awc_fallback(
     return rows
 
 
+async def asos_lead0_kelvin(
+    city: str,
+    target_date: date,
+    instant: datetime,
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> float | None:
+    """ASOS reading nearest ``instant`` in Kelvin for the lead-0 sanity probe (D-04), else ``None``.
+
+    Reuses the same settlement-window ASOS fetch the daily-high uses, returns the in-window
+    reading closest to ``instant`` converted °F → Kelvin (the obs-path °F→K seam). ``None`` when
+    no obs cover the window so the caller can skip the probe rather than fabricate a comparison.
+    """
+    win = settlement_window(get_city(city), target_date)
+    rows = await fetch_asos_obs(city, win, client=client)
+    nearest_f: float | None = None
+    nearest_gap: float | None = None
+    for raw in rows:
+        coerced = _coerce(raw)
+        if coerced is None:
+            continue
+        ts, tmpf = coerced
+        if not win.contains(ts):
+            continue
+        gap = abs((ts - instant).total_seconds())
+        if nearest_gap is None or gap < nearest_gap:
+            nearest_gap = gap
+            nearest_f = tmpf
+    if nearest_f is None:
+        return None
+    return (nearest_f - 32.0) * 5.0 / 9.0 + KELVIN_OFFSET
+
+
 def store_daily_high(
     bind: Bind,
     city: str,
@@ -333,6 +364,7 @@ def store_daily_high(
 __all__ = [
     "SOURCE",
     "DailyHigh",
+    "asos_lead0_kelvin",
     "celsius_to_fahrenheit",
     "daily_high",
     "daily_high_from_obs",

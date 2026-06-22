@@ -3,16 +3,17 @@
 Turned GREEN by 02-05's orchestrator (the one ingestion code path). The behavioral
 contract under test:
 
-* ``weatherquant.ingest.ingest_all_models`` exists and is callable (the RED import seam).
 * When ONE model's fetch raises (a late/missing cycle), a STRUCTURED fallback is logged and
   the OTHER models still ingest their rows — the city/cycle is NOT dropped (D-11).
 * NO row is inserted for the failed model: absence is represented by absence — the
   orchestrator never interpolates or carries forward a fake value (D-11). We assert this by
   counting the rows that reached the (mocked) single audited writer path.
 
-The GRIB fetch + decode and the supplementary HTTP sources are MOCKED here (no network, no
-cfgrib, no DB) — this test pins the degradation/branching contract of the orchestrator, not
-the already-unit-tested source parsers (02-02/03/04 cover those).
+The per-source degradation contract lives in ``ingest_cycle``'s try/except; ``_ingest_all``
+below drives that ONE code path model-by-model (the trivial fan-out the deleted
+``ingest_all_models`` used to wrap). The GRIB fetch + decode and the supplementary HTTP sources
+are MOCKED here (no network, no cfgrib, no DB) — this pins the degradation/branching contract,
+not the already-unit-tested source parsers (02-02/03/04 cover those).
 """
 
 from __future__ import annotations
@@ -22,14 +23,23 @@ from datetime import datetime, timezone
 
 import pytest
 
-from weatherquant.ingest import grib, orchestrator
+from weatherquant.ingest import grib, obs, orchestrator
 from weatherquant.ingest.sources import nws, openmeteo, wethr
 
 
-def test_ingest_all_models_is_callable():
-    from weatherquant.ingest import ingest_all_models
+async def _ingest_all(bind, city, cycle, *, mode, lead=0):
+    """Drive ``ingest_cycle`` (the ONE code path) over every GRIB model + supplementary source.
 
-    assert callable(ingest_all_models)
+    Replaces the deleted ``ingest_all_models``; the degradation/skip logic under test lives in
+    ``ingest_cycle`` itself, so fanning out here exercises the same contract.
+    """
+    targets = [*orchestrator.GRIB_MODELS, *orchestrator.SUPPLEMENTARY_SOURCES]
+    return {
+        model: await orchestrator.ingest_cycle(
+            bind, model, city, cycle, mode=mode, lead=lead
+        )
+        for model in targets
+    }
 
 
 class _RecordingBind:
@@ -95,6 +105,13 @@ def recorder(monkeypatch: pytest.MonkeyPatch) -> _RecordingBind:
     monkeypatch.setattr(nws, "fetch_nws_forecast", _fake_nws)
     monkeypatch.setattr(openmeteo, "fetch_openmeteo_ensemble", _fake_openmeteo)
     monkeypatch.setattr(wethr, "fetch_wethr_forecast", _fake_wethr)
+
+    # The lead-0 sanity probe (D-04) would otherwise hit the ASOS feed at lead=0; stub it to
+    # None so the probe is skipped and the degradation contract stays the focus here.
+    async def _no_asos(*_a, **_kw):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(obs, "asos_lead0_kelvin", _no_asos)
     return bind
 
 
@@ -104,7 +121,7 @@ async def test_missing_cycle_does_not_abort_other_models(
     """A raising HRRR cycle degrades gracefully; the other models still ingest (D-11)."""
     cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
     with caplog.at_level(logging.WARNING):
-        summary = await orchestrator.ingest_all_models(
+        summary = await _ingest_all(
             recorder, "NYC", cycle, mode="backfill", lead=0
         )
 
@@ -142,7 +159,7 @@ async def test_live_mode_runs_supplementary_sources(
 ):
     """In LIVE mode the supplementary HTTP sources DO run (WR-02 only gates backfill)."""
     cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
-    summary = await orchestrator.ingest_all_models(
+    summary = await _ingest_all(
         recorder, "NYC", cycle, mode="live", lead=0
     )
 
@@ -164,7 +181,7 @@ async def test_backfill_skips_live_only_sources_with_structured_log(
     """WR-02: backfill emits a structured live-only skip for nws/openmeteo/wethr (D-11)."""
     cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
     with caplog.at_level(logging.INFO):
-        await orchestrator.ingest_all_models(
+        await _ingest_all(
             recorder, "NYC", cycle, mode="backfill", lead=0
         )
 
@@ -182,7 +199,7 @@ async def test_backfill_mode_stamps_publish_latency_not_now(
     from weatherquant.ingest.available_at import PUBLISH_LATENCY
 
     cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
-    await orchestrator.ingest_all_models(recorder, "NYC", cycle, mode="backfill", lead=0)
+    await _ingest_all(recorder, "NYC", cycle, mode="backfill", lead=0)
 
     nbm_rows = [r for r in recorder.rows if r["model"] == "nbm"]
     assert nbm_rows, "expected an nbm row"

@@ -80,6 +80,13 @@ def grib_alarm_env(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(grib, "fetch_t2m", _fake_fetch_t2m)
     monkeypatch.setattr(grib, "snap_city", _fake_snap_city)
 
+    # These tests exercise the WRITER/snap alarm-propagation contract at lead=0, not the lead-0
+    # ASOS probe — stub it to None (skip) so the probe never makes a real network call.
+    async def _no_asos(*_a, **_kw):  # noqa: ANN001
+        return None
+
+    monkeypatch.setattr(orchestrator.obs, "asos_lead0_kelvin", _no_asos)
+
 
 async def test_write_integrity_error_propagates_not_swallowed(
     grib_alarm_env, monkeypatch: pytest.MonkeyPatch

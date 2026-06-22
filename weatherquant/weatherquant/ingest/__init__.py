@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from weatherquant.ingest.orchestrator import (
     ingest_afd,
-    ingest_all_models,
     ingest_cycle,
     ingest_obs,
     ingest_range,
@@ -18,7 +17,6 @@ from weatherquant.ingest.orchestrator import (
 
 __all__ = [
     "ingest_afd",
-    "ingest_all_models",
     "ingest_cycle",
     "ingest_obs",
     "ingest_range",

@@ -9,17 +9,15 @@ the exact integer-cent arithmetic with closed-form expected values (mirroring
 * ``exact_fee(100, 0.50)`` → ``0.07·100·0.50·0.50 = $1.75`` → **$1.75**
 * ``exact_fee(1, 0.50)`` → ``0.07·1·0.25 = $0.0175`` → ceil → **$0.02** (single-contract floor)
 
-Wave 1 (04-04) implemented the body and flipped these GREEN (no rename). Guard/maker tests
-lock the fail-loud and not-for-sizing contract (T-04-10/T-04-11/T-04-12).
+Wave 1 (04-04) implemented the body and flipped these GREEN (no rename). Guard tests lock the
+fail-loud contract (T-04-10/T-04-11).
 """
 
 from __future__ import annotations
 
-import math
-
 import pytest
 
-from weatherquant.price.fee import FEE_COEFF, exact_fee, maker_fee
+from weatherquant.price.fee import FEE_COEFF, exact_fee
 
 
 def test_exact_fee_golden_twenty_at_sixty():
@@ -63,28 +61,3 @@ def test_exact_fee_ceils_once_per_order_not_per_contract():
 def test_exact_fee_fails_loud_on_invalid_input(n, p):
     with pytest.raises(ValueError):
         exact_fee(n, p)
-
-
-def test_maker_fee_defaults_to_quarter_taker_and_parameterizes_coeff():
-    # Maker defaults to 0.25 × the taker fee on the same (n, p).
-    n, p = 100, 0.50
-    assert maker_fee(n, p) == pytest.approx(0.25 * exact_fee(n, p))
-    # The maker fraction is parameterizable (a per-market override, never auto-applied).
-    assert maker_fee(n, p, maker_fraction=0.5) == pytest.approx(0.5 * exact_fee(n, p))
-    # The taker coefficient is parameterizable too (raw, pre-ceiling intent check).
-    assert maker_fee(1, 0.50, coeff=0.035) == pytest.approx(
-        0.25 * exact_fee(1, 0.50, 0.035)
-    )
-
-
-def test_maker_fee_is_not_on_the_sizing_path_documented():
-    # The maker helper exists but its docstring states it is not used for Gate-1 sizing (D-09).
-    assert maker_fee.__doc__ is not None
-    assert "NOT on the sizing path" in maker_fee.__doc__ or "not" in maker_fee.__doc__.lower()
-
-
-def test_maker_fee_fails_loud_on_invalid_input():
-    with pytest.raises(ValueError):
-        maker_fee(0, 0.5)
-    with pytest.raises(ValueError):
-        maker_fee(1, math.nan)

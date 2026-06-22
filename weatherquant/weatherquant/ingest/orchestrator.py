@@ -22,10 +22,9 @@ from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
-from weatherquant.ingest.sources._client import get_client
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
-from weatherquant.time import settlement_window
+from weatherquant.time import coerce_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +34,12 @@ Mode = Literal["backfill", "live"]
 # deterministic (member=0); GEFS is the 31-member ensemble (c00 + p01..p30).
 GRIB_MODELS: tuple[str, ...] = ("nbm", "hrrr", "gfs", "gefs")
 _GEFS_MEMBERS: tuple[str, ...] = ("c00",) + tuple(f"p{i:02d}" for i in range(1, 31))
+
+# Snap-distance sane bound (Pitfall 2) wired into the live path so grib.snap_city's SanityError
+# can actually fire. Covers the coarsest grid we decode (GEFS 0.5° ≈ 56 km nearest cell) with
+# headroom; a bad station coord / grid mislabel snaps thousands of km off, far past this.
+# ponytail: one bound for all models; tighten per-model only if a mislabel ever slips under 80km.
+_MAX_SNAP_DISTANCE_M = 80_000.0
 
 # The supplementary live-forward sources (02-04) are defined as the {name: handler} dispatch
 # table _SUPPLEMENTARY_HANDLERS below (the single source of truth); SUPPLEMENTARY_SOURCES is
@@ -54,9 +59,7 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
     docs/DECISIONS.md).
     """
     city = get_city(city_code)
-    valid = cycle_init + timedelta(hours=lead)
-    if valid.tzinfo is None:
-        valid = valid.replace(tzinfo=UTC)
+    valid = coerce_utc(cycle_init + timedelta(hours=lead))
     # Valid instant is within ~1 civil day of its UTC date for any US offset; check the UTC
     # date and its neighbours so the half-open window assignment is exact.
     base = valid.astimezone(UTC).date()
@@ -95,14 +98,25 @@ async def _ingest_grib_model(
     stamp = available_at(cycle_init, model, mode)
 
     inserted = 0
-    for member_label in _gefs_members(model):
+    for i, member_label in enumerate(_gefs_members(model)):
         # D-14: run the sync, CPU-bound Herbie+cfgrib decode off the async loop.
         field = await loop.run_in_executor(
             None, grib.fetch_t2m, model, cycle_init, lead, member_label
         )
         temp_kelvin, station_lat, station_lon, grid_distance_m = grib.snap_city(
-            field, city_code
+            field, city_code, max_distance_m=_MAX_SNAP_DISTANCE_M
         )
+        # D-04 / Pitfall 4: the lead-0 control snap must track contemporaneous ASOS, else a
+        # wrong snap / unit / grid error fails LOUD (SanityError → ingest_cycle re-raises, never
+        # a silent skip that corrupts every downstream fit). Checked once per model on the c00
+        # control member (i==0); the grid is shared across members so one probe covers them all.
+        # ASOS unavailable → skip the probe (can't verify), only a real breach raises.
+        if lead == 0 and i == 0:
+            asos_k = await obs.asos_lead0_kelvin(city_code, target_date, cycle_init)
+            if asos_k is not None:
+                grib.lead0_sanity_check(
+                    forecast_k=temp_kelvin, asos_k=asos_k, city_code=city_code
+                )
         inserted += insert_forecast(
             bind,
             city=city_code,
@@ -337,51 +351,6 @@ def target_date_to_dt(target_date: date) -> datetime:
     return datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
 
 
-async def ingest_all_models(
-    bind: Bind,
-    city: str,
-    cycle_init: datetime,
-    *,
-    mode: Mode = "live",
-    lead: int = 0,
-    models: Sequence[str] | None = None,
-) -> dict[str, int]:
-    """Ingest EVERY forecast source for one city/cycle concurrently, degrading per-source (D-11).
-
-    The graceful-degradation entry point: a failed model logs a fallback while the others still
-    ingest. Returns ``{model: rows_inserted}`` (0 for a skipped source).
-
-    Args:
-        mode: ``"live"`` (scheduler) or ``"backfill"`` (CLI) — the only live/backfill seam.
-        models: optional subset of labels; defaults to all GRIB + supplementary.
-    """
-    get_city(city)  # ASVS V5 up front.
-    targets = list(models) if models is not None else [*GRIB_MODELS, *SUPPLEMENTARY_SOURCES]
-
-    # One shared httpx client for the whole concurrent fan-out (D-14): the supplementary
-    # sources reuse it instead of each opening/closing its own; closed once here.
-    client = get_client()
-    try:
-
-        async def _one(model: str) -> tuple[str, int]:
-            return model, await ingest_cycle(
-                bind, model, city, cycle_init, mode=mode, lead=lead, client=client
-            )
-
-        results = await asyncio.gather(*(_one(m) for m in targets))
-    finally:
-        await client.aclose()
-    summary = dict(results)
-    logger.info(
-        "ingest_all_models city=%s cycle=%s mode=%s -> %s",
-        city,
-        cycle_init.isoformat(),
-        mode,
-        summary,
-    )
-    return summary
-
-
 async def ingest_range(
     bind: Bind,
     models: Sequence[str],
@@ -463,7 +432,6 @@ __all__ = [
     "GRIB_MODELS",
     "SUPPLEMENTARY_SOURCES",
     "ingest_afd",
-    "ingest_all_models",
     "ingest_cycle",
     "ingest_obs",
     "ingest_range",

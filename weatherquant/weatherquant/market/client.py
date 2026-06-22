@@ -215,7 +215,6 @@ async def run_feed(
     tickers: Sequence[str],
     signer: SignerFn,
     *,
-    http: Any,
     on_book: OnBookFn | None = None,
     ws_connect: Callable[..., Any] | None = None,
     demo: bool = False,
@@ -245,7 +244,6 @@ async def run_feed(
         tickers: the market tickers to subscribe to.
         signer: ``signer(method, path) -> headers``; RE-INVOKED once per (re)connection so each
             handshake carries a fresh timestamp (CR-01).
-        http: injectable async HTTP client (kept for parity; run_feed issues no REST call).
         on_book: optional callback ``on_book(ticker, book)`` invoked after each applied
             snapshot/delta (sync or async); the book carries the WS event time on
             :attr:`OrderBook.event_time` after a delta (PAP-03).

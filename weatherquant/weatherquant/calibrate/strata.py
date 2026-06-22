@@ -134,9 +134,15 @@ class TrainingPair:
     y: float
 
 
-def _fit_own(stratum: StratumSamples, pool_level: str) -> StratumFit:
-    """Fit a stratum on its own samples (no pooling) — the finest-rung / parent fit."""
-    a, b, c, d = fit_stratum(stratum.m, stratum.s2, stratum.y, sigma_floor=SIGMA_FLOOR_F)
+def _make_fit(
+    stratum: StratumSamples, *, a: float, b: float, c: float, d: float, pool_level: str
+) -> StratumFit:
+    """Build a StratumFit, filling the mechanical natural-key + floor/n fields from ``stratum``.
+
+    The three fit branches (own / sparse-parent-fallback / shrunk) differ only in ``(a, b, c, d)``
+    and ``pool_level``; city/model/lead/month/sigma_floor/n_train are mechanical copies of the fine
+    stratum, centralized here so a field rename cannot drift between branches.
+    """
     return StratumFit(
         city=stratum.city,
         model=stratum.model,
@@ -150,6 +156,12 @@ def _fit_own(stratum: StratumSamples, pool_level: str) -> StratumFit:
         n_train=stratum.n,
         pool_level=pool_level,
     )
+
+
+def _fit_own(stratum: StratumSamples, pool_level: str) -> StratumFit:
+    """Fit a stratum on its own samples (no pooling) — the finest-rung / parent fit."""
+    a, b, c, d = fit_stratum(stratum.m, stratum.s2, stratum.y, sigma_floor=SIGMA_FLOOR_F)
+    return _make_fit(stratum, a=a, b=b, c=c, d=d, pool_level=pool_level)
 
 
 def fit_stratum_pooled(
@@ -180,17 +192,12 @@ def fit_stratum_pooled(
 
     # Below N_MIN the fine stratum is too sparse to trust — use the parent params entirely (D-08).
     if stratum.n < N_MIN:
-        return StratumFit(
-            city=stratum.city,
-            model=stratum.model,
-            lead=stratum.lead,
-            month=stratum.month,
+        return _make_fit(
+            stratum,
             a=parent.a,
             b=parent.b,
             c=parent.c,
             d=parent.d,
-            sigma_floor=SIGMA_FLOOR_F,
-            n_train=stratum.n,
             pool_level=f"parent:{rung}",
         )
 
@@ -200,17 +207,12 @@ def fit_stratum_pooled(
     # Blend mean params (a, b) linearly but variance params by MAGNITUDE: c, d enter σ only via
     # their squares (D-02), so signs are free and a linear blend could cancel them toward 0 —
     # collapsing σ to the floor into a spurious over-confident fit. |c|/|d| avoid that.
-    return StratumFit(
-        city=stratum.city,
-        model=stratum.model,
-        lead=stratum.lead,
-        month=stratum.month,
+    return _make_fit(
+        stratum,
         a=w * own.a + (1.0 - w) * parent.a,
         b=w * own.b + (1.0 - w) * parent.b,
         c=w * abs(own.c) + (1.0 - w) * abs(parent.c),
         d=w * abs(own.d) + (1.0 - w) * abs(parent.d),
-        sigma_floor=SIGMA_FLOOR_F,
-        n_train=stratum.n,
         pool_level=f"shrunk:{rung}",
     )
 

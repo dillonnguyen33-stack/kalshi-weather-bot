@@ -53,7 +53,6 @@ def taker_sweep(
     want_count: int,
     *,
     event_time: datetime,
-    is_maker: bool = False,
 ) -> Fill | None:
     """Sweep ``want_count`` contracts against reflected ``ask_levels`` best-price-first (D-05/D-07).
 
@@ -66,7 +65,6 @@ def taker_sweep(
         want_count: contracts to fill. Must be ``> 0`` (fail-loud otherwise).
         event_time: the real WS event time of the book state, stamped onto the :class:`Fill`
             (D-08); a caller param, never back-dated.
-        is_maker: stamped onto the :class:`Fill`; ``False`` for a normal taker sweep.
 
     Returns:
         A :class:`Fill` crediting only achievable liquidity, or ``None`` if nothing filled.
@@ -102,7 +100,7 @@ def taker_sweep(
         avg_price_cents=cost / filled,
         partial=filled < want_count,
         shortfall=want_count - filled,
-        is_maker=is_maker,
+        is_maker=False,  # a taker sweep is never a maker fill (maker goes via maker_queue_fill)
         event_time=event_time,
     )
 

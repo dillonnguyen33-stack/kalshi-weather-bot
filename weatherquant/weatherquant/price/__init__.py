@@ -6,7 +6,7 @@ from :mod:`weatherquant.calibrate.crps` (D-15). Public surface:
 * ``blend``   — ``accuracy_weights``, ``blend_gaussians`` (D-01/D-02/D-03).
 * ``buckets`` — ``integers_in_bucket``, ``bucket_prob``, ``bucket_probs`` (D-04/D-05).
 * ``ticker``  — ``parse_ticker`` (D-06).
-* ``fee``     — ``exact_fee``, ``maker_fee`` (D-07/D-09).
+* ``fee``     — ``exact_fee`` (D-07).
 * ``ev``      — ``p_used``, ``bucket_ev`` (D-08).
 * ``kelly``   — ``kelly_fraction``, ``sufficiency_ramp``, ``stake_fraction`` (D-10–D-13).
 """
@@ -20,7 +20,7 @@ from weatherquant.price.buckets import (
     integers_in_bucket,
 )
 from weatherquant.price.ev import bucket_ev, p_used
-from weatherquant.price.fee import exact_fee, maker_fee
+from weatherquant.price.fee import exact_fee
 from weatherquant.price.kelly import kelly_fraction, stake_fraction, sufficiency_ramp
 from weatherquant.price.ticker import parse_ticker
 
@@ -33,12 +33,11 @@ __all__ = [
     # buckets (PRC-02, D-04/D-05/D-06)
     "bucket_prob",
     "bucket_probs",
-    # fee (PRC-03, D-07/D-09)
+    # fee (PRC-03, D-07)
     "exact_fee",
     "integers_in_bucket",
     # kelly (PRC-04/PRC-05, D-10–D-13)
     "kelly_fraction",
-    "maker_fee",
     "p_used",
     "parse_ticker",
     "stake_fraction",

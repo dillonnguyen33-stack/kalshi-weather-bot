@@ -23,7 +23,7 @@ from typing import cast
 import numpy as np
 from numpy.typing import NDArray
 
-__all__ = ["crps_norm", "crps_norm_grad", "normal_cdf", "normal_pdf"]
+__all__ = ["crps_norm", "crps_norm_grad", "normal_cdf"]
 
 # 1 / sqrt(pi): the closed-form CRPS additive constant (the -1/sqrt(pi) term).
 _INV_SQRT_PI = 1.0 / math.sqrt(math.pi)
@@ -47,10 +47,9 @@ def _phi(x: NDArray[np.float64]) -> NDArray[np.float64]:
     return cast(NDArray[np.float64], np.exp(-0.5 * x * x) * _INV_SQRT_2PI)
 
 
-# Public aliases for Phase-4 bucket CDF differencing (D-04/D-14/D-15): same erf-based bodies
-# under public names so ``weatherquant.price`` imports ONE source of truth and never re-derives erf.
+# Public alias for Phase-4 bucket CDF differencing (D-04/D-14/D-15): the erf-based CDF under a
+# public name so ``weatherquant.price`` imports ONE source of truth and never re-derives erf.
 normal_cdf = _Phi
-normal_pdf = _phi
 
 
 def crps_norm(

@@ -197,7 +197,7 @@ async def test_connect_does_not_rest_resnapshot_for_seq():
     connector = _MockConnector([conn1])
 
     # Runs to completion without raising on the seq-less REST payload.
-    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=1)
+    await run_feed([_TICKER], _signer, ws_connect=connector, max_reconnects=1)
 
     # No connect-time REST GET — the seq baseline came from the WS snapshot, never REST (B1).
     assert http.calls == []
@@ -218,7 +218,6 @@ async def test_subscribed_control_frame_is_skipped():
     await run_feed(
         [_TICKER, "KX-OTHER"],
         _signer,
-        http=http,
         on_book=lambda t, b: seen.append((t, b.seq)),
         ws_connect=connector,
         max_reconnects=1,
@@ -241,7 +240,6 @@ async def test_ws_snapshot_is_seq_anchor():
     await run_feed(
         [_TICKER],
         _signer,
-        http=http,
         on_book=lambda t, b: captured.append(b.seq),
         ws_connect=connector,
         max_reconnects=1,
@@ -264,7 +262,7 @@ async def test_seq_gap_resubscribes_for_fresh_ws_snapshot():
     conn2 = _MockWS([_ws_snapshot(1)], close_after=False)
     connector = _MockConnector([conn1, conn2])
 
-    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=2)
+    await run_feed([_TICKER], _signer, ws_connect=connector, max_reconnects=2)
 
     # The gap broke conn1's loop; conn2 re-subscribed for a fresh WS snapshot (D-02 redesign).
     assert len(conn2.sent) == 1
@@ -290,7 +288,6 @@ async def test_malformed_frame_is_skipped_and_feed_survives():
     await run_feed(
         [_TICKER],
         _signer,
-        http=http,
         on_book=lambda t, b: captured.append(b.seq),
         ws_connect=connector,
         max_reconnects=1,
@@ -308,7 +305,7 @@ async def test_reconnect_resubscribes():
     conn2 = _MockWS([_ws_snapshot(1)], close_after=False)  # the reconnect
     connector = _MockConnector([conn1, conn2])
 
-    await run_feed([_TICKER], _signer, http=http, ws_connect=connector, max_reconnects=2)
+    await run_feed([_TICKER], _signer, ws_connect=connector, max_reconnects=2)
 
     # Subscribe command re-sent on BOTH connections; never a REST GET (WS-seq anchor).
     assert len(conn1.sent) == 1
@@ -335,7 +332,6 @@ async def test_reconnect_uses_fresh_ws_seq_baseline():
     await run_feed(
         [_TICKER],
         _signer,
-        http=http,
         on_book=lambda t, b: captured.append(b.seq),
         ws_connect=connector,
         max_reconnects=2,
@@ -371,7 +367,7 @@ async def test_handshake_is_resigned_on_every_reconnection():
             "KALSHI-ACCESS-TIMESTAMP": ts,
         }
 
-    await run_feed([_TICKER], recording_signer, http=http, ws_connect=connector, max_reconnects=2)
+    await run_feed([_TICKER], recording_signer, ws_connect=connector, max_reconnects=2)
 
     # The signer ran once PER connection (not once for the whole feed), and the handshake was
     # built fresh for each of the two connections.
@@ -393,7 +389,6 @@ async def test_event_time_surfaced_to_on_book():
     A WS snapshot then a delta carrying ``msg.ts`` is applied; the on_book callback sees
     ``book.event_time`` == that tz-aware UTC instant. CARRY+SURFACE only — NOT DB persistence.
     """
-    http = _MockHttp(_FP_PAYLOAD)
     ts = "2026-06-18T19:55:00.000000Z"
     conn1 = _MockWS([_ws_snapshot(1), _ws_delta(2, ts=ts)], close_after=False)
     connector = _MockConnector([conn1])
@@ -402,7 +397,6 @@ async def test_event_time_surfaced_to_on_book():
     await run_feed(
         [_TICKER],
         _signer,
-        http=http,
         on_book=lambda t, b: seen_times.append(b.event_time),
         ws_connect=connector,
         max_reconnects=1,

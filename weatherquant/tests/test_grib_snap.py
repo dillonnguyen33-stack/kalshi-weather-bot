@@ -57,3 +57,31 @@ def test_snap_distance_bound_raises_on_far_station(grib_fixture):
     field = decode_t2m(grib_fixture("hrrr"))
     with pytest.raises(ValueError):
         snap_to_station(field, lat=0.0, lon=-160.0, max_distance_m=5_000.0)
+
+
+async def test_orchestrator_wires_snap_distance_bound(monkeypatch):
+    """1.1: the ingest path passes max_distance_m so a far snap raises SanityError (never stored).
+
+    The unit test above proves the guard; this proves the orchestrator actually wires it in —
+    on the OLD code (snap_city called without a bound) this would have stored a garbage row.
+    """
+    from datetime import datetime, timezone
+
+    import numpy as np
+
+    from weatherquant.ingest import orchestrator
+    from weatherquant.ingest.errors import SanityError
+    from weatherquant.ingest.grib import T2MField
+
+    # A field whose grid sits near (0, 0) — thousands of km from the NYC station.
+    far_field = T2MField(
+        values=np.array([[295.0, 295.0], [295.0, 295.0]]),
+        lat2d=np.array([[0.0, 0.0], [1.0, 1.0]]),
+        lon2d=np.array([[0.0, 1.0], [0.0, 1.0]]),
+        units="K",
+    )
+    monkeypatch.setattr(orchestrator.grib, "fetch_t2m", lambda *a, **k: far_field)
+    cycle = datetime(2026, 6, 12, 0, tzinfo=timezone.utc)
+    # lead != 0 keeps the lead-0 ASOS probe off this path; the snap-distance guard is what fires.
+    with pytest.raises(SanityError):
+        await orchestrator.ingest_cycle(object(), "hrrr", "NYC", cycle, mode="live", lead=5)
