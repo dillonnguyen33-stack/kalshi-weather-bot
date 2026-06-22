@@ -315,8 +315,13 @@ def fetch_t2m(
     try:
         inventory = herbie.inventory(":TMP:2 m")
     except Exception:  # noqa: BLE001 - a transient .idx probe failure must not block the fetch.
+        # The egress backstop is the errors="raise" on download() below: with Herbie's DEFAULT
+        # errors="warn", a missing .idx silently downloads the full ~700 MB file ("I will download
+        # the full file because I cannot subset"). errors="raise" turns that into a ValueError, so
+        # a probe failure can never fall through to an unguarded full fetch.
         logger.warning(
-            "herbie .idx inventory probe failed for model=%s; proceeding without egress guard",
+            "herbie .idx inventory probe failed for model=%s; egress guard falls back to "
+            "download(errors='raise') (a missing .idx fails loud, never a full-file fetch)",
             model,
         )
     else:
@@ -333,7 +338,9 @@ def fetch_t2m(
 
     # Download ONLY the :TMP:2 m byte-range subset (~1 MB). herbie-data 2026.3.0 dropped the
     # old ``remove_grib`` kwarg, so the subset file is kept by default and decoded below.
-    local_path = herbie.download(":TMP:2 m")
+    # errors="raise" (vs Herbie's default "warn") is the egress guard's teeth: a subset request
+    # with a missing .idx raises instead of silently fetching the full ~700 MB file.
+    local_path = herbie.download(":TMP:2 m", errors="raise")
     return decode_t2m(local_path)
 
 
