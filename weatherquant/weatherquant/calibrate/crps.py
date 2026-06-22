@@ -1,32 +1,18 @@
 """Gaussian CRPS value and its closed-form analytic gradient (CAL-02 / D-04 / D-05).
 
-The single most safety-critical artifact in the calibration core. A silent algebra error
-here would corrupt every fit, every out-of-sample metric, and the eventual Gate-1 proof —
-invisibly, since a wrong-but-plausible CRPS still "optimizes" to something. The structural
-guard is the finite-difference gradient-check test (``tests/test_crps_gradient.py``, D-05),
-which is why both the value and the gradient are implemented in *exact closed form*,
-never by numerical integration.
+The most safety-critical artifact in the core — a silent algebra error would invisibly corrupt
+every fit and metric, so both value and gradient are EXACT closed form (never numerical
+integration), guarded by the finite-difference test ``tests/test_crps_gradient.py``.
 
-Closed form (Gneiting et al. 2005, MWR 133:1098; scoringRules App. A), with
-``z = (y - mu) / sigma``::
+Closed form (Gneiting et al. 2005, MWR 133:1098; scoringRules App. A), ``z = (y - mu)/sigma``::
 
     CRPS(N(mu, sigma), y) = sigma * [ z*(2*Phi(z) - 1) + 2*phi(z) - 1/sqrt(pi) ]
-
-and the exact gradient w.r.t. the predictive parameters (D-05)::
-
     d CRPS / d mu    = 1 - 2*Phi(z)
     d CRPS / d sigma = 2*phi(z) - 1/sqrt(pi)
 
-The normal CDF ``Phi`` is built from stdlib ``math.erf`` — ``Phi(x) = 0.5*(1 + erf(x/sqrt(2)))``
-(D-04). ``math.erf`` is correctly-rounded double precision (~1e-16), which keeps the
-gradient-check tolerance entirely down at the central-difference truncation floor; a
-hand-rolled polynomial erf (e.g. A&S 7.1.26, ~1.4e-7) would needlessly eat that budget.
-Crucially this is **scipy-free**: ``scipy.stats.norm`` is the forbidden "natural" reach
-(PROJECT.md / CLAUDE.md), and the AST guard ``tests/test_no_forbidden_calibration_deps.py``
-fences it out.
-
-All functions are elementwise over NumPy arrays (or accept Python scalars) so a whole
-stratum's residuals are scored in one vectorized pass.
+``Phi`` is built from stdlib ``math.erf`` (``0.5*(1 + erf(x/sqrt(2)))``, D-04) — scipy-free
+(``scipy.stats.norm`` is fenced out by the AST guard). All functions are elementwise so a whole
+stratum scores in one vectorized pass.
 """
 
 from __future__ import annotations
@@ -46,9 +32,8 @@ _INV_SQRT_2 = 1.0 / math.sqrt(2.0)
 # 1 / sqrt(2*pi): the standard-normal pdf normalizer.
 _INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
 
-# Vectorized stdlib erf — scipy-free, full double precision (D-04). Per-stratum sample
-# counts are small (tens–hundreds), so erf is not a hot path; np.vectorize is the simplest
-# correct path and keeps the gradient-check tolerance tight.
+# Vectorized stdlib erf — scipy-free, full double precision (D-04). Strata are small (tens–
+# hundreds of samples) so erf is not a hot path; np.vectorize is the simplest correct path.
 _erf = np.vectorize(math.erf)
 
 
@@ -62,11 +47,8 @@ def _phi(x: NDArray[np.float64]) -> NDArray[np.float64]:
     return cast(NDArray[np.float64], np.exp(-0.5 * x * x) * _INV_SQRT_2PI)
 
 
-# Public surface for Phase-4 bucket CDF differencing (D-04 / RESEARCH Pitfall 6):
-# the *same* erf-based bodies, exposed under public names so ``weatherquant.price`` imports
-# ONE source of truth for the normal CDF/PDF and never re-implements erf (D-14/D-15). These
-# are plain aliases — assigning, not re-deriving — so there is exactly one ``_Phi``/``_phi``
-# definition in the codebase.
+# Public aliases for Phase-4 bucket CDF differencing (D-04/D-14/D-15): same erf-based bodies
+# under public names so ``weatherquant.price`` imports ONE source of truth and never re-derives erf.
 normal_cdf = _Phi
 normal_pdf = _phi
 
@@ -76,10 +58,9 @@ def crps_norm(
 ) -> NDArray[np.float64]:
     """Gaussian CRPS, elementwise (D-04).
 
-    ``CRPS(N(mu, sigma), y) = sigma * [z*(2*Phi(z) - 1) + 2*phi(z) - 1/sqrt(pi)]`` with
-    ``z = (y - mu) / sigma``. Lower is better; units match ``y`` (°F on the calibration
-    path, D-03). ``sigma`` must be strictly positive (the σ-floor clamp in
-    :func:`weatherquant.calibrate.link.predict` guarantees this upstream).
+    ``CRPS(N(mu, sigma), y) = sigma * [z*(2*Phi(z) - 1) + 2*phi(z) - 1/sqrt(pi)]``,
+    ``z = (y - mu)/sigma``. Lower is better; units match ``y`` (°F, D-03). ``sigma`` must be
+    strictly positive (guaranteed upstream by the σ-floor clamp in ``link.predict``).
     """
     z = (y - mu) / sigma
     return cast(
@@ -93,11 +74,9 @@ def crps_norm_grad(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Exact analytic CRPS gradient ``(d/dmu, d/dsigma)``, elementwise (D-05).
 
-    ``d CRPS / d mu = 1 - 2*Phi(z)`` and ``d CRPS / d sigma = 2*phi(z) - 1/sqrt(pi)`` with
-    ``z = (y - mu) / sigma``. Verified against central differences to the finite-difference
-    truncation floor by the linchpin gradient-check test (``tests/test_crps_gradient.py`` asserts
-    ``< 1e-5``, D-05). Chain-ruled onto the EMOS params ``(a, b, c, d)`` by
-    :func:`weatherquant.calibrate.link.param_grads`.
+    ``d CRPS/d mu = 1 - 2*Phi(z)`` and ``d CRPS/d sigma = 2*phi(z) - 1/sqrt(pi)``,
+    ``z = (y - mu)/sigma``. Verified against central differences (``< 1e-5``) by
+    ``tests/test_crps_gradient.py``; chain-ruled onto ``(a, b, c, d)`` by ``link.param_grads``.
     """
     z = (y - mu) / sigma
     d_mu = 1.0 - 2.0 * _Phi(z)

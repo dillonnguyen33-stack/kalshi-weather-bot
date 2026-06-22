@@ -50,8 +50,8 @@ def captured_range(monkeypatch: pytest.MonkeyPatch) -> dict:
         )
         return {m: 1 for m in models}
 
-    monkeypatch.setattr(cli, "get_engine", _fake_get_engine)
-    monkeypatch.setattr(cli.orchestrator, "ingest_range", _fake_ingest_range)
+    monkeypatch.setattr(cli.ingest, "get_engine", _fake_get_engine)
+    monkeypatch.setattr(cli.ingest.orchestrator, "ingest_range", _fake_ingest_range)
     return captured
 
 
@@ -138,6 +138,18 @@ def test_build_scheduler_registers_per_model_jobs():
     assert len(jobs) >= 4
     # The scheduler is configured but NOT started (unit-testable).
     assert scheduler.running is False
+
+
+def test_scheduler_jobs_have_explicit_misfire_policy():
+    """Each live job sets an explicit misfire_grace_time + coalesce so a late/overrunning cycle
+    is handled deliberately, not silently dropped under apscheduler's 1-second default."""
+    from weatherquant.scheduler import build_scheduler
+
+    jobs = build_scheduler().get_jobs()
+    assert jobs
+    for job in jobs:
+        assert job.misfire_grace_time is not None and job.misfire_grace_time >= 60
+        assert job.coalesce is True
 
 
 def test_scheduler_is_asyncio_3x_not_4x():
@@ -251,9 +263,9 @@ def _patch_price_db(
             return afd
         raise AssertionError(f"unexpected table {table!r}")
 
-    monkeypatch.setattr(cli, "get_engine", lambda: object())
+    monkeypatch.setattr(cli.pricing, "get_engine", lambda: object())
     monkeypatch.setattr(
-        cli, "get_settings", lambda: type("S", (), {"max_position_fraction": cap})()
+        cli.pricing, "get_settings", lambda: type("S", (), {"max_position_fraction": cap})()
     )
     monkeypatch.setattr("weatherquant.db.queries.latest", _fake_latest)
 
@@ -421,16 +433,17 @@ def _patch_paper(
         def sign(self, method, path):  # noqa: ANN001
             return {}
 
-    monkeypatch.setattr(cli, "get_engine", lambda: object())
-    monkeypatch.setattr(
-        cli,
-        "get_settings",
-        lambda: type("S", (), {"max_position_fraction": cap, "execution_mode": "paper"})(),
-    )
-    monkeypatch.setattr(cli, "fetch_snapshot", _fake_fetch)
-    monkeypatch.setattr(cli, "persist_snapshot", _fake_persist_snapshot)
-    monkeypatch.setattr(cli, "persist_fill", _fake_persist_fill)
-    monkeypatch.setattr(cli, "KalshiSigner", _Signer)
+    _settings = lambda: type(  # noqa: E731
+        "S", (), {"max_position_fraction": cap, "execution_mode": "paper"}
+    )()
+    monkeypatch.setattr(cli.paper, "get_engine", lambda: object())
+    monkeypatch.setattr(cli.paper, "get_settings", _settings)
+    # _blend_distribution lives in cli.pricing and reads get_settings()/cap there.
+    monkeypatch.setattr(cli.pricing, "get_settings", _settings)
+    monkeypatch.setattr(cli.paper, "fetch_snapshot", _fake_fetch)
+    monkeypatch.setattr(cli.paper, "persist_snapshot", _fake_persist_snapshot)
+    monkeypatch.setattr(cli.paper, "persist_fill", _fake_persist_fill)
+    monkeypatch.setattr(cli.paper, "KalshiSigner", _Signer)
     monkeypatch.setattr("weatherquant.db.queries.latest", _fake_latest)
     return captured
 
@@ -677,7 +690,7 @@ def test_run_paper_end_to_end_real_fetch_snapshot(monkeypatch: pytest.MonkeyPatc
     )
     # OVERRIDE the _patch_paper fetch stub: restore the REAL fetch_snapshot and mock ONLY the
     # httpx transport so run_paper exercises the production producer shape (no injected event_time).
-    monkeypatch.setattr(cli, "fetch_snapshot", ws_client.fetch_snapshot)
+    monkeypatch.setattr(cli.paper, "fetch_snapshot", ws_client.fetch_snapshot)
     monkeypatch.setattr(
         httpx, "AsyncClient", lambda *a, **k: _RealShapeAsyncClient(real_payload, {"Date": date_header})
     )
@@ -705,7 +718,7 @@ def test_run_paper_refuses_live_mode(monkeypatch: pytest.MonkeyPatch):
     )
     # Flip settings to live — the paper simulator must refuse before any fill.
     monkeypatch.setattr(
-        cli,
+        cli.paper,
         "get_settings",
         lambda: type("S", (), {"max_position_fraction": 0.025, "execution_mode": "live"})(),
     )

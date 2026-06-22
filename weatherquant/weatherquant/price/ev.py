@@ -24,7 +24,7 @@ import math
 
 from weatherquant.price.fee import FEE_COEFF, exact_fee
 
-__all__ = ["MARKET_SHRINK_ALPHA", "p_used", "bucket_ev"]
+__all__ = ["MARKET_SHRINK_ALPHA", "bucket_ev", "p_used"]
 
 
 def _require_prob(name: str, value: float) -> None:

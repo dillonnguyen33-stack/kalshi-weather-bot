@@ -1,28 +1,11 @@
 """Ground-truth daily-high observations (ING-03) — bucket ASOS/METAR through the LST window.
 
-This module produces the *verifying truth* Phase 3 calibrates against and Phase 6 scores.
-The single correctness core is the bucket: the daily-high label is ``max(tmpf)`` over the
-**half-open** Phase-1 ``settlement_window`` ``[start_utc, end_utc)`` — NEVER a hand-rolled
-UTC day (D-16). This fixes v3's bug, which took the max over a flat ~14h aviationweather.gov
-window (``fetch_asos_high_fallback`` at kalshi_weather_bot_v3.py L779-796): a flat window
-both straddles the wrong LST day and silently clips the true intra-day peak.
-
-The civil-time→UTC conversion is delegated entirely to :func:`weatherquant.time.settlement_window`
-(the ONE LST authority — D-01/D-02); this module performs no DST-aware tz math and imports no
-runtime DST tooling. The only °F seam in the obs path is centralized here in
-:func:`celsius_to_fahrenheit` — the v3 inline ``*9/5+32`` (L793) lives in exactly one place.
-
-Writes route through 02-02's :func:`weatherquant.ingest.writer.insert_observation` — the single
-audited insert + skip-before-insert idempotency + ``rowcount==1`` path (D-10/D-11). There is no
-hand-rolled Core insert here, so the observations table has exactly one write contract.
-
-The obs row's ``available_at`` is the obs **report time** (the feed's own timestamp), NOT
-``now()`` and NOT the window edge (D-09) — conflating those clocks would corrupt Phase 6's
-no-look-ahead walk-forward.
-
-A disagreement between the ASOS-derived max and the NWS CLI oracle (Phase-1 D-04) is a flagged
-data-quality EVENT: the flag is logged and surfaced, but the ASOS label is STILL produced and
-stored — never silently overwritten (D-16).
+Produces the verifying truth Phase 3/6 use. The correctness core is the bucket: daily-high =
+``max(tmpf)`` over the half-open ``settlement_window`` (the one LST authority), never a
+hand-rolled UTC day (D-16/D-01/D-02). The only °F seam is :func:`celsius_to_fahrenheit`.
+Writes route through the single audited :func:`insert_observation`; the obs ``available_at``
+is the feed's report time, not ``now()`` (D-09/D-10/D-11). A CLI-vs-ASOS disagreement is
+flagged but the ASOS label is still stored, never overwritten (D-16; see docs/DECISIONS.md).
 """
 
 from __future__ import annotations
@@ -30,14 +13,15 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, UTC
 from typing import Any, cast
 
 import httpx
 
+from weatherquant.ingest.sources._client import managed_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
-from weatherquant.time import SettlementWindow, settlement_window
+from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +29,9 @@ logger = logging.getLogger(__name__)
 _IEM_ASOS_CGI = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 # v3 AWC_METAR_BASE — the recent-~14h *live fallback* only (kalshi_weather_bot_v3.py L53).
 _AWC_METAR_BASE = "https://aviationweather.gov/api/data/metar"
+# AWC lookback: the feed returns only the most recent ~N hours of METARs, so it can serve a
+# live/today window only — a window ending older than this predates the feed (backfill, skip).
+_AWC_FALLBACK_HOURS = 14
 # v3 NWS_UA (L77) — a descriptive User-Agent is required/courteous for these feeds.
 _USER_AGENT = "weatherquant/0.1 (kalshi daily-high paper-trading)"
 
@@ -57,12 +44,7 @@ SOURCE = "asos"
 
 
 def celsius_to_fahrenheit(temp_c: float) -> float:
-    """The ONE °C→°F conversion on the obs path (centralized v3 L793 ``*9/5+32``).
-
-    The obs payload is stored in °F (D-07); the only K↔F seam in the system lives between
-    phases 2 and 3. Keeping this conversion in a single named function means no other module
-    inlines ``* 9 / 5 + 32`` and the units boundary stays auditable.
-    """
+    """The ONE °C→°F conversion on the obs path, keeping the units boundary auditable (D-07)."""
     return temp_c * 9.0 / 5.0 + 32.0
 
 
@@ -71,16 +53,10 @@ class DailyHigh:
     """The bucketed daily-high label plus its provenance (ING-03).
 
     Attributes:
-        daily_high_f: ``max(tmpf)`` over the in-window readings, in °F (``None`` if no
-            reading fell inside the half-open window).
-        obs_count: the number of readings that fell inside ``[window_start, window_end)``.
-        window_start: the inclusive UTC start of the LST settlement window.
-        window_end: the EXCLUSIVE UTC end of the LST settlement window (half-open).
-        report_time: the timestamp of the reading that produced the max — the obs
-            ``available_at`` is stamped from this (the report time, D-09), never ``now()``.
-        cli_disagreement: ``True`` when a supplied CLI max disagreed with the ASOS max
-            beyond tolerance — the label is still produced, never overwritten (D-16).
-        cli_max_f: the CLI oracle max that was compared against (``None`` if not supplied).
+        window_start/window_end: the half-open ``[start, end)`` UTC settlement window.
+        report_time: timestamp of the max reading — the obs ``available_at`` source (D-09).
+        cli_disagreement: ``True`` when a CLI max disagreed beyond tolerance; label still
+            produced, never overwritten (D-16).
     """
 
     daily_high_f: float | None
@@ -93,11 +69,10 @@ class DailyHigh:
 
 
 def _coerce(reading: object) -> tuple[datetime, float] | None:
-    """Extract a well-formed ``(ts_utc, tmpf)`` from one untrusted feed row (T-02-07).
+    """Extract a well-formed ``(ts_utc, tmpf)`` from one untrusted feed row, else ``None`` (T-02-07).
 
-    Accepts a ``(ts, tmpf)`` pair or a mapping with ``ts``/``ts_utc`` and ``tmpf``/``temp_f``
-    keys. Returns ``None`` (skip — never store garbage) for any malformed/uncoercible row.
-    Naive timestamps are assumed UTC (the feeds are queried with ``tz=UTC``).
+    Accepts a ``(ts, tmpf)`` pair or a mapping with ``ts``/``ts_utc`` + ``tmpf``/``temp_f``;
+    naive timestamps are assumed UTC.
     """
     from collections.abc import Mapping
 
@@ -132,14 +107,14 @@ def _coerce_ts(ts_raw: object) -> datetime | None:
         ts = ts_raw
     elif isinstance(ts_raw, str):
         try:
-            ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            ts = parse_utc(ts_raw)
         except ValueError:
             return None
     else:
         return None
     if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(timezone.utc)
+        ts = ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
 
 
 def daily_high(
@@ -148,21 +123,14 @@ def daily_high(
     target_date: date,
     cli_max_f: float | None = None,
 ) -> DailyHigh:
-    """Bucket ``rows`` to the LST settlement window and return the daily-high label (ING-03).
+    """Bucket ``rows`` to the half-open LST settlement window and return the daily-high label (ING-03).
 
-    The window comes from :func:`settlement_window` (the ONLY LST authority); rows are kept
-    only when ``win.start_utc <= ts < win.end_utc`` — the half-open boundary means a reading
-    at exactly ``end_utc`` is EXCLUDED, and a hotter reading just OUTSIDE the window cannot
-    raise the daily high (proving correct bucketing, not a flat window). Malformed rows are
-    skipped (T-02-07). When ``cli_max_f`` is supplied and disagrees beyond tolerance, the
-    returned ``DailyHigh`` carries ``cli_disagreement=True`` (logged) but the ASOS label is
-    still produced — never overwritten (D-16).
+    A reading at exactly ``end_utc`` is excluded and one just outside cannot raise the high;
+    malformed rows are skipped (T-02-07). A CLI disagreement beyond tolerance is flagged but
+    the ASOS label is still produced (D-16; see docs/DECISIONS.md).
 
     Args:
-        rows: untrusted feed readings — ``(ts_utc, tmpf)`` pairs or mappings with
-            ``ts``/``ts_utc`` + ``tmpf``/``temp_f``. Temperatures are already °F.
-        city: Kalshi city code (resolved via :func:`get_city`).
-        target_date: the LST settlement (civil) date being labeled.
+        rows: untrusted feed readings — ``(ts_utc, tmpf)`` pairs or mappings; temps already °F.
         cli_max_f: optional NWS CLI oracle max for the data-quality cross-check (D-16).
     """
     win: SettlementWindow = settlement_window(get_city(city), target_date)
@@ -176,7 +144,7 @@ def daily_high(
             continue
         ts, tmpf = coerced
         # Half-open [start, end): end_utc is EXCLUSIVE (no double-count, no flat window).
-        if not (win.start_utc <= ts < win.end_utc):
+        if not win.contains(ts):
             continue
         count += 1
         if best_f is None or tmpf > best_f:
@@ -215,20 +183,14 @@ def daily_high_from_obs(
     readings: Iterable[object],
     cli_max_f: float | None = None,
 ) -> DailyHigh:
-    """Keyword-friendly alias of :func:`daily_high` matching the 02-01 RED-stub contract.
-
-    The Wave-0 stub (``tests/test_obs_daily_high.py``) imports this name and asserts the
-    result exposes ``daily_high_f`` and ``obs_count``. One implementation — this just
-    re-orders the arguments to the stub's ``(city, target_date, readings)`` shape.
-    """
+    """Arg-reordered alias of :func:`daily_high` matching the 02-01 RED-stub ``(city, target_date, readings)``."""
     return daily_high(readings, city, target_date, cli_max_f=cli_max_f)
 
 
 def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
-    """Parse the IEM ``asos.py`` ``format=onlycomma`` CSV into ``(ts_utc, tmpf)`` rows.
+    """Parse the IEM ``onlycomma`` CSV (``station,valid,tmpf``, tz=UTC) into ``(ts_utc, tmpf)`` rows.
 
-    Columns: ``station,valid,tmpf`` (``valid`` is ``YYYY-MM-DD HH:MM`` in the requested
-    ``tz=UTC``). Missing values are ``M`` — those rows are skipped (T-02-07).
+    Missing values (``M``) are skipped (T-02-07).
     """
     rows: list[tuple[datetime, float]] = []
     for line in body.splitlines():
@@ -242,9 +204,9 @@ def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
         if tmpf_s.strip().upper() in ("M", "", "T"):
             continue
         try:
-            ts = datetime.strptime(valid.strip(), "%Y-%m-%d %H:%M").replace(
-                tzinfo=timezone.utc
-            )
+            # IEM emits ``YYYY-MM-DD HH:MM`` UTC; parse_utc (fromisoformat) handles the space
+            # separator and stamps the naive instant as UTC — same result, one parse seam.
+            ts = parse_utc(valid.strip())
             tmpf = float(tmpf_s)
         except ValueError:
             continue
@@ -259,21 +221,15 @@ async def fetch_asos_obs(
 ) -> list[tuple[datetime, float]]:
     """Fetch sub-daily ASOS/METAR ``(ts_utc, tmpf)`` rows for ``win`` (ING-03, Pattern 3).
 
-    Primary feed: the IEM ASOS request CGI (``asos.py``) — ``data=tmpf``, ``sts``/``ets``
-    set to ``win.start_utc``/``win.end_utc`` as UTC ISO, ``tz=UTC``, routine+special report
-    types, ``format=onlycomma``. The station is the registry CLI station (``get_city(city).
-    cli_station``), NOT v3's CITY_COORDS ICAO. On any IEM failure the live aviationweather.gov
-    METAR endpoint (v3 ``AWC_METAR_BASE`` + UA header) is used as a graceful fallback (D-11);
-    its °C ``temp`` field is converted via :func:`celsius_to_fahrenheit`. Endpoints are fixed
-    constants (SSRF guard T-02-11). Returns the raw rows; :func:`daily_high` does the bucket.
+    Primary feed is the IEM ASOS CGI keyed by the registry ``cli_station``; on failure it
+    degrades to the aviationweather.gov METAR endpoint (°C → °F). Fixed endpoints (SSRF guard
+    T-02-11). Returns raw rows; :func:`daily_high` does the bucket (D-11).
     """
     station = get_city(city).cli_station
     # IEM strips the leading 'K' from the 4-letter ICAO for its 3-letter network ids.
     iem_station = station[1:] if station.startswith("K") and len(station) == 4 else station
 
-    owns_client = client is None
-    client = client or httpx.AsyncClient(timeout=15.0, headers={"User-Agent": _USER_AGENT})
-    try:
+    async with managed_client(client) as client:
         try:
             resp = await client.get(
                 _IEM_ASOS_CGI,
@@ -289,27 +245,37 @@ async def fetch_asos_obs(
                 },
             )
             resp.raise_for_status()
-            rows = _parse_iem_csv(resp.text)
-            if rows:
-                return rows
+            # A successful response is authoritative — empty rows mean "no obs for this window"
+            # (a real answer), NOT a failure. Only a genuine fetch error falls back to AWC.
+            return _parse_iem_csv(resp.text)
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("IEM ASOS fetch failed for %s (%s); trying AWC fallback", city, exc)
-
-        # Graceful live fallback (D-11): v3 AWC_METAR_BASE, recent window, °C temps.
-        return await _fetch_awc_fallback(station, client)
-    finally:
-        if owns_client:
-            await client.aclose()
+            return await _fetch_awc_fallback(station, client, win)
 
 
 async def _fetch_awc_fallback(
-    station: str, client: httpx.AsyncClient
+    station: str, client: httpx.AsyncClient, win: SettlementWindow
 ) -> list[tuple[datetime, float]]:
-    """v3 aviationweather.gov METAR fallback (recent ~14h window, °C temps → °F)."""
+    """aviationweather.gov METAR fallback — LIVE/recent windows only (°C → °F).
+
+    The feed returns only the most recent ~``_AWC_FALLBACK_HOURS`` of METARs, so it can cover a
+    today/live window. A window ending older than that lookback (a historical backfill) is
+    skipped — fetching the recent feed would stamp today's obs onto a past date. Returned obs
+    are filtered to ``win`` so nothing outside the target window leaks in.
+    """
+    if win.end_utc <= datetime.now(UTC) - timedelta(hours=_AWC_FALLBACK_HOURS):
+        logger.info(
+            "AWC fallback skipped for %s: window ending %s predates the ~%dh recent feed "
+            "(backfill — no wrong-date obs)",
+            station,
+            win.end_utc.isoformat(),
+            _AWC_FALLBACK_HOURS,
+        )
+        return []
     try:
         resp = await client.get(
             _AWC_METAR_BASE,
-            params={"ids": station, "format": "json", "hours": 14},
+            params={"ids": station, "format": "json", "hours": _AWC_FALLBACK_HOURS},
             headers={"User-Agent": _USER_AGENT},
         )
         resp.raise_for_status()
@@ -322,8 +288,8 @@ async def _fetch_awc_fallback(
     for ob in data or []:
         temp_c = ob.get("temp")
         ts = _coerce_ts(ob.get("reportTime") or ob.get("obsTime"))
-        if temp_c is None or ts is None:
-            continue
+        if temp_c is None or ts is None or not win.contains(ts):
+            continue  # filter to the target window — no wrong-date leak
         try:
             rows.append((ts, celsius_to_fahrenheit(float(temp_c))))
         except (TypeError, ValueError):
@@ -339,11 +305,8 @@ def store_daily_high(
 ) -> int:
     """Persist a daily-high label via the SINGLE audited writer path (D-10/D-11).
 
-    Routes through :func:`weatherquant.ingest.writer.insert_observation` with ``source='asos'``
-    — never a hand-rolled Core insert. ``available_at`` is the obs REPORT time (the reading
-    that produced the max), NOT ``now()`` and NOT the window edge (D-09); the CLI disagreement
-    flag is preserved in ``detail`` so the data-quality event is queryable (D-16). Falls back
-    to ``window_end`` for ``available_at`` only when no in-window reading exists (empty label).
+    ``available_at`` is the obs report time (the max reading), not ``now()`` (D-09), falling
+    back to ``window_end`` only for an empty label; the CLI flag is kept in ``detail`` (D-16).
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
@@ -368,11 +331,11 @@ def store_daily_high(
 
 
 __all__ = [
+    "SOURCE",
     "DailyHigh",
+    "celsius_to_fahrenheit",
     "daily_high",
     "daily_high_from_obs",
     "fetch_asos_obs",
     "store_daily_high",
-    "celsius_to_fahrenheit",
-    "SOURCE",
 ]

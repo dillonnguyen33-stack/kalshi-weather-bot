@@ -273,6 +273,34 @@ async def test_seq_gap_resubscribes_for_fresh_ws_snapshot():
     assert http.calls == []
 
 
+async def test_malformed_frame_is_skipped_and_feed_survives():
+    """A single malformed (non-JSON) frame is dropped; good frames after it still apply.
+
+    Pre-fix, an unguarded ``json.loads`` raised ``JSONDecodeError`` out of the delta loop and the
+    feed coroutine died with no reconnect. The decode is now guarded: a bad frame is skipped (not
+    reconnected over) and the contiguous delta that follows still reaches on_book.
+    """
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS(
+        [_ws_snapshot(1), "this is not json{", _ws_delta(2)], close_after=False
+    )
+    connector = _MockConnector([conn1])
+
+    captured = []
+    await run_feed(
+        [_TICKER],
+        _signer,
+        http=http,
+        on_book=lambda t, b: captured.append(b.seq),
+        ws_connect=connector,
+        max_reconnects=1,
+    )
+
+    # snapshot(1) applied, bad frame dropped, delta(2) still applied after it.
+    assert captured == [1, 2]
+    assert http.calls == []
+
+
 async def test_reconnect_resubscribes():
     """A reconnect re-subscribes on the new connection (W3 — WS-seq, no REST resnapshot)."""
     http = _MockHttp(_FP_PAYLOAD)

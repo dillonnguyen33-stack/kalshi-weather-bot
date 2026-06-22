@@ -1,34 +1,23 @@
 """Single source for the append-only ledger enforcement DDL (D-10).
 
-The append-only guarantee is enforced structurally by PostgreSQL: a shared
-``raise_append_only()`` PL/pgSQL function plus per-table triggers that raise on any
-UPDATE, DELETE, or TRUNCATE. This module is the ONE place that DDL is written; both
-:mod:`weatherquant.db.models` (via ``metadata.create_all`` DDL events) and the Alembic
-migration consume the strings produced here, so the migrated schema and the
-``create_all`` schema are guaranteed identical — there is no hand-duplicated SQL to
-drift apart.
+A shared ``raise_append_only()`` PL/pgSQL function plus per-table triggers raise on any
+UPDATE, DELETE, or TRUNCATE. The ONE place this DDL is written; both
+:mod:`weatherquant.db.models` (via ``create_all`` events) and the Alembic migration
+consume these strings, so the two schemas cannot drift.
 
-Why a STATIC raise message (no ``%`` placeholder): ``sqlalchemy.DDL`` runs
-``statement % context`` for substitution, so a literal ``%`` in a ``sa.DDL`` body has to
-be escaped as ``%%``, while ``op.execute`` in a migration takes the string verbatim.
-Keeping the RAISE message a fixed string with NO ``%`` eliminates that escaping
-divergence entirely — the exact same SQL string is safe in both call sites.
-
-Why BEFORE triggers (not DO INSTEAD rewrite rules): a rewrite rule on a table suppresses
-the row-count / RETURNING tag of OTHER commands (an INSERT would then report
-``rowcount -1``), whereas a BEFORE trigger leaves INSERT semantics untouched and still
-rejects the forbidden mutations with a clear exception.
-
-Why a per-statement TRUNCATE trigger in addition to the per-row UPDATE/DELETE trigger:
-``BEFORE UPDATE OR DELETE FOR EACH ROW`` does NOT fire on ``TRUNCATE`` (TRUNCATE removes
-rows without per-row processing), so without a dedicated ``BEFORE TRUNCATE ... FOR EACH
-STATEMENT`` trigger a ``TRUNCATE`` would silently wipe the append-only ledger.
+Load-bearing notes:
+* STATIC raise message, NO ``%``: ``sa.DDL`` runs ``statement % context`` (a literal
+  ``%`` would need ``%%``) while ``op.execute`` takes the string verbatim — a fixed
+  no-``%`` message is safe identically in both call sites.
+* BEFORE triggers, not DO INSTEAD rewrite rules: a rewrite rule would suppress INSERT's
+  rowcount/RETURNING tag; a BEFORE trigger leaves INSERT untouched.
+* Separate per-statement TRUNCATE trigger: ``BEFORE UPDATE OR DELETE FOR EACH ROW`` does
+  NOT fire on TRUNCATE, which would otherwise silently wipe the ledger.
 """
 
 from __future__ import annotations
 
-# The five append-only ledger tables (D-10). Kept as an explicit tuple so the install
-# order is deterministic and both consumers iterate the identical set.
+# The five append-only ledger tables (D-10). Explicit tuple for deterministic install order.
 LEDGER_TABLES: tuple[str, ...] = (
     "forecasts",
     "observations",
@@ -52,12 +41,9 @@ DROP_RAISE_FUNCTION_SQL: str = "DROP FUNCTION IF EXISTS raise_append_only();"
 def create_trigger_sql(table: str) -> tuple[str, ...]:
     """Return the CREATE TRIGGER statements that guard ``table`` (D-10).
 
-    Two triggers per table:
-
-    * ``<table>_append_only`` — ``BEFORE UPDATE OR DELETE ... FOR EACH ROW``: rejects
-      row-level mutations while leaving INSERT semantics untouched.
-    * ``<table>_no_truncate`` — ``BEFORE TRUNCATE ... FOR EACH STATEMENT``: rejects
-      TRUNCATE, which the per-row trigger does not catch.
+    Two per table: ``<table>_append_only`` (BEFORE UPDATE OR DELETE FOR EACH ROW) and
+    ``<table>_no_truncate`` (BEFORE TRUNCATE FOR EACH STATEMENT — the per-row trigger
+    does not catch TRUNCATE).
     """
     return (
         f'CREATE TRIGGER "{table}_append_only" '
@@ -78,9 +64,9 @@ def drop_trigger_sql(table: str) -> tuple[str, ...]:
 
 
 __all__ = [
-    "LEDGER_TABLES",
     "CREATE_RAISE_FUNCTION_SQL",
     "DROP_RAISE_FUNCTION_SQL",
+    "LEDGER_TABLES",
     "create_trigger_sql",
     "drop_trigger_sql",
 ]

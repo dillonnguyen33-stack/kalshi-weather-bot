@@ -146,14 +146,21 @@ Weatherquant is a probabilistic forecasting system that prices bets on Kalshi da
 
 ## Conventions
 
-Conventions not yet established. Will populate as patterns emerge during development.
+- Decision rationale is single-sourced in `docs/DECISIONS.md`; modules cite a decision by a
+  **subtree-local** id (the same `D-01` means different things in core vs `calibrate/` vs `price/`)
+  plus a one-line WHY. Docstrings carry the WHY, not WHAT-narration.
+- Guarded invariants (enforced by `tests/`): pure-NumPy in `calibrate/`+`price/` (no scipy/sklearn),
+  no runtime DST tooling, no `market` import into `price/`, paper-only (no live orders).
 <!-- GSD:conventions-end -->
 
 <!-- GSD:architecture-start source:ARCHITECTURE.md -->
 
 ## Architecture
 
-Architecture not yet mapped. Follow existing patterns found in the codebase.
+One-way dependency spine, no import cycles: `time`/`registry` → `ingest` (one orchestrator code
+path, live==backfill) → `calibrate` (EMOS/NGR fits) → `price` (`blend`/`fee`/`buckets` CDF +
+`ticker` parsing) ; `market/` (paper book/CLV) and the `cli/` package (one submodule per
+subcommand) sit at the edges. `db/` is the shared audited-writer ledger.
 <!-- GSD:architecture-end -->
 
 <!-- GSD:skills-start source:skills/ -->

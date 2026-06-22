@@ -1,31 +1,11 @@
 """NOAA GRIB core (ING-01/02) — Herbie byte-range fetch + cfgrib decode + nearest-point snap.
 
-This is the single highest-risk module in Phase 2 (the STATE.md blocker) and the I/O edge
-where untrusted NOAA GRIB bytes become a trusted ``np.ndarray``. Four responsibilities:
-
-* :func:`fetch_t2m` — use Herbie to discover the S3 object, log the resolved key + byte
-  range + selected ``.idx`` record, subset ``:TMP:2 m`` (~1 MB, NEVER the ~700 MB full
-  file), decode with cfgrib, and return a :class:`T2MField` (plain ``np.ndarray`` payload).
-* :func:`decode_t2m` — decode an already-downloaded GRIB2 file (the offline test path;
-  also the shared decode used by :func:`fetch_t2m`). Asserts decoded units == ``"K"``.
-* :func:`snap_to_station` — nearest-grid-point snap (haversine ``argmin``) on the 2-D
-  latitude/longitude arrays, working for BOTH Lambert (HRRR/NBM, 2-D coords) and regular
-  lat/lon (GFS/GEFS, 1-D coords broadcast to 2-D) grids. Returns ``(temp_kelvin,
-  distance_m)`` and logs ``grid_distance_m``.
-* :func:`lead0_sanity_check` — the lead-0 acceptance probe: the analysis-time forecast must
-  match contemporaneous ASOS within 3 °C (4 °C for DEN, per RESEARCH Pitfall 4); a breach
-  raises a loud error.
-
-THE BOUNDARY (D-02). xarray / cfgrib NEVER leave this module — the decoded field crosses
-out as a plain :class:`T2MField` whose ``.values`` is a NumPy array. No xarray ``Dataset``
-appears in any public return annotation. THE UNIT GUARD (D-03 / Pitfall 3): the decode
-asserts the cfgrib ``units`` attribute is exactly ``"K"`` before the field is trusted;
-forecasts are Kelvin-only and °F never enters this path.
-
-GEFS member mapping (D-05): ``c00`` -> ``member=0``; ``p01..p30`` -> ``member=1..30``;
-deterministic models (HRRR/GFS/NBM) write ``member=0``. The sync Herbie+cfgrib decode is
-CPU-bound; callers on the async loop run :func:`fetch_t2m` in a thread executor (D-14), but
-the function itself stays sync and is unit-tested against the offline vendored fixtures.
+The I/O edge where untrusted GRIB bytes become a trusted ``np.ndarray``: fetch/decode the
+``:TMP:2 m`` subset, snap to the nearest grid point, and probe lead-0 sanity. xarray/cfgrib
+never leave this module (the field crosses out as a plain :class:`T2MField`), the decode
+asserts units == ``"K"``, and GEFS members map c00→0 / p01..p30→1..30 (D-02/D-03/D-05; see
+docs/DECISIONS.md). The sync decode is CPU-bound; async callers run :func:`fetch_t2m` off-loop
+(D-14).
 """
 
 from __future__ import annotations
@@ -33,7 +13,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
@@ -60,16 +40,20 @@ _LEAD0_TOLERANCE_C_DEN = 4.0
 #   c00 (control) -> 0 ; p01..p30 -> 1..30 ; deterministic models -> 0.
 _GEFS_DETERMINISTIC_MEMBER = 0
 
+# Egress guard: the ``:TMP:2 m`` .idx search normally matches exactly ONE record (~1 MB). A
+# Herbie default/search regression that matched the whole inventory would silently pull the
+# ~700 MB full file. Refuse the download above this many records (a little slack for variants).
+_MAX_T2M_RECORDS = 4
+
 
 @dataclass(frozen=True)
 class T2MField:
     """Decoded 2-m temperature field at the I/O edge — NumPy only, no xarray (D-02).
 
     Attributes:
-        values: the 2-D temperature field in Kelvin (``np.ndarray``, shape ``(ny, nx)``).
-        lat2d: 2-D latitude array aligned with ``values`` (degrees north).
-        lon2d: 2-D longitude array aligned with ``values`` (degrees east, may be 0..360).
-        units: the decoded unit string — asserted ``"K"`` at decode time (D-03).
+        values: 2-D Kelvin field, shape ``(ny, nx)``.
+        lat2d/lon2d: 2-D coords aligned with ``values`` (lon may be 0..360).
+        units: decoded unit string — asserted ``"K"`` at decode time (D-03).
     """
 
     values: FloatArray
@@ -81,9 +65,8 @@ class T2MField:
 def member_to_axis(member: str) -> int:
     """Map a Herbie GEFS member label to the ``forecasts.member`` axis (D-05).
 
-    ``"c00"`` -> 0 (control); ``"p01".."p30"`` -> 1..30. Any other label (deterministic
-    models, ``avg``/``spr``, or an explicit control) resolves to 0. Never a silent wrong
-    index — an out-of-range perturbation label raises ``ValueError``.
+    ``c00``/``avg``/``spr``/``control`` → 0; ``p01..p30`` → 1..30. An out-of-range
+    perturbation label raises ``ValueError`` (never a silent wrong index).
     """
     member = member.lower()
     if member in ("c00", "", "avg", "mean", "spr", "control"):
@@ -97,11 +80,9 @@ def member_to_axis(member: str) -> int:
 
 
 def _to_2d(lat: FloatArray, lon: FloatArray, shape: tuple[int, int]) -> tuple[FloatArray, FloatArray]:
-    """Broadcast coordinate arrays to 2-D aligned with the field (Pitfall 2).
+    """Broadcast coordinate arrays to 2-D aligned with the field so one snap works for both grid types (Pitfall 2).
 
-    HRRR/NBM are Lambert: cfgrib already exposes 2-D ``latitude``/``longitude``. GFS/GEFS
-    are regular lat/lon: cfgrib exposes 1-D coords that must be meshed to 2-D so the same
-    haversine ``argmin`` works for both grid types.
+    HRRR/NBM Lambert coords are already 2-D; GFS/GEFS regular 1-D coords are meshed to 2-D.
     """
     if lat.ndim == 2 and lon.ndim == 2:
         return lat, lon
@@ -117,11 +98,9 @@ def _to_2d(lat: FloatArray, lon: FloatArray, shape: tuple[int, int]) -> tuple[Fl
 def _open_t2m_field(path: Path) -> T2MField:
     """Open a GRIB2 file with cfgrib and extract the 2-m temperature as a :class:`T2MField`.
 
-    xarray/cfgrib are confined to THIS private helper (D-02) — the labeled DataArray is
-    converted to plain ``np.ndarray`` here and never crosses out; callers receive only the
-    NumPy-backed :class:`T2MField`. The ``indexpath=""`` keeps cfgrib from writing a sidecar
-    ``.idx`` next to the (possibly read-only) vendored fixture. The Kelvin units guard
-    (Pitfall 3) runs here so a non-Kelvin field is rejected before any NumPy leaves.
+    Confines xarray/cfgrib to this helper (D-02), converting to ``np.ndarray`` at the edge;
+    ``indexpath=""`` avoids a sidecar ``.idx`` next to a read-only fixture, and the Kelvin
+    units guard runs here before any NumPy leaves (Pitfall 3).
     """
     import xarray as xr  # imported lazily so the boundary stays inside this module (D-02).
 
@@ -135,10 +114,9 @@ def _open_t2m_field(path: Path) -> T2MField:
     da = ds["t2m"]
     units = str(da.attrs.get("units", ""))
     if units != "K":
-        # Pitfall 3: a non-Kelvin forecast field is a hard error — °F/°C must never enter
-        # the Kelvin-only forecast path (D-07). A CorrectnessError (UnitError) so the
-        # orchestrator fails LOUD instead of degrading it to a silent skip (WR-05). Still a
-        # ValueError ("units must be 'K'") so the existing units-boundary test holds.
+        # Pitfall 3: a non-Kelvin field is a hard error (D-07). A CorrectnessError (UnitError)
+        # so the orchestrator fails loud, never a silent skip (WR-05); still a ValueError so the
+        # units-boundary test holds.
         raise UnitError(
             f"decoded TMP:2 m units must be 'K' (Kelvin-only forecast path, D-03/D-07); "
             f"got units={units!r}"
@@ -153,12 +131,7 @@ def _open_t2m_field(path: Path) -> T2MField:
 
 
 def decode_t2m(path: str | Path) -> T2MField:
-    """Decode a GRIB2 file to a Kelvin :class:`T2MField` (D-02 / D-03).
-
-    Thin public wrapper over :func:`_open_t2m_field`: asserts the cfgrib ``units`` attribute
-    is exactly ``"K"`` (Pitfall 3), converts the labeled DataArray to a plain ``np.ndarray``
-    at the edge, and broadcasts the coordinate arrays to 2-D so the snap works for both
-    Lambert and lat/lon grids. No xarray object crosses this public boundary (D-02).
+    """Decode a GRIB2 file to a Kelvin :class:`T2MField`, asserting units == ``"K"`` (D-02 / D-03).
 
     Raises:
         ValueError: if the file has no ``t2m`` variable or its units are not ``"K"``.
@@ -167,10 +140,10 @@ def decode_t2m(path: str | Path) -> T2MField:
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: FloatArray, lon2: FloatArray) -> FloatArray:
-    """Great-circle distance (meters) from one point to every grid cell (vectorized).
+    """Great-circle distance (meters) from one point to every grid cell, vectorized.
 
-    Longitudes are normalized to [-180, 180) before the difference so a 0..360 GFS grid and
-    a negative station longitude compare correctly (Pitfall 2 — wrong-cell snaps otherwise).
+    Longitudes are normalized to [-180, 180) so a 0..360 grid and a negative station longitude
+    compare correctly (Pitfall 2).
     """
     lat1r = math.radians(lat1)
     lon1r = math.radians(((lon1 + 180.0) % 360.0) - 180.0)
@@ -190,23 +163,14 @@ def snap_to_station(
     lon: float,
     max_distance_m: float | None = None,
 ) -> tuple[float, float]:
-    """Nearest-grid-point snap to ``(lat, lon)`` on the 2-D coords (D-03 / Pitfall 2).
-
-    Computes the haversine distance from the station to EVERY grid cell on the 2-D
-    latitude/longitude arrays (works for Lambert HRRR/NBM and regular GFS/GEFS) and returns
-    the temperature at the closest cell plus that distance. Logs ``grid_distance_m``.
+    """Nearest-grid-point snap to ``(lat, lon)`` via haversine ``argmin`` (D-03 / Pitfall 2).
 
     Args:
-        field: a decoded :class:`T2MField`.
-        lat: station latitude (degrees north).
-        lon: station longitude (degrees east; negative West is fine — normalized internally).
-        max_distance_m: optional sane-bound assertion. A ~3 km HRRR/NBM grid should snap
-            within a few km; GFS 0.25° / GEFS 0.5° are coarser. A snap farther than this
-            raises (a bad station coord / grid mislabel — Pitfall 2). ``None`` disables.
+        max_distance_m: optional sane-bound; a snap farther than this raises (bad coord / grid
+            mislabel, Pitfall 2). ``None`` disables.
 
     Returns:
-        ``(temp_kelvin, distance_m)`` — the Kelvin value at the nearest cell and the
-        great-circle distance (meters) from the station to that cell.
+        ``(temp_kelvin, distance_m)`` at the nearest cell.
     """
     dist = _haversine_m(lat, lon, field.lat2d, field.lon2d)
     flat_idx = int(np.argmin(dist))
@@ -239,11 +203,10 @@ def snap_city(
     *,
     max_distance_m: float | None = None,
 ) -> tuple[float, float, float, float]:
-    """Snap ``field`` to a registry city's Kalshi station (D-03).
+    """Snap ``field`` to a registry city's Kalshi station, returning the forecast-row fields (D-03).
 
-    Resolves the station lat/lon via :func:`weatherquant.registry.get_city` (raises
-    ``KeyError`` on an unknown code — ASVS V5, never a silent default) and returns
-    ``(temp_kelvin, station_lat, station_lon, grid_distance_m)`` for the forecast row.
+    Resolves the station via :func:`get_city` (raises ``KeyError`` on unknown — ASVS V5) and
+    returns ``(temp_kelvin, station_lat, station_lon, grid_distance_m)``.
     """
     city = get_city(city_code)
     temp_kelvin, distance_m = snap_to_station(
@@ -259,27 +222,18 @@ def lead0_sanity_check(
     tolerance_c: float | None = None,
     city_code: str | None = None,
 ) -> None:
-    """Assert the lead-0 forecast matches contemporaneous ASOS (D-04 / Pitfall 4).
+    """Assert the lead-0 forecast matches contemporaneous ASOS, else fail loud (D-04 / Pitfall 4).
 
-    A model analysis (lead 0) is constrained by assimilated obs and should sit within a few
-    degrees of the station. A breach is almost always a wrong station snap / unit error /
-    grid mislabel (often 5-15 °C off; a K-vs-°C swap is ~250 °C off), so it raises LOUDLY
-    rather than letting corrupt data into calibration.
-
-    Both temperatures are Kelvin (a Kelvin difference equals a Celsius difference, so the
-    tolerance is in °C directly). Compare at the SAME instant (the caller snaps ASOS to the
-    analysis hour).
+    Both temps are Kelvin (so the °C tolerance applies directly) and compared at the same
+    instant; a breach is almost always a wrong snap / unit / grid error.
 
     Args:
-        forecast_k: the lead-0 forecast temperature (Kelvin).
-        asos_k: the contemporaneous ASOS observation at the analysis hour (Kelvin).
-        tolerance_c: explicit tolerance override (°C). If ``None``, defaults to 3 °C, or
-            4 °C when ``city_code == "DEN"`` (the authorized wide band, logged).
-        city_code: optional city; ``"DEN"`` relaxes the default tolerance to 4 °C.
+        tolerance_c: override (°C). ``None`` → 3 °C, or 4 °C for ``city_code == "DEN"`` (logged).
+        city_code: optional; ``"DEN"`` relaxes the default tolerance to 4 °C.
 
     Raises:
-        SanityError: if ``|forecast_k - asos_k|`` exceeds the tolerance (loud breach). It is a
-            ``CorrectnessError`` (so the orchestrator fails loud, WR-05) and a ``ValueError``.
+        SanityError: if ``|forecast_k - asos_k|`` exceeds the tolerance. A ``CorrectnessError``
+            (orchestrator fails loud, WR-05) and a ``ValueError``.
     """
     if tolerance_c is None:
         if city_code == "DEN":
@@ -308,6 +262,22 @@ def lead0_sanity_check(
     )
 
 
+def _assert_subset_inventory(inventory: object, model: str) -> int:
+    """Guard that the ``:TMP:2 m`` .idx match is a small byte-range subset, not the whole file.
+
+    Returns the record count (for logging). Raises :class:`SanityError` when the match is empty
+    or implausibly large — a broad match would pull the ~700 MB full file, not the ~1 MB subset.
+    """
+    n = len(inventory)  # type: ignore[arg-type]  # a list / pandas DataFrame of matched .idx records
+    if not 0 < n <= _MAX_T2M_RECORDS:
+        raise SanityError(
+            f"refusing GRIB fetch for model={model}: ':TMP:2 m' .idx matched {n} records "
+            f"(expected 1..{_MAX_T2M_RECORDS}) — a broad match would pull the full ~700 MB file, "
+            "not the ~1 MB byte-range subset (egress guard)"
+        )
+    return n
+
+
 def fetch_t2m(
     model: str,
     cycle_init: datetime,
@@ -316,32 +286,23 @@ def fetch_t2m(
 ) -> T2MField:
     """Fetch + decode the ``:TMP:2 m`` byte-range subset for one model run (ING-01/02).
 
-    Uses Herbie to discover the S3 object, logs the resolved S3 key + byte range + selected
-    ``.idx`` record (D-01), subsets ONLY ``:TMP:2 m`` (~1 MB, never the full ~700 MB file),
-    and decodes the subset with cfgrib via :func:`decode_t2m`. Returns a Kelvin
-    :class:`T2MField` (NumPy at the edge, D-02). This is the sync, CPU-bound path; async
-    callers run it in a thread executor (D-14). It is NOT exercised by the offline unit
-    tests (which call :func:`decode_t2m` on the vendored fixtures directly) — it is the live
-    ingestion entry point 02-05 schedules.
+    Discovers the S3 object via Herbie, logs the resolved key + byte range (D-01), subsets only
+    ``:TMP:2 m`` (~1 MB, never the ~700 MB full file), and decodes via :func:`decode_t2m`. The
+    sync, CPU-bound live path (async callers run it off-loop, D-14); the offline tests call
+    :func:`decode_t2m` directly instead.
 
     Args:
-        model: ``"hrrr"`` / ``"gfs"`` / ``"gefs"`` / ``"nbm"``.
-        cycle_init: the model run init time (UTC).
-        fxx: forecast lead hours.
-        member: GEFS member label (``"c00"``/``"p01".."p30"``); ignored for deterministic
-            models. See :func:`member_to_axis` for the member -> axis mapping (D-05).
+        member: GEFS member label, ignored for deterministic models (see :func:`member_to_axis`).
 
     Returns:
         A decoded Kelvin :class:`T2MField` for the requested run.
     """
     from herbie import Herbie  # lazy import: keep Herbie off the offline test path.
 
-    # Herbie's _validate() compares the run date against a tz-NAIVE pandas Timestamp
-    # (``pd.Timestamp.utcnow().tz_localize(None)``), so a tz-aware ``cycle_init`` raises
-    # "Cannot compare tz-naive and tz-aware timestamps". Herbie treats the run time as UTC
-    # implicitly; normalize an aware datetime to a naive UTC instant before handing it over.
+    # Herbie's _validate() compares against a tz-naive Timestamp, so an aware ``cycle_init``
+    # raises "Cannot compare tz-naive and tz-aware"; normalize to a naive UTC instant first.
     if cycle_init.tzinfo is not None:
-        herbie_date = cycle_init.astimezone(timezone.utc).replace(tzinfo=None)
+        herbie_date = cycle_init.astimezone(UTC).replace(tzinfo=None)
     else:
         herbie_date = cycle_init
 
@@ -350,26 +311,36 @@ def fetch_t2m(
         h_kwargs["member"] = member
     herbie = Herbie(herbie_date, **h_kwargs)
 
-    # Log the resolved S3 key + the selected .idx record / byte range (D-01) before fetch.
+    # Probe the .idx, GUARD the subset size (egress), then log — before the byte-range fetch.
     try:
         inventory = herbie.inventory(":TMP:2 m")
+    except Exception:  # noqa: BLE001 - a transient .idx probe failure must not block the fetch.
+        # The egress backstop is the errors="raise" on download() below: with Herbie's DEFAULT
+        # errors="warn", a missing .idx silently downloads the full ~700 MB file ("I will download
+        # the full file because I cannot subset"). errors="raise" turns that into a ValueError, so
+        # a probe failure can never fall through to an unguarded full fetch.
+        logger.warning(
+            "herbie .idx inventory probe failed for model=%s; egress guard falls back to "
+            "download(errors='raise') (a missing .idx fails loud, never a full-file fetch)",
+            model,
+        )
+    else:
+        n_records = _assert_subset_inventory(inventory, model)  # raises on a broad/empty match
         logger.info(
-            "herbie resolved model=%s cycle=%s fxx=%s member=%s grib_source=%s "
-            "idx_records=%d",
+            "herbie resolved model=%s cycle=%s fxx=%s member=%s grib_source=%s idx_records=%d",
             model,
             cycle_init.isoformat(),
             fxx,
             member if model == "gefs" else _GEFS_DETERMINISTIC_MEMBER,
             getattr(herbie, "grib", None),
-            len(inventory),
+            n_records,
         )
-    except Exception:  # noqa: BLE001 - logging probe must never block the fetch.
-        logger.warning("herbie .idx inventory probe failed for model=%s; proceeding", model)
 
-    # Download ONLY the :TMP:2 m byte-range subset (~1 MB, never the full ~700 MB file). The
-    # ``search`` argument is the GRIB message filter; herbie-data 2026.3.0 dropped the old
-    # ``remove_grib`` kwarg, so the subset file is kept by default and decoded below.
-    local_path = herbie.download(":TMP:2 m")
+    # Download ONLY the :TMP:2 m byte-range subset (~1 MB). herbie-data 2026.3.0 dropped the
+    # old ``remove_grib`` kwarg, so the subset file is kept by default and decoded below.
+    # errors="raise" (vs Herbie's default "warn") is the egress guard's teeth: a subset request
+    # with a missing .idx raises instead of silently fetching the full ~700 MB file.
+    local_path = herbie.download(":TMP:2 m", errors="raise")
     return decode_t2m(local_path)
 
 
@@ -377,8 +348,8 @@ __all__ = [
     "T2MField",
     "decode_t2m",
     "fetch_t2m",
-    "snap_to_station",
-    "snap_city",
     "lead0_sanity_check",
     "member_to_axis",
+    "snap_city",
+    "snap_to_station",
 ]

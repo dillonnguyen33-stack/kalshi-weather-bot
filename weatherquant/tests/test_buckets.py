@@ -28,8 +28,8 @@ from weatherquant.price.buckets import (
     bucket_prob,
     bucket_probs,
     integers_in_bucket,
-    parse_ticker,
 )
+from weatherquant.price.ticker import parse_ticker
 
 # ---------------------------------------------------------------------------
 # -k sum : CDF differencing + centralized _HALF + ladder-sum property

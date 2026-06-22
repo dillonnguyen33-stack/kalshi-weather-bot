@@ -1,31 +1,17 @@
 """The shared params->Gaussian link (D-14) and the CRPS chain-rule to (a,b,c,d) (D-02).
 
-This module is the SINGLE source of truth for turning the 4 EMOS/NGR parameters into a
-predictive Gaussian. :func:`predict` is the link Phase 4 reuses **verbatim** when it blends
-and prices (D-14) — so the calibration fit and the downstream pricing apply the exact same
-``params -> (mu, sigma)`` mapping, with no risk of a divergent re-implementation.
+Single source of truth for the 4 EMOS/NGR params → predictive Gaussian. :func:`predict` is
+reused VERBATIM by Phase-4 blending/pricing so the fit and pricing never diverge (D-14). The
+NGR parameterization (D-02): ``mu = a + b*m``; ``var = max(sigma_floor^2, c^2 + d^2*s2)``.
+Squaring c, d makes variance non-negative by construction; ``s2 == 0`` (deterministic) leaves
+``d`` inactive (gradient ≡ 0) — expected, not a bug (D-02).
 
-The NGR parameterization (D-02) is::
+LOAD-BEARING (Pitfall 1 / D-02): :func:`param_grads` chain-rules the CRPS gradient onto
+``(a,b,c,d)``, but ``var = max(...)`` has a kink — when the floor is ACTIVE
+(``var_raw <= sigma_floor^2``) σ is constant so ``dsigma/dc = dsigma/dd = 0`` MUST be masked,
+else the optimizer takes a phantom step it can never escape.
 
-    mu      = a + b * m                              (m = ensemble mean forecast, °F)
-    var_raw = c^2 + d^2 * s2                          (s2 = ensemble variance)
-    var     = max(sigma_floor^2, var_raw)            (the σ-floor clamp, D-09)
-    sigma   = sqrt(var)
-
-Squaring ``c`` and ``d`` makes the variance non-negative *by construction* — no constrained
-optimization, no projection (D-02). The additive ``sigma_floor`` blocks the degenerate
-over-confidence that would otherwise blow up Phase-4 Kelly sizing (D-09). For a deterministic
-single-member model ``s2 == 0`` ⇒ ``var = c^2`` a fitted constant and ``d`` is inactive
-(its gradient is identically 0) — **expected, not a bug** (D-02 / RESEARCH Pitfall 2).
-
-:func:`param_grads` chain-rules the closed-form CRPS gradient ``(d/dmu, d/dsigma)`` from
-:func:`weatherquant.calibrate.crps.crps_norm_grad` onto ``(a, b, c, d)`` for the per-stratum
-mean-CRPS objective. The subtle part is the clamp: ``var = max(...)`` is non-differentiable
-at the kink, so when the floor is ACTIVE (``var_raw <= sigma_floor^2``) ``sigma`` is constant
-and ``dsigma/dc = dsigma/dd = 0`` — the variance-param gradient must be masked to 0
-(RESEARCH Pitfall 1), or the optimizer takes a phantom step it can never escape.
-
-Pure NumPy + ``math`` only (via crps.py) — no scipy/sklearn (the AST guard enforces it).
+Pure NumPy + ``math`` only — no scipy/sklearn (the AST guard enforces it).
 """
 
 from __future__ import annotations
@@ -35,7 +21,7 @@ from numpy.typing import NDArray
 
 from weatherquant.calibrate.crps import crps_norm_grad
 
-__all__ = ["predict", "param_grads"]
+__all__ = ["param_grads", "predict"]
 
 # A params bundle is (a, b, c, d, sigma_floor): the 4 fitted EMOS params plus the σ-floor.
 Params = tuple[float, float, float, float, float]
@@ -48,11 +34,8 @@ def predict(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Reconstruct the predictive Gaussian ``(mu, sigma)`` from params (D-14, D-02).
 
-    The single shared params->Gaussian link, reused verbatim by Phase 4's blending/pricing
-    so calibration and pricing never diverge. ``params`` is ``(a, b, c, d, sigma_floor)``;
-    ``mean_f`` is the ensemble-mean forecast (°F) and ``var_f`` the ensemble variance
-    (``0`` for a deterministic model). Applies ``mu = a + b*mean_f`` and
-    ``sigma = sqrt(max(sigma_floor^2, c^2 + d^2*var_f))`` (the σ-floor clamp, D-09).
+    The shared link reused verbatim by Phase-4 pricing. ``params`` is ``(a, b, c, d, sigma_floor)``;
+    applies ``mu = a + b*mean_f`` and ``sigma = sqrt(max(sigma_floor^2, c^2 + d^2*var_f))`` (D-09).
     """
     a, b, c, d, sigma_floor = params
     mu = a + b * mean_f
@@ -74,17 +57,10 @@ def param_grads(
 ) -> NDArray[np.float64]:
     """Mean-CRPS gradient w.r.t. ``(a, b, c, d)`` over a stratum (D-02 chain-rule).
 
-    Chain-rules ``(d CRPS/d mu, d CRPS/d sigma)`` (from
-    :func:`weatherquant.calibrate.crps.crps_norm_grad`) onto the 4 EMOS params under the
-    D-02 link, returning ``np.array([g_a, g_b, g_c, g_d])`` averaged over the stratum's
-    samples (the mean-CRPS objective the optimizer minimizes).
-
-    Mean part: ``d mu/d a = 1`` and ``d mu/d b = m``. Variance part (floor INACTIVE):
-    ``d sigma/d c = c/sigma`` and ``d sigma/d d = d*s2/sigma``. When the σ-floor is ACTIVE
-    (``c^2 + d^2*s2 <= sigma_floor^2``) ``sigma`` is constant, so ``d sigma/d c`` and
-    ``d sigma/d d`` are masked to 0 (RESEARCH Pitfall 1). For ``s2 == 0`` (deterministic
-    model) ``g_d`` is identically 0 — expected (D-02). Verified end-to-end against finite
-    differences by ``tests/test_crps_gradient.py``.
+    Chain-rules the CRPS gradient onto the 4 EMOS params, returning ``[g_a, g_b, g_c, g_d]``
+    averaged over the stratum. When the σ-floor is ACTIVE (``c^2 + d^2*s2 <= sigma_floor^2``) σ
+    is constant, so ``dsigma/dc`` and ``dsigma/dd`` are masked to 0 (Pitfall 1; for ``s2 == 0``
+    ``g_d`` is identically 0 — expected). Verified by ``tests/test_crps_gradient.py``.
     """
     mu = a + b * m
     var_raw = c * c + d * d * s2

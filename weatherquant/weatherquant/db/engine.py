@@ -1,11 +1,8 @@
 """Engine + typed settings for the weatherquant ledger (D-09 / Pitfall 4 / ASVS V14).
 
-`DATABASE_URL` is loaded from the environment (a local, git-ignored `.env` in dev) via
-pydantic-settings and MUST use the ``postgresql+psycopg://`` dialect — psycopg v3, never
-the legacy psycopg-2 driver (D-09). A field validator rejects any other scheme at
-construction time (Pitfall 4). The URL is a secret: it is never logged or ``repr``'d
-(ASVS V14) — the ``Settings`` repr is overridden so an accidental log line cannot leak
-credentials.
+`DATABASE_URL` (from env / git-ignored `.env`) MUST use the ``postgresql+psycopg://``
+dialect (D-09); a validator rejects any other scheme. The URL is a secret, never
+logged or ``repr``'d (ASVS V14).
 """
 
 from __future__ import annotations
@@ -19,39 +16,28 @@ from sqlalchemy import Engine, create_engine
 # The one required SQLAlchemy dialect — psycopg v3, never the legacy psycopg2 (D-09).
 _REQUIRED_SCHEME = "postgresql+psycopg"
 
-# The locked single-position cap band (PROJECT.md risk constraint / D-13): the configured
-# max_position_fraction MUST land in [2%, 5%] of bankroll. The field validator rejects any
-# value outside this inclusive band at construction so the hard cap can never be configured
-# looser than policy (threat T-04-02).
+# Locked single-position cap band [2%, 5%] of bankroll (D-13; threat T-04-02).
 _MIN_POSITION_FRACTION = 0.02
 _MAX_POSITION_FRACTION = 0.05
 
-# The single source of truth for the default single-position cap (D-13): the conservative
-# end of the locked band. Both the ``Settings.max_position_fraction`` field default and
-# ``price.kelly.stake_fraction``'s ``cap`` default reference THIS one constant so they can
-# never drift apart (WR-A1). Any configured override still passes the band validator above.
+# Single source for the default single-position cap (D-13; WR-A1) — shared by the
+# Settings field default and price.kelly.stake_fraction's cap default so they can't drift.
 DEFAULT_POSITION_FRACTION = 0.025
 
-# The locked set of allowed execution modes (D-15). ``execution_mode`` gates whether any
-# (future, Gate-2) live order path is reachable; defaulting to ``paper`` and rejecting any
-# out-of-policy value at construction means a typo or an injected value can never silently
-# unlock a live path (threat T-05-02). The structural no-order-path guard lands in 05-03.
+# Locked set of allowed execution modes (D-15; threat T-05-02). Gates whether any live
+# order path is reachable; the structural no-order-path guard lands in 05-03.
 _ALLOWED_EXECUTION_MODES = frozenset({"paper", "live"})
 
-# The default execution mode (D-15): paper-trading only this milestone (Gate 1). The
-# operator never sets ``live`` until the Gate-1 statistical proof passes (Gate 2).
+# Default execution mode (D-15): paper-only this milestone (Gate 1).
 DEFAULT_EXECUTION_MODE = "paper"
 
 
 def require_psycopg3_scheme(url: str) -> None:
     """Raise ``ValueError`` unless ``url``'s dialect is exactly ``postgresql+psycopg``.
 
-    Single source for the Pitfall-4 / D-09 guard, consumed by the ``Settings`` validator,
-    the Alembic env, and the test conftest. The scheme is parsed from the part before
-    ``://`` and compared by EXACT equality — a substring check like ``'+psycopg' in
-    scheme`` wrongly accepts ``postgresql+psycopg2`` (the legacy driver), since
-    ``'+psycopg'`` is a prefix of ``'+psycopg2'``. The error never echoes the credential
-    (ASVS V14) — only the scheme is shown.
+    Single source for the Pitfall-4 / D-09 guard (Settings validator, Alembic env, test
+    conftest). EXACT-equality match — a substring check would wrongly accept the legacy
+    ``postgresql+psycopg2``. The error shows only the scheme, never the credential (ASVS V14).
     """
     scheme = url.split("://", 1)[0] if "://" in url else url
     if scheme != _REQUIRED_SCHEME:
@@ -62,14 +48,11 @@ def require_psycopg3_scheme(url: str) -> None:
 
 
 class Settings(BaseSettings):
-    """Typed application settings sourced from the environment / local ``.env``.
+    """Typed application settings from env / local ``.env``.
 
-    Phase-1 added ``database_url``; Phase-2 (02-01) adds the two ingestion secrets
-    ``anthropic_api_key`` (AFD forecaster-disagreement classification, D-13) and
-    ``wethr_api_key`` (Wethr.net bearer auth, ING-06). Both are nullable so ingestion
-    degrades gracefully when a key is absent (D-11) — the AFD/Wethr clients skip rather
-    than fail. The redacted ``__repr__``/``__str__`` below is a FIXED string, so adding
-    secret fields here can never leak them in a log line (ASVS V14, threat T-02-01).
+    Secret fields are nullable so ingestion degrades gracefully when a key is absent
+    (D-11). The redacted ``__repr__``/``__str__`` below is a FIXED string, so secret
+    fields can never leak in a log line (ASVS V14, threat T-02-01).
     """
 
     model_config = SettingsConfigDict(
@@ -82,33 +65,25 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     wethr_api_key: str | None = None
 
-    # Phase-4 money-path config (D-13). NOT secrets — these are policy numbers that may
-    # appear in a normal repr; they are deliberately NOT added to the redacted ``__repr__``
-    # below (that fixed string only hides credentials, ASVS V14).
+    # Phase-4 money-path config (D-13). NOT secrets — policy numbers, kept out of the repr.
     bankroll_usd: float = 500.0  # PROJECT.md constraint: the $500 paper-trading bankroll.
     max_position_fraction: float = DEFAULT_POSITION_FRACTION  # D-13: see DEFAULT_POSITION_FRACTION.
 
-    # Phase-5 Kalshi credentials (D-14). Both are SECRETS and nullable so the suite/config
-    # construct cleanly without a live key (the operator supplies them out-of-band before the
-    # live checkpoints in 05-02 / 05-05). ``kalshi_private_key_path`` is a filesystem PATH to
-    # the RSA private key OUTSIDE the repo — never the key material in ``.env``/repo (the loss
-    # is irrecoverable, the leak is account-level). Both are added to the redacted ``__repr__``
-    # below so neither can ever leak in a log line (ASVS V14, threat T-05-01).
+    # Phase-5 Kalshi credentials (D-14). SECRETS, nullable (supplied out-of-band before the
+    # live checkpoints). ``kalshi_private_key_path`` is a PATH to the RSA key OUTSIDE the repo,
+    # never key material in repo. Both added to the redacted ``__repr__`` (ASVS V14, T-05-01).
     kalshi_key_id: str | None = None
     kalshi_private_key_path: str | None = None
-    # D-15: execution policy. NOT a secret (kept out of the redacted repr, like bankroll_usd)
-    # but validated to the locked {paper, live} set below so it can never silently unlock a
-    # live order path. Defaults to paper this milestone (Gate 1).
+    # D-15: execution policy. NOT a secret (out of the repr) but validated to {paper, live}
+    # below so it can't silently unlock a live path. Defaults to paper (Gate 1).
     execution_mode: str = DEFAULT_EXECUTION_MODE
 
     @field_validator("database_url")
     @classmethod
     def _validate_psycopg3_scheme(cls, value: str) -> str:
-        """Reject any DATABASE_URL whose dialect is not exactly ``postgresql+psycopg``.
+        """Reject any DATABASE_URL whose dialect is not exactly ``postgresql+psycopg`` (D-09).
 
-        Delegates to the shared :func:`require_psycopg3_scheme` so the engine, the Alembic
-        env, and the test conftest all enforce the identical exact-match check (Pitfall 4
-        / D-09). A bare ``postgresql://`` or ``postgresql+psycopg2://`` URL is rejected.
+        Delegates to the shared :func:`require_psycopg3_scheme` (Pitfall 4).
         """
         require_psycopg3_scheme(value)
         return value
@@ -118,10 +93,8 @@ class Settings(BaseSettings):
     def _validate_position_cap_band(cls, value: float) -> float:
         """Reject any single-position cap outside the locked ``[0.02, 0.05]`` band (D-13).
 
-        Mirrors :meth:`_validate_psycopg3_scheme`'s fail-loud-at-construction shape. The cap
-        is the hard money-path invariant (PROJECT.md risk constraint): an out-of-range value
-        that silently raised position size is a money-path risk (threat T-04-02), so the cap
-        can never be configured looser than policy. ``0.02`` and ``0.05`` are accepted.
+        Fail-loud at construction: the cap can never be configured looser than policy
+        (threat T-04-02). ``0.02`` and ``0.05`` are accepted.
         """
         if not (_MIN_POSITION_FRACTION <= value <= _MAX_POSITION_FRACTION):
             raise ValueError(
@@ -136,11 +109,8 @@ class Settings(BaseSettings):
     def _validate_execution_mode(cls, value: str) -> str:
         """Reject any ``execution_mode`` not in the locked ``{paper, live}`` set (D-15).
 
-        Mirrors :meth:`_validate_position_cap_band`'s fail-loud-at-construction shape. The
-        mode gates whether any (future, Gate-2) live order path is reachable, so an out-of-
-        policy value (a typo like ``"live2"`` or an injected string) must never construct —
-        it could silently unlock a live path (threat T-05-02). ``"paper"``/``"live"`` pass;
-        the default is ``"paper"`` (this milestone never sets ``live``).
+        Fail-loud at construction: an out-of-policy value must never silently unlock a live
+        path (threat T-05-02). ``"paper"``/``"live"`` pass; the default is ``"paper"``.
         """
         if value not in _ALLOWED_EXECUTION_MODES:
             allowed = ", ".join(sorted(_ALLOWED_EXECUTION_MODES))
@@ -150,10 +120,8 @@ class Settings(BaseSettings):
         return value
 
     def __repr__(self) -> str:  # never leak credential-bearing fields (ASVS V14)
-        # Fixed string: no field VALUE is ever interpolated, so neither the URL nor the
-        # API keys / Kalshi credentials can leak through an accidental log/repr (threats
-        # T-02-01, T-05-01). execution_mode is policy (not a secret) so it stays OUT, like
-        # bankroll_usd / max_position_fraction.
+        # Fixed string: no field VALUE is interpolated, so no secret can leak via repr
+        # (threats T-02-01, T-05-01). Policy fields (execution_mode etc.) stay OUT too.
         return (
             "Settings(database_url=<redacted>, anthropic_api_key=<redacted>, "
             "wethr_api_key=<redacted>, kalshi_key_id=<redacted>, "
@@ -163,8 +131,13 @@ class Settings(BaseSettings):
     __str__ = __repr__
 
 
+@lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """Construct ``Settings`` from the environment / ``.env`` (fails loud if unset)."""
+    """Construct ``Settings`` from the environment / ``.env`` once per process (fails loud if unset).
+
+    Memoized (like :func:`get_engine`) so callers share one parsed config and the ``.env`` is read
+    once, not on every key lookup. ``cache_clear()`` is available for tests that repoint the env.
+    """
     return Settings()  # type: ignore[call-arg]  # populated from env by pydantic-settings
 
 
@@ -172,18 +145,11 @@ def get_settings() -> Settings:
 def get_engine() -> Engine:
     """Return the process-wide SQLAlchemy ``Engine`` bound to ``DATABASE_URL``.
 
-    Memoized: an ``Engine`` owns a connection pool, so every caller must share the one
-    instance. Without this, a per-cycle caller (e.g. an APScheduler ingestion job in
-    Phase 2+) would build a fresh pool — and re-read/re-validate ``.env`` — on each call.
-
-    The engine is built on the ``postgresql+psycopg://`` dialect. ``hide_parameters``
-    keeps bound values out of error logs; the connection URL itself is never logged.
-
-    ``execution_options(preserve_rowcount=True)`` is set on the engine so every INSERT
-    reports a real ``result.rowcount`` (1 for a single row) despite the implicit
-    ``RETURNING id`` on the ``Identity()`` PK (D-11 contract). Setting it on the app
-    engine here — rather than as an import-time global listener on the Engine class —
-    makes the behavior deterministic and not dependent on module import order.
+    Memoized so every caller shares the one connection pool (and one ``.env`` read).
+    ``hide_parameters`` keeps bound values out of error logs. ``preserve_rowcount``
+    makes every INSERT report a real ``result.rowcount`` despite the implicit
+    ``RETURNING id`` on the ``Identity()`` PK — set here deterministically, not as an
+    import-order-dependent global listener (D-11 contract).
     """
     settings = get_settings()
     return create_engine(

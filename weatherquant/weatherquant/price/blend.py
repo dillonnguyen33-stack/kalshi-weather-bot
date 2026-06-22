@@ -1,21 +1,11 @@
-"""Accuracy-weighted Gaussian Vincentization — the blend (PRC-01, D-01/D-02/D-03).
+"""Accuracy-weighted Gaussian Vincentization — the blend (D-01/D-02/D-03).
 
-Quantile-average the Phase-3 calibrated per-model Gaussians into ONE predictive Gaussian.
-For Gaussians, quantile averaging has the exact closed form
-``N(μ_blend = Σwᵢμᵢ, σ_blend = Σwᵢσᵢ)`` — a *weighted mean of the std-devs*, NOT
-``sqrt(Σwᵢσᵢ²)`` and NOT the (overdispersed) linear-mixture variance (D-01, RESEARCH
-Pitfall 2). This makes the σ-monotonicity invariant ``σ_blend ≤ max(σᵢ)`` true **by
-construction**, which ``tests/test_blend.py -k monoton`` guards.
+LOAD-BEARING NUMERICS: σ_blend = weighted MEAN of σ (Σwᵢσᵢ), NOT sqrt(Σwᵢσᵢ²) — the linear
+mix is overdispersed (D-01, Pitfall 2). This keeps σ_blend ≤ max(σᵢ) by construction.
 
-Per-model ``(μᵢ, σᵢ)`` come from :func:`weatherquant.calibrate.link.predict` reused verbatim
-(D-14/D-15) — this module never re-derives the params→Gaussian link. Accuracy weights derive
-from the per-stratum OOS CRPS Phase 3 persists (``crps_oos``): lower CRPS ⇒ higher weight,
-via normalized inverse-CRPS with a floor so no model fully dominates or drops (D-02). A
-missing model drops out and the survivors renormalize; a NULL-``crps_oos`` (pure-pooled fit)
-falls back to its pooled-parent CRPS or equal weight (D-03, RESEARCH Pitfall 4). ``crps_oos``
-is used only as a RELATIVE cross-model signal, never an absolute quality measure (Pitfall 5).
-
-Pure NumPy + stdlib ``math`` only — no scipy/sklearn (the AST guard enforces it).
+Per-model ``(μᵢ, σᵢ)`` come from :func:`weatherquant.calibrate.link.predict` (D-14/D-15).
+Weights are normalized inverse-CRPS over the present models' ``crps_oos`` (D-02/D-03; Pitfalls
+4/5). Pure NumPy + stdlib ``math`` only — no scipy/sklearn (AST guard).
 """
 
 from __future__ import annotations
@@ -25,18 +15,11 @@ from numpy.typing import NDArray
 
 __all__ = ["accuracy_weights", "blend_gaussians"]
 
-# --- Named operational constants (RESEARCH §Operational Defaults — never a magic number
-# inline; every LOW/MEDIUM knob is a module-level constant Phase 6 can audit/revisit). ---
-
-#: Lower bound on ``crps_oos`` in the inverse so a (near-)zero CRPS can't blow the weight up
-#: to ±inf. RESEARCH §Operational Defaults: ``w_i ∝ 1/max(crps_oos_i, ε)``. Small enough not
-#: to perturb realistic CRPS magnitudes (CRPS is in °F, ~O(1)).
+#: Floor on ``crps_oos`` in the inverse so a near-zero CRPS can't blow the weight to ±inf.
 CRPS_EPS: float = 1e-6
 
-#: Per-model weight floor applied BEFORE the final renormalize so no single model fully
-#: dominates or is fully dropped (RESEARCH §Operational Defaults — equal weights are hard to
-#: beat, so tilt gently; a floor keeps the ensemble diverse). For ``k`` present models the
-#: floor must satisfy ``k * W_MIN <= 1``; with the in-scope model set (≤ ~8) ``0.05`` is safe.
+#: Per-model weight floor applied BEFORE the final renormalize so no model dominates or drops.
+#: Needs ``k * W_MIN <= 1``; safe for the in-scope model set (≤ ~8).
 W_MIN: float = 0.05
 
 
@@ -47,29 +30,14 @@ def accuracy_weights(
     eps: float = CRPS_EPS,
     w_min: float = W_MIN,
 ) -> NDArray[np.float64]:
-    """Normalized inverse-CRPS weights with a floor (D-02/D-03, RESEARCH §Operational Defaults).
+    """Normalized inverse-CRPS weights over present models, with a pre-renormalize floor (D-02/D-03).
 
-    Turns the per-model OOS CRPS of the models PRESENT for a given ``(city, lead, month)``
-    into a weight vector that sums to 1, with lower ``crps_oos`` ⇒ higher weight via
-    normalized inverse-CRPS ``w_i ∝ 1/max(crps_oos_i, eps)``. A per-model floor ``w_min`` is
-    applied before the final renormalize so no model fully dominates or fully drops
-    (RESEARCH §Operational Defaults; equal weights are hard to beat → tilt gently). The floor
-    is PRE-renormalize, so it guarantees every present model keeps a strictly positive weight
-    but is an exact lower bound on the FINAL weight only while the floored sum ``≤ 1`` (with
-    ``W_MIN=0.05`` that holds for ``≤ 20`` present models — always true for the in-scope ≤ ~8);
-    past that the renormalizer can pull a model's final weight slightly below ``w_min``. Because
-    only the models present are passed in, the renormalize that closes this function is also
-    the dropped-model renormalization (D-03 / RESEARCH Pitfall 4): a missing model is simply
-    absent from ``crps_oos`` and the survivors' weights renormalize to sum to 1.
-
-    A NULL/NaN ``crps_oos`` entry (a pure-pooled fit has no own OOS score) falls back to the
-    supplied pooled-parent CRPS (``parent_crps[i]``) if finite, else to that model's
-    equal-weight share — never NaN, never a silent zero (D-03, threat T-04-04). If EVERY
-    present model is NULL (and no usable parent) the result is exactly equal weights.
-
-    ``crps_oos`` is used ONLY as a RELATIVE cross-model accuracy signal, never as an absolute
-    quality measure of the persisted (possibly season-pooled) params — its provenance is an
-    unpooled train-slice fit (RESEARCH Pitfall 5; ``evaluate.OOSResult`` docstring).
+    ``w_i ∝ 1/max(crps_oos_i, eps)``, renormalized to sum to 1; passing only present models
+    makes the renormalize double as the dropped-model renormalization (D-03; Pitfall 4). The
+    floor is PRE-renormalize: an exact lower bound on the final weight only while the floored
+    sum ``≤ 1`` (holds for the in-scope ≤ ~8 models). A NULL/NaN ``crps_oos`` falls back to a
+    finite ``parent_crps[i]``, else equal-weight share — never NaN/zero (D-03, T-04-04).
+    ``crps_oos`` is a RELATIVE cross-model signal only, never absolute quality (Pitfall 5).
 
     Parameters
     ----------
@@ -91,8 +59,7 @@ def accuracy_weights(
     if n == 0:
         raise ValueError("accuracy_weights requires at least one present model.")
 
-    # --- Resolve NULL/NaN entries (D-03). Substitute a finite pooled-parent CRPS where
-    # available; the still-NULL set is handled as equal-weight below. ---
+    # Resolve NULL/NaN entries (D-03): substitute a finite pooled-parent CRPS where available.
     null = ~np.isfinite(crps)
     if parent_crps is not None:
         parent = np.asarray(parent_crps, dtype=np.float64).ravel()
@@ -102,9 +69,8 @@ def accuracy_weights(
         crps = np.where(substitute, parent, crps)
         null = ~np.isfinite(crps)
 
-    # --- Normalized inverse-CRPS raw weights for the models with a usable CRPS. A NULL
-    # model gets the mean usable raw weight (its equal-weight share) so it neither dominates
-    # nor zeroes; if NO model is usable, every raw weight is equal → equal weights (D-03). ---
+    # Inverse-CRPS raw weights; a NULL model gets the mean usable raw weight, and if none is
+    # usable every raw weight is equal → equal weights (D-03).
     raw = np.zeros(n, dtype=np.float64)
     usable = ~null
     if np.any(usable):
@@ -114,9 +80,8 @@ def accuracy_weights(
         raw[:] = 1.0
     raw = raw / raw.sum()
 
-    # --- Per-model floor, then final renormalize (also the dropped-model renormalization,
-    # D-03 / Pitfall 4). The floor guarantees a strictly positive normalizer (threat
-    # T-04-06) and keeps every present model in the blend. ---
+    # Per-model floor, then final renormalize (also the dropped-model renormalization, D-03 /
+    # Pitfall 4); the floor guarantees a strictly positive normalizer (T-04-06).
     floored: NDArray[np.float64] = np.maximum(raw, w_min)
     weights: NDArray[np.float64] = floored / floored.sum()
     return weights
@@ -127,26 +92,15 @@ def blend_gaussians(
     sigmas: NDArray[np.float64],
     weights: NDArray[np.float64],
 ) -> tuple[float, float]:
-    """Vincentization closed form ``N(Σwᵢμᵢ, (Σwᵢσᵢ)²)`` (D-01, RESEARCH Pattern 1).
+    """Vincentization closed form ``N(Σwᵢμᵢ, (Σwᵢσᵢ)²)`` (D-01).
 
-    Quantile-average the per-model predictive Gaussians into ONE Gaussian. The quantile
-    function of ``N(μ, σ)`` is ``μ + σ·Φ⁻¹(p)``; a weighted average of quantile functions is
-    ``(Σwᵢμᵢ) + (Σwᵢσᵢ)·Φ⁻¹(p)`` — the quantile function of ``N(Σwᵢμᵢ, (Σwᵢσᵢ)²)``. So this
-    is QUANTILE AVERAGING (Vincentization), NOT a linear mixture of the densities.
+    Quantile averaging, NOT a linear density mixture: ``sigma_blend = Σwᵢσᵢ`` is the WEIGHTED
+    MEAN of σ, so ``σ_blend ≤ max(σᵢ)`` by construction (T-04-05, ``-k monoton``). The FORBIDDEN
+    ``sqrt(Σwᵢσᵢ²)`` (and the larger linear-mixture variance) overdisperses the blend and
+    violates PRC-01 (Pitfall 2) — never take a sqrt of a weighted sum of squares.
 
-    ``mu_blend = Σwᵢμᵢ`` and ``sigma_blend = Σwᵢσᵢ`` — the WEIGHTED MEAN of the component
-    std-devs. A weighted mean of values is ``≤`` their max, so ``σ_blend ≤ max(σᵢ)`` holds by
-    construction (the σ-monotonicity invariant guarded by ``-k monoton``; threat T-04-05).
-    The FORBIDDEN alternative ``sqrt(Σwᵢσᵢ²)`` (and the full linear-mixture variance, which is
-    even larger) overdisperses the blend — it can exceed ``max(σᵢ)`` and produces a ∩/U-shaped
-    PIT — and would silently violate PRC-01 (RESEARCH Pitfall 2 / Anti-Patterns). This module
-    therefore never takes a square root of a weighted sum of squares.
-
-    ``weights`` are renormalized internally (``w = weights / weights.sum()``), so dropped
-    models — already absent from ``mus``/``sigmas``/``weights`` — leave a valid simplex
-    (D-03, threat T-04-06). The component ``(μᵢ, σᵢ)`` are obtained by the caller from
-    :func:`weatherquant.calibrate.link.predict` reused verbatim (D-14/D-15); this function
-    never re-derives ``μ = a + b·m``.
+    ``weights`` are renormalized internally, so dropped models leave a valid simplex (D-03,
+    T-04-06). Component ``(μᵢ, σᵢ)`` come from :func:`weatherquant.calibrate.link.predict`.
 
     Parameters
     ----------

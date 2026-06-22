@@ -1,32 +1,43 @@
-"""Fixed-offset LST settlement window — the single civil-time -> UTC primitive.
+"""Fixed-offset LST settlement window — the single civil-time -> UTC primitive (TIME-01).
 
-This module is the ONE place the codebase converts a city's local settlement day
-into a UTC window (TIME-01). Both observation labeling (Phase 2) and market
-settlement (Phase 6) import ``settlement_window`` from here; no other module
-re-derives civil time.
+The ONE place a city's local settlement day becomes a UTC window; obs labeling and market
+settlement both import :func:`settlement_window` from here.
 
-THE DELIBERATE INVERSION (RESEARCH Pitfall 1): a *fixed integer* standard offset
-is MORE correct here than a DST-aware ``ZoneInfo`` conversion. Kalshi settles on
-the NWS Daily Climate Report, whose climatological day is midnight-to-midnight
-Local Standard Time, ignoring DST year-round. The v3 bug was computing the day
-with DST-aware tz math, which shifted the day by an hour during DST. So this
-module computes the window purely arithmetically from ``city.std_offset_hours``
-and MUST NOT import ``zoneinfo`` or ``timezonefinder`` (D-01/D-02; enforced by
-``tests/test_no_runtime_dst.py``). The fixed ``timedelta(days=1)`` span is
-correct precisely BECAUSE there is no DST in this window — the standard-offset
-day is always exactly 24h.
-
-During civil DST the standard-offset window appears shifted one civil-clock hour
-(TIME-02), but that is an observed consequence of using the standard offset
-year-round, not a separate code branch.
+THE DELIBERATE INVERSION (RESEARCH Pitfall 1 / D-01/D-02): a *fixed integer* standard offset
+is MORE correct here than a DST-aware ``ZoneInfo`` conversion. Kalshi settles on the NWS Daily
+Climate Report — a midnight-to-midnight Local Standard Time day, ignoring DST year-round; the
+v3 bug used DST-aware math and shifted the day an hour during DST. So the window is computed
+purely from ``city.std_offset_hours`` and this module imports neither ``zoneinfo`` nor
+``timezonefinder`` (enforced by ``tests/test_no_runtime_dst.py``). The ``timedelta(days=1)``
+span is exactly 24h precisely because there is no DST. During civil DST the window appears
+shifted one civil-clock hour (TIME-02) — a consequence of the standard offset, not a branch.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, UTC
 
 from weatherquant.registry import City
+
+
+def coerce_utc(dt: datetime) -> datetime:
+    """Stamp a naive datetime as UTC, leaving an aware one (any offset) untouched.
+
+    The one ``x if x.tzinfo else x.replace(tzinfo=UTC)`` seam shared by the parse path and the
+    market timestamp paths; complements :func:`parse_utc` (which is string-only).
+    """
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def parse_utc(iso: str) -> datetime:
+    """Parse an ISO-8601 string to a tz-aware datetime (trailing ``Z`` accepted; naive → UTC).
+
+    The one ``fromisoformat`` + ``Z``-normalize + naive-as-UTC parse the ingest/market timestamp
+    paths share. Keeps any explicit offset; callers wanting a UTC instant chain ``.astimezone``.
+    Stdlib-only — no DST tooling on the runtime path.
+    """
+    return coerce_utc(datetime.fromisoformat(iso.replace("Z", "+00:00")))
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,10 @@ class SettlementWindow:
     std_offset_hours: int
     station: str
 
+    def contains(self, ts: datetime) -> bool:
+        """Whether ``ts`` falls in this half-open ``[start_utc, end_utc)`` window."""
+        return self.start_utc <= ts < self.end_utc
+
 
 def settlement_window(city: City, day: date) -> SettlementWindow:
     """Return the fixed-offset half-open UTC settlement window for ``day``.
@@ -68,7 +83,7 @@ def settlement_window(city: City, day: date) -> SettlementWindow:
     # class Phase 1 exists to prevent. Switch registry.City to minutes before adding
     # any such city; do not coerce a fractional offset into this int.
     off = timedelta(hours=city.std_offset_hours)
-    start_utc = datetime(day.year, day.month, day.day, tzinfo=timezone.utc) - off
+    start_utc = datetime(day.year, day.month, day.day, tzinfo=UTC) - off
     end_utc = start_utc + timedelta(days=1)  # half-open [start, end); always 24h (no DST)
     return SettlementWindow(
         day, start_utc, end_utc, city.std_offset_hours, city.cli_station

@@ -11,8 +11,9 @@ CLI disagreement is flagged but the ASOS label is still produced (never overwrit
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
+import httpx
 import pytest
 
 from weatherquant.ingest.obs import (
@@ -20,6 +21,7 @@ from weatherquant.ingest.obs import (
     celsius_to_fahrenheit,
     daily_high,
     daily_high_from_obs,
+    fetch_asos_obs,
 )
 from weatherquant.registry import get_city
 from weatherquant.time import settlement_window
@@ -140,6 +142,75 @@ def test_naive_timestamps_assumed_utc():
     result = daily_high([(naive, 47.0)], "NYC", target)
     assert result.obs_count == 1
     assert result.daily_high_f == 47.0
+
+
+# --- fetch_asos_obs IEM -> AWC fallback gating (Phase-4 fix #3) ----------------------------
+
+
+def _routing_client(handler) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+async def test_empty_iem_success_does_not_trigger_awc_fallback():
+    """A successful-but-EMPTY IEM response is a real 'no obs', not a failure — no AWC fallback."""
+    win = settlement_window(get_city("NYC"), datetime.now(UTC).date())
+    calls = {"iem": 0, "awc": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mesonet" in request.url.host:
+            calls["iem"] += 1
+            return httpx.Response(200, text="station,valid,tmpf\n")  # header only, no data rows
+        calls["awc"] += 1
+        return httpx.Response(200, json=[])
+
+    client = _routing_client(handler)
+    try:
+        rows = await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    assert rows == []
+    assert calls["iem"] == 1
+    assert calls["awc"] == 0  # empty-but-successful must NOT trigger the live fallback
+
+
+async def test_iem_failure_falls_back_to_awc_for_live_window():
+    """On a real IEM failure with a live/today window, the AWC fallback IS invoked."""
+    win = settlement_window(get_city("NYC"), datetime.now(UTC).date())
+    calls = {"awc": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mesonet" in request.url.host:
+            return httpx.Response(500, text="boom")
+        calls["awc"] += 1
+        return httpx.Response(200, json=[])
+
+    client = _routing_client(handler)
+    try:
+        rows = await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    assert calls["awc"] == 1
+    assert isinstance(rows, list)
+
+
+async def test_awc_fallback_skipped_for_historical_backfill_window():
+    """A historical (backfill) window predates the recent ~14h AWC feed — skip it (no leak)."""
+    win = settlement_window(get_city("NYC"), date(2025, 1, 15))
+    calls = {"awc": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mesonet" in request.url.host:
+            return httpx.Response(500, text="boom")  # IEM fails → would otherwise trigger fallback
+        calls["awc"] += 1
+        return httpx.Response(200, json=[{"temp": 5.0, "reportTime": "2026-06-21T12:00:00Z"}])
+
+    client = _routing_client(handler)
+    try:
+        rows = await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    assert rows == []
+    assert calls["awc"] == 0  # gated out before any HTTP call — no wrong-date obs fetched
 
 
 def test_cli_fixture_parity_window_max(cli_fixture):

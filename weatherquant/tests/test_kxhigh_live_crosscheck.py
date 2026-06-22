@@ -41,11 +41,10 @@ import numpy as np
 import pytest
 
 from weatherquant.price.buckets import (
-    TICKER_CITY_SUFFIX_TO_KEY,
     bucket_probs,
     integers_in_bucket,
-    parse_ticker,
 )
+from weatherquant.price.ticker import TICKER_CITY_SUFFIX_TO_KEY, parse_ticker
 from weatherquant.price.fee import FEE_COEFF, exact_fee
 from weatherquant.registry import CITIES
 
