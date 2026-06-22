@@ -448,11 +448,46 @@ def _patch_paper(
     return captured
 
 
-def _paper_args(ticker: str = _PAPER_TICKER, demo: bool = False):
+def _paper_args(
+    ticker: str = _PAPER_TICKER,
+    demo: bool = False,
+    watch: bool = False,
+    max_duration: int | None = None,
+):
     argv = ["paper", "--city", "NYC", "--date", "2026-06-18", "--ticker", ticker]
     if demo:
         argv.append("--demo")
+    if watch:
+        argv.append("--watch")
+    if max_duration is not None:
+        argv += ["--max-duration", str(max_duration)]
     return cli.build_parser().parse_args(argv)
+
+
+def test_paper_watch_flag_defaults_off_and_parses_on():
+    """`--watch` is store_true: absent -> False (single-shot default), present -> True."""
+    assert _paper_args().watch is False
+    assert _paper_args(watch=True).watch is True
+
+
+def test_paper_max_duration_parses_and_has_positive_default():
+    """`--max-duration` parses to the typed seconds; the default is a positive safety cap."""
+    assert _paper_args(max_duration=600).max_duration == 600
+    default_cap = _paper_args().max_duration
+    assert isinstance(default_cap, int)
+    assert default_cap > 0
+
+
+def test_paper_max_duration_rejects_non_positive_at_parse_time():
+    """A non-positive `--max-duration` raises SystemExit at parse time (T-051-01)."""
+    parser = cli.build_parser()
+    for bad in ("0", "-5"):
+        with pytest.raises(SystemExit) as excinfo:
+            parser.parse_args(
+                ["paper", "--city", "NYC", "--date", "2026-06-18", "--ticker", _PAPER_TICKER,
+                 "--max-duration", bad]
+            )
+        assert excinfo.value.code != 0
 
 
 def test_run_paper_produces_midpoint_fed_ev_and_paper_fill(monkeypatch: pytest.MonkeyPatch):
