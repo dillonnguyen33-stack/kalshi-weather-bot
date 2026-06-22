@@ -22,7 +22,6 @@ from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
-from weatherquant.ingest.sources._client import get_client
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import settlement_window
@@ -354,51 +353,6 @@ def target_date_to_dt(target_date: date) -> datetime:
     return datetime(target_date.year, target_date.month, target_date.day, tzinfo=UTC)
 
 
-async def ingest_all_models(
-    bind: Bind,
-    city: str,
-    cycle_init: datetime,
-    *,
-    mode: Mode = "live",
-    lead: int = 0,
-    models: Sequence[str] | None = None,
-) -> dict[str, int]:
-    """Ingest EVERY forecast source for one city/cycle concurrently, degrading per-source (D-11).
-
-    The graceful-degradation entry point: a failed model logs a fallback while the others still
-    ingest. Returns ``{model: rows_inserted}`` (0 for a skipped source).
-
-    Args:
-        mode: ``"live"`` (scheduler) or ``"backfill"`` (CLI) — the only live/backfill seam.
-        models: optional subset of labels; defaults to all GRIB + supplementary.
-    """
-    get_city(city)  # ASVS V5 up front.
-    targets = list(models) if models is not None else [*GRIB_MODELS, *SUPPLEMENTARY_SOURCES]
-
-    # One shared httpx client for the whole concurrent fan-out (D-14): the supplementary
-    # sources reuse it instead of each opening/closing its own; closed once here.
-    client = get_client()
-    try:
-
-        async def _one(model: str) -> tuple[str, int]:
-            return model, await ingest_cycle(
-                bind, model, city, cycle_init, mode=mode, lead=lead, client=client
-            )
-
-        results = await asyncio.gather(*(_one(m) for m in targets))
-    finally:
-        await client.aclose()
-    summary = dict(results)
-    logger.info(
-        "ingest_all_models city=%s cycle=%s mode=%s -> %s",
-        city,
-        cycle_init.isoformat(),
-        mode,
-        summary,
-    )
-    return summary
-
-
 async def ingest_range(
     bind: Bind,
     models: Sequence[str],
@@ -480,7 +434,6 @@ __all__ = [
     "GRIB_MODELS",
     "SUPPLEMENTARY_SOURCES",
     "ingest_afd",
-    "ingest_all_models",
     "ingest_cycle",
     "ingest_obs",
     "ingest_range",
