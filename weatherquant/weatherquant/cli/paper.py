@@ -12,14 +12,16 @@ import argparse
 import asyncio
 import logging
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Any
 
 from weatherquant.db.engine import get_engine, get_settings
 from weatherquant.market import clv
 from weatherquant.market.auth import KalshiSigner
-from weatherquant.market.client import fetch_snapshot
+from weatherquant.market.client import fetch_snapshot, run_feed
 from weatherquant.market.persist import persist_fill, persist_snapshot
+from weatherquant.registry import get_city
+from weatherquant.time import settlement_window
 
 from .pricing import _blend_distribution, _price_bucket
 
@@ -303,6 +305,177 @@ def _process_book(
     }
 
 
+class _WatchSink:
+    """The ``on_book`` sink for ``paper --watch``: debounced, material-move-aware persist (D-08).
+
+    WATCH-01 / WHY: ``run_feed`` calls ``on_book(ticker, book)`` after EVERY applied
+    snapshot/delta, far more often than the CLV window needs. This sink debounces to at most one
+    persist per ``PAPER_SNAPSHOT_CADENCE_SECONDS`` PLUS a forced persist on a MATERIAL book move
+    (a change in the best yes/no bid PRICE or its supporting SIZE since the last persist), so the
+    closing window stays dense (PAP-04, T-05-20) without churning a row per delta. Each persist
+    runs the SHARED ``_process_book`` body so the watch and single-shot paths cannot drift
+    (PROC-01).
+
+    Event-time discipline (D-08): the stamp is ``book.event_time`` — the real WS instant carried
+    after a delta. The first WS ``orderbook_snapshot`` (seq=1) legitimately carries NO event time
+    (``event_time is None``); the sink SKIPS that emit rather than back-dating to ``now()`` (a
+    fabricated instant would mis-window CLV). The debounce clock is therefore the WS event time,
+    not the wall clock — so a scripted-ts test is deterministic.
+
+    Persist-error surfacing (WR-04 / T-051-09): ``client._emit`` CATCHES a raising sink and only
+    logs it so a feed hiccup cannot kill the long-running feed. A hard persist failure must NOT be
+    silently swallowed (it would make ``--watch`` look successful while writing nothing), so the
+    sink records the first such error on ``self.error``; the loop inspects it AFTER the feed drains
+    and re-raises as ``SystemExit``.
+    """
+
+    def __init__(
+        self,
+        bind: object,
+        *,
+        ticker: str,
+        blend: dict[str, Any],
+        pricing_mod: Any,
+        fills_mod: Any,
+        reflect_mod: Any,
+    ) -> None:
+        self._bind = bind
+        self._ticker = ticker
+        self._blend = blend
+        self._pricing = pricing_mod
+        self._fills = fills_mod
+        self._reflect = reflect_mod
+        self._last_persist_at: datetime | None = None
+        self._last_top: tuple[int | None, int | None, int | None, int | None] | None = None
+        self.persisted_count = 0
+        self.last_event_time: datetime | None = None
+        # The first hard persist failure observed inside the sink (re-raised by the loop, WR-04).
+        self.error: BaseException | None = None
+
+    def _top_of_book(self, book: object) -> tuple[int | None, int | None, int | None, int | None]:
+        """The material-move key: best yes/no bid PRICE + its supporting SIZE (via the reflect seam).
+
+        A change in any of (best_yes_bid price, best_no_bid price, best_yes_bid size,
+        best_no_bid size) is a MATERIAL move that forces a persist even inside the debounce
+        interval — the same top-of-book quantities ``_process_book`` persists (one code path for
+        both shapes via ``reflect._levels``), so the move test agrees with the persisted row.
+        """
+        best_yes_bid = self._reflect.best_bid(book, "yes")
+        best_no_bid = self._reflect.best_bid(book, "no")
+        yes_size = _best_price_size(list(self._reflect._levels(book, "yes")))
+        no_size = _best_price_size(list(self._reflect._levels(book, "no")))
+        return (best_yes_bid, best_no_bid, yes_size, no_size)
+
+    def _should_persist(self, event_time: datetime, top: tuple[Any, ...]) -> bool:
+        """Persist on the FIRST in-window book, on a material move, or once the debounce elapsed."""
+        if self._last_persist_at is None:
+            return True
+        if top != self._last_top:  # a material book move forces a persist (PAP-04 density)
+            return True
+        elapsed = (event_time - self._last_persist_at).total_seconds()
+        return elapsed >= PAPER_SNAPSHOT_CADENCE_SECONDS
+
+    def __call__(self, ticker: str, book: object) -> None:
+        # D-08: the stamp is the WS event time; a book with no delta yet (event_time None) has no
+        # derivable instant — SKIP it rather than back-date to now() (the first snapshot before any
+        # delta legitimately has none).
+        event_time = getattr(book, "event_time", None)
+        if event_time is None:
+            return
+        try:
+            top = self._top_of_book(book)
+            if not self._should_persist(event_time, top):
+                return
+            result = _process_book(
+                self._bind,
+                book=book,
+                event_time=event_time,
+                seq=getattr(book, "seq", None),
+                ticker=self._ticker,
+                blend=self._blend,
+                pricing_mod=self._pricing,
+                fills_mod=self._fills,
+                reflect_mod=self._reflect,
+            )
+        except Exception as exc:  # noqa: BLE001 — record + re-raise via the loop (WR-04, T-051-09)
+            # _emit would swallow this; remember the FIRST hard failure so the loop fails loud
+            # after the feed drains (a swallowed DB error must never make --watch look successful).
+            if self.error is None:
+                self.error = exc
+            raise
+        self._last_persist_at = event_time
+        self._last_top = top
+        self.last_event_time = event_time
+        self.persisted_count += len(result["persisted_snapshot_times"])
+
+
+async def _run_watch_loop(
+    bind: object,
+    *,
+    ticker: str,
+    blend: dict[str, Any],
+    deadline_seconds: float,
+    demo: bool,
+    signer: Any,
+    pricing_mod: Any,
+    fills_mod: Any,
+    reflect_mod: Any,
+    ws_connect: Any = None,
+    max_reconnects: int | None = None,
+) -> _WatchSink:
+    """Drive ``run_feed(on_book=sink)`` until ``deadline_seconds`` elapses, then return the sink.
+
+    WATCH-02 / WHY: ``run_feed`` runs until the connection drains (tests) or indefinitely
+    (production). The watch loop bounds it with ``asyncio.wait_for(..., timeout=deadline_seconds)``
+    — the EARLIER of the settlement deadline and the ``--max-duration`` cap, computed by the
+    caller. A ``TimeoutError`` (the deadline firing while the feed is still open) is the NORMAL
+    terminal condition, not an error. ``ws_connect`` is injectable so tests drive a mock connector
+    with no live network; production passes ``None`` → ``run_feed`` defaults to ``websockets``.
+
+    A hard persist failure recorded on the sink (``sink.error``) is re-raised as ``SystemExit``
+    here, AFTER the feed drains — ``client._emit`` swallowed it to keep the feed alive, so this
+    post-drain inspection is the WR-04 mitigation that makes the failure loud (T-051-09).
+    """
+    sink = _WatchSink(
+        bind,
+        ticker=ticker,
+        blend=blend,
+        pricing_mod=pricing_mod,
+        fills_mod=fills_mod,
+        reflect_mod=reflect_mod,
+    )
+    feed = run_feed(
+        [ticker],
+        signer,
+        on_book=sink,
+        ws_connect=ws_connect,
+        demo=demo,
+        max_reconnects=max_reconnects,
+    )
+    try:
+        if max_reconnects is None:
+            # UNBOUNDED (production) run: bound it by the wall-clock deadline. A TimeoutError (the
+            # deadline firing while the feed is still open) is the NORMAL terminal condition.
+            await asyncio.wait_for(feed, timeout=deadline_seconds)
+        else:
+            # BOUNDED run (a finite scripted stream / tests): run_feed returns on its own after
+            # max_reconnects connections drain — let it drain rather than racing a wall-clock
+            # timeout (the settlement deadline only bounds the UNBOUNDED production loop, T-051-07).
+            await feed
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # The deadline fired while the feed was still open — the NORMAL terminal condition for an
+        # unbounded production run (the watch window ended).
+        logger.info("paper --watch: deadline reached, terminating feed for %s", ticker)
+    if sink.error is not None:
+        # WR-04 / T-051-09: a persist failure _emit swallowed to keep the feed alive now fails
+        # loud, so a silently-dropped DB write can never make --watch look successful.
+        raise SystemExit(
+            f"paper --watch: a snapshot/fill persist failed for {ticker} ({sink.error!r}) — "
+            "refusing to report success on a swallowed persist error (WR-04)."
+        ) from sink.error
+    return sink
+
+
 def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     """Paper-trade one (city, date, ticker): REAL live-book midpoint into the money path (D-08/D-16).
 
@@ -370,6 +543,67 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     demo = bool(getattr(args, "demo", False))
     _, rest_host = _resolve_hosts(demo)
 
+    # The blend is per-(city, date, lead) — NOT per-book — and does not change intra-window, so
+    # compute it ONCE before either path (recomputing it per book under --watch would be wasteful).
+    blend = _blend_distribution(bind, city, target, lead)
+
+    # --watch: the feed-driven loop (WATCH-01/WATCH-02, un-defers Phase-5's B2). When set, drive
+    # market.client.run_feed against the LIVE book instead of the single-shot REST read; the
+    # single-shot path below is unchanged when --watch is off.
+    if getattr(args, "watch", False):
+        # Resolve the City BEFORE computing the deadline: args.city is a validated STR
+        # (_args._city_type returns the string, not a City), but time.settlement_window dereferences
+        # city.std_offset_hours / city.cli_station — passing the raw arg string would AttributeError
+        # (the single-shot path never calls settlement_window, so this is new). get_city is the same
+        # resolver _city_type / clv.closing_window_snapshots use.
+        deadline = settlement_window(get_city(city), target).end_utc
+        max_duration = int(getattr(args, "max_duration", 14400))
+        now = datetime.now(UTC)
+        # The effective stop is the EARLIER of the settlement deadline and now + max_duration: the
+        # duration cap is a SAFETY bound for a missing/garbled boundary, so it must never EXTEND past
+        # the settlement deadline (T-051-07). A non-positive remaining window (deadline already past)
+        # clamps to 0 so wait_for terminates immediately rather than waiting on a negative timeout.
+        deadline_seconds = max(0.0, min((deadline - now).total_seconds(), float(max_duration)))
+        # ws_connect is injectable (default None → run_feed uses websockets.connect) so tests drive
+        # a mock connector with no live network; max_reconnects likewise (None = run indefinitely).
+        ws_connect = getattr(args, "ws_connect", None)
+        max_reconnects = getattr(args, "max_reconnects", None)
+        sink = asyncio.run(
+            _run_watch_loop(
+                bind,
+                ticker=ticker,
+                blend=blend,
+                deadline_seconds=deadline_seconds,
+                demo=demo,
+                signer=signer.sign,
+                pricing_mod=pricing,
+                fills_mod=fills,
+                reflect_mod=reflect,
+                ws_connect=ws_connect,
+                max_reconnects=max_reconnects,
+            )
+        )
+        logger.info(
+            "paper --watch city=%s date=%s ticker=%s deadline=%s persisted=%d last_event=%s",
+            city, target, ticker, deadline.isoformat(), sink.persisted_count, sink.last_event_time,
+        )
+        print(
+            f"paper --watch {city} {target} {ticker}: persisted={sink.persisted_count} "
+            f"deadline={deadline.isoformat()} "
+            f"last_event={'none' if sink.last_event_time is None else sink.last_event_time.isoformat()}"
+        )
+        return {
+            "city": city,
+            "date": target.isoformat(),
+            "lead": lead,
+            "ticker": ticker,
+            "models": blend["used_models"],
+            "watch": True,
+            "deadline": deadline.isoformat(),
+            "persisted_snapshot_count": sink.persisted_count,
+            "last_event_time": sink.last_event_time,
+        }
+
     async def _fetch() -> dict[str, Any]:
         async with httpx.AsyncClient() as http:
             return await fetch_snapshot(http, signer.sign, ticker, rest_host=rest_host)
@@ -380,8 +614,6 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     # and never picks a source itself (D-08: the helper never calls now()).
     event_time = _snapshot_event_time(snapshot)
     seq = snapshot.get("seq")
-
-    blend = _blend_distribution(bind, city, target, lead)
 
     # Persist exactly ONE snapshot for this invocation (this command is single-shot; there is no
     # in-process cadence loop, WR-02). DELEGATE the per-book money tail (midpoint → EV/Kelly gate →
