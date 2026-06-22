@@ -23,6 +23,8 @@ from datetime import datetime, UTC
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from collections.abc import Awaitable, Callable
+
 from weatherquant.db.engine import get_engine
 from weatherquant.ingest import orchestrator
 from weatherquant.registry import CITIES
@@ -31,6 +33,29 @@ logger = logging.getLogger(__name__)
 
 # Cycle latency cushion: a cadence fires for the cycle that has had time to publish; the
 # orchestrator handles a not-yet-published cycle gracefully (D-11), so clock skew never crashes.
+
+
+async def _run_per_city(
+    make_coro: Callable[[str], Awaitable[object]], label: str
+) -> tuple[int, int]:
+    """Run one coroutine per city concurrently, degrading PER CITY (D-11), returning (n_ok, n_failed).
+
+    ``orchestrator.ingest_cycle`` deliberately re-raises a ``CorrectnessError`` (an alarm). The
+    orchestrator's own fan-out stays bare so alarms propagate, but the SCHEDULER is the wrong
+    layer to inherit that: one city's bad window must not abort every other city for the model.
+    So gather with ``return_exceptions=True`` and log each failure (alarms stay visible in the
+    logs) without letting it kill the job.
+    """
+    cities = list(CITIES)
+    results = await asyncio.gather(
+        *(make_coro(city) for city in cities), return_exceptions=True
+    )
+    n_failed = 0
+    for city, result in zip(cities, results):
+        if isinstance(result, BaseException):
+            n_failed += 1
+            logger.error("live job [%s] city=%s failed: %r", label, city, result)
+    return len(cities) - n_failed, n_failed
 
 
 def _latest_synoptic_cycle(now: datetime, step_hours: int) -> datetime:
@@ -57,10 +82,14 @@ async def _ingest_grib_all_cities(model: str, step_hours: int) -> None:
     bind = get_engine()
     # Cities are independent (per-city graceful degradation, D-11) — run concurrently so the job
     # finishes well within its cadence and never overruns into the next firing.
-    await asyncio.gather(
-        *(orchestrator.ingest_cycle(bind, model, city, cycle, mode="live", lead=0) for city in CITIES)
+    n_ok, n_failed = await _run_per_city(
+        lambda city: orchestrator.ingest_cycle(bind, model, city, cycle, mode="live", lead=0),
+        f"grib model={model}",
     )
-    logger.info("live grib job model=%s cycle=%s ran across %d cities", model, cycle, len(CITIES))
+    logger.info(
+        "live grib job model=%s cycle=%s ran across %d cities (ok=%d failed=%d)",
+        model, cycle, len(CITIES), n_ok, n_failed,
+    )
 
 
 async def _ingest_source_all_cities(source: str, step_hours: int) -> None:
@@ -70,10 +99,14 @@ async def _ingest_source_all_cities(source: str, step_hours: int) -> None:
         _latest_hourly_cycle(now) if step_hours == 1 else _latest_synoptic_cycle(now, step_hours)
     )
     bind = get_engine()
-    await asyncio.gather(
-        *(orchestrator.ingest_cycle(bind, source, city, cycle, mode="live", lead=0) for city in CITIES)
+    n_ok, n_failed = await _run_per_city(
+        lambda city: orchestrator.ingest_cycle(bind, source, city, cycle, mode="live", lead=0),
+        f"source={source}",
     )
-    logger.info("live source job source=%s cycle=%s ran across %d cities", source, cycle, len(CITIES))
+    logger.info(
+        "live source job source=%s cycle=%s ran across %d cities (ok=%d failed=%d)",
+        source, cycle, len(CITIES), n_ok, n_failed,
+    )
 
 
 async def _ingest_obs_all_cities() -> None:
@@ -85,8 +118,11 @@ async def _ingest_obs_all_cities() -> None:
         await orchestrator.ingest_obs(bind, city, today)
         await orchestrator.ingest_afd(bind, city, today)
 
-    await asyncio.gather(*(_one(city) for city in CITIES))
-    logger.info("live obs/afd job ran for %s across %d cities", today, len(CITIES))
+    n_ok, n_failed = await _run_per_city(_one, "obs/afd")
+    logger.info(
+        "live obs/afd job ran for %s across %d cities (ok=%d failed=%d)",
+        today, len(CITIES), n_ok, n_failed,
+    )
 
 
 # Explicit misfire policy on every job (vs apscheduler's silent 1s default): a firing up to
