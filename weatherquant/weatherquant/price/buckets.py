@@ -81,6 +81,12 @@ def bucket_prob(
         raise ValueError(f"bucket_prob: mu must be finite, got {mu!r}.")
     if not math.isfinite(sigma) or sigma <= 0.0:
         raise ValueError(f"bucket_prob: sigma must be finite and > 0, got {sigma!r}.")
+    if open_lo and open_hi:
+        # A bucket open on BOTH ends would span (−∞, ∞) and silently return 1.0 — masking a
+        # caller bug. The ticker parser only ever sets ONE open end, so fail loud (ASVS V5).
+        raise ValueError(
+            "bucket_prob: a bucket cannot be open on BOTH ends (would span all mass = 1.0)."
+        )
 
     upper = 1.0 if open_hi else _normal_cdf_scalar((hi - mu) / sigma)
     lower = 0.0 if open_lo else _normal_cdf_scalar((lo - mu) / sigma)

@@ -144,6 +144,12 @@ def test_buckets_bucket_prob_fails_loud_on_non_finite():
         bucket_prob(70.0, float("inf"), 69.5, 70.5)
 
 
+def test_buckets_bucket_prob_fails_loud_on_both_open_ends():
+    # 4.1: a bucket open on BOTH ends would silently return 1.0; it must raise instead.
+    with pytest.raises(ValueError):
+        bucket_prob(70.0, 4.0, -math.inf, math.inf, open_lo=True, open_hi=True)
+
+
 # ---------------------------------------------------------------------------
 # -k parse : pure ticker/strike → (lo, hi, open_lo, open_hi), fail-loud
 # ---------------------------------------------------------------------------
