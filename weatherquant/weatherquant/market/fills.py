@@ -48,16 +48,6 @@ class Fill:
     event_time: datetime
 
 
-def _validate_levels(levels: Sequence[tuple[int, int]]) -> None:
-    """Fail loud on a negative price or size in the level book (a caller bug, never clamped)."""
-    for price, count in levels:
-        if price < 0 or count < 0:
-            raise ValueError(
-                f"ask level prices/sizes must be non-negative; got (price={price}, "
-                f"count={count})"
-            )
-
-
 def taker_sweep(
     ask_levels: Sequence[tuple[int, int]],
     want_count: int,
@@ -86,7 +76,13 @@ def taker_sweep(
     """
     if want_count <= 0:
         raise ValueError(f"want_count must be positive; got {want_count}")
-    _validate_levels(ask_levels)
+    # Validate EVERY level up front (a negative price/size is a caller bug, never clamped) before
+    # crediting any liquidity — preserves the prior _validate_levels "check all first" semantics.
+    for price, count in ask_levels:
+        if price < 0 or count < 0:
+            raise ValueError(
+                f"ask level prices/sizes must be non-negative; got (price={price}, count={count})"
+            )
 
     filled = 0
     cost = 0

@@ -36,9 +36,11 @@ from weatherquant.market.book import (
     CONTROL_FRAME_TYPES,
     OrderBook,
     SeqGap,
+    _TICKER_KEYS,
     apply,
     parse_dollar_fp_side,
 )
+from weatherquant.time import coerce_utc
 
 logger = logging.getLogger(__name__)
 
@@ -73,11 +75,6 @@ def _resolve_hosts(demo: bool) -> tuple[str, str]:
     return WS_URL_PROD, REST_HOST_PROD
 
 
-def _parse_fp_side(raw: Any) -> list[list[int]]:
-    """Parse one ``orderbook_fp`` side to cent levels — delegates to the ONE shared parser (W1)."""
-    return parse_dollar_fp_side(raw)
-
-
 def _observed_instant(response: Any) -> datetime:
     """Capture the server-observed book instant for a snapshot (CRIT-1, D-08).
 
@@ -96,7 +93,7 @@ def _observed_instant(response: Any) -> datetime:
             parsed = None
         if parsed is not None:
             # A naive RFC-1123 date is GMT/UTC.
-            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+            return coerce_utc(parsed)
     return datetime.now(UTC)
 
 
@@ -178,8 +175,8 @@ async def fetch_snapshot(
             "type": "orderbook_snapshot",
             "seq": _resolve_seq(fp, payload),
             "ticker": ticker,
-            "yes": _parse_fp_side(fp.get("yes_dollars")),
-            "no": _parse_fp_side(fp.get("no_dollars")),
+            "yes": parse_dollar_fp_side(fp.get("yes_dollars")),
+            "no": parse_dollar_fp_side(fp.get("no_dollars")),
             # The observed REST instant IS the book instant under D-08 (CRIT-1).
             "event_time": observed,
             "snapshot_for": observed.isoformat(),
@@ -278,7 +275,14 @@ async def run_feed(
                 await ws.send(subscribe_cmd)
 
                 async for raw in ws:
-                    msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                    try:
+                        msg = json.loads(raw) if isinstance(raw, (str, bytes, bytearray)) else raw
+                    except json.JSONDecodeError as exc:
+                        # A single malformed frame is feed-level noise, not a connection fault:
+                        # drop it and keep reading (like the control-frame skip below) — never let
+                        # one bad frame kill the feed coroutine, and do NOT reconnect over it.
+                        logger.warning("[ws error] dropping malformed WS frame: %s", exc)
+                        continue
                     # A control frame is feed-level — skip it BEFORE keying a book (W1).
                     if isinstance(msg, Mapping) and msg.get("type") in CONTROL_FRAME_TYPES:
                         logger.debug("[ws] skipping control frame: %s", msg.get("type"))
@@ -327,7 +331,7 @@ def _msg_ticker(msg: Mapping[str, Any], tickers: Sequence[str]) -> str:
     body = msg.get("msg") if isinstance(msg, Mapping) else None
     scopes = [body, msg] if isinstance(body, Mapping) else [msg]
     for scope in scopes:
-        for key in ("market_ticker", "market_id", "ticker"):
+        for key in _TICKER_KEYS:
             if key in scope:
                 value = scope[key]
                 if not isinstance(value, str):

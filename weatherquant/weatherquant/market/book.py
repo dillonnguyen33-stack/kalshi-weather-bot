@@ -104,11 +104,7 @@ def parse_dollar_fp_side(raw: Any) -> list[list[int]]:
 def _coerce_levels(raw: Any) -> dict[int, int]:
     """Coerce a parsed snapshot side (cent levels) to a ``{price: count}`` map, dropping
     non-positive counts."""
-    levels: dict[int, int] = {}
-    for price, count in raw:
-        if count > 0:
-            levels[int(price)] = int(count)
-    return levels
+    return {int(price): int(count) for price, count in raw if count > 0}
 
 
 def _parse_event_time(msg: Mapping[str, Any]) -> datetime | None:
@@ -218,6 +214,13 @@ def _ticker_of(body: Mapping[str, Any]) -> str | None:
     return None
 
 
+def _carry_event_time(book: OrderBook, body: Mapping[str, Any]) -> None:
+    """Carry a snapshot/delta WS event time onto ``book``, leaving it unchanged if absent (PAP-03/D-08)."""
+    observed = _parse_event_time(body)
+    if observed is not None:
+        book.event_time = observed
+
+
 def apply(book: OrderBook, msg: Mapping[str, Any]) -> None:
     """Apply one Kalshi V2 WS message (control / snapshot / delta) to ``book`` in place.
 
@@ -246,9 +249,7 @@ def apply(book: OrderBook, msg: Mapping[str, Any]) -> None:
             ticker=_ticker_of(body),
         )
         # Carry a snapshot ts/ts_ms if present, else leave unchanged (never back-date, D-08).
-        observed = _parse_event_time(body)
-        if observed is not None:
-            book.event_time = observed
+        _carry_event_time(book, body)
         return
 
     if msg_type == _TYPE_DELTA:
@@ -270,9 +271,7 @@ def apply(book: OrderBook, msg: Mapping[str, Any]) -> None:
         )
         book.seq = got_seq
         # Carry the WS event time onto the book (PAP-03); absent → leave unchanged.
-        observed = _parse_event_time(body)
-        if observed is not None:
-            book.event_time = observed
+        _carry_event_time(book, body)
         return
 
     raise ValueError(
@@ -286,6 +285,7 @@ __all__ = [
     "CONTROL_FRAME_TYPES",
     "OrderBook",
     "SeqGap",
+    "_TICKER_KEYS",
     "apply",
     "parse_dollar_fp_side",
 ]

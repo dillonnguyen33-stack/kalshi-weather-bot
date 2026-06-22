@@ -30,8 +30,10 @@ def _levels(book: object, side: str) -> Iterable[tuple[int, int]]:
 def _reflect(levels: Iterable[tuple[int, int]]) -> list[tuple[int, int]]:
     """Reflect bid ``levels`` to the opposite ask side: ``(100 - price, count)``, cheapest-first."""
     # Highest bid price first -> lowest (100 - price) ask first == best/cheapest ask first.
-    ordered = sorted(levels, key=lambda level: level[0], reverse=True)
-    return [(_COMPLEMENT - price, count) for price, count in ordered]
+    return [
+        (_COMPLEMENT - price, count)
+        for price, count in sorted(levels, key=lambda level: level[0], reverse=True)
+    ]
 
 
 def best_bid(book: object, side: str) -> int | None:

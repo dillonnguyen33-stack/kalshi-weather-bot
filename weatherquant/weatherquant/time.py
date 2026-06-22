@@ -21,6 +21,15 @@ from datetime import date, datetime, timedelta, UTC
 from weatherquant.registry import City
 
 
+def coerce_utc(dt: datetime) -> datetime:
+    """Stamp a naive datetime as UTC, leaving an aware one (any offset) untouched.
+
+    The one ``x if x.tzinfo else x.replace(tzinfo=UTC)`` seam shared by the parse path and the
+    market timestamp paths; complements :func:`parse_utc` (which is string-only).
+    """
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
 def parse_utc(iso: str) -> datetime:
     """Parse an ISO-8601 string to a tz-aware datetime (trailing ``Z`` accepted; naive → UTC).
 
@@ -28,8 +37,7 @@ def parse_utc(iso: str) -> datetime:
     paths share. Keeps any explicit offset; callers wanting a UTC instant chain ``.astimezone``.
     Stdlib-only — no DST tooling on the runtime path.
     """
-    parsed = datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    return coerce_utc(datetime.fromisoformat(iso.replace("Z", "+00:00")))
 
 
 @dataclass(frozen=True)

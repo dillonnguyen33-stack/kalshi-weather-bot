@@ -18,11 +18,11 @@ PURE: imports only :func:`weatherquant.time.settlement_window`.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta, UTC
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol
 
 from weatherquant.registry import City
-from weatherquant.time import parse_utc, settlement_window
+from weatherquant.time import coerce_utc, parse_utc, settlement_window
 
 # Closing window length: the final N minutes before settlement (D-09). run_paper's snapshot
 # cadence MUST stay strictly finer so the window holds >= 1 snapshot (PAP-04, T-05-20).
@@ -48,7 +48,7 @@ def snapshot_event_time(snapshot: Mapping[str, Any]) -> datetime:
     for key in ("event_time", "available_at"):
         value = snapshot.get(key)
         if isinstance(value, datetime):
-            return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+            return coerce_utc(value)
     raw = snapshot.get("snapshot_for")
     if isinstance(raw, str):
         # Strip an optional ``#<seq>`` disambiguation suffix before parsing (WR-03).
