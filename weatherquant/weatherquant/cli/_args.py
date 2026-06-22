@@ -36,18 +36,13 @@ def _parse_date(value: str) -> date:
         ) from exc
 
 
-def _validate_city(value: str) -> str:
-    """Validate a city code via :func:`get_city` (raises on unknown — ASVS V5 / T-02-17)."""
-    get_city(value)  # raises KeyError on an unknown code; surfaced as an arg error below.
-    return value
-
-
 def _city_type(value: str) -> str:
-    """argparse ``type=`` wrapper turning an unknown city KeyError into an arg error."""
+    """argparse ``type=`` validating a city via :func:`get_city`; unknown → arg error (ASVS V5 / T-02-17)."""
     try:
-        return _validate_city(value)
+        get_city(value)  # raises KeyError on an unknown code.
     except KeyError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
 
 
 def _add_model_selector(p: argparse.ArgumentParser, *, verb: str) -> None:

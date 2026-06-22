@@ -22,10 +22,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Absolute-zero offset shared by every source's unit seam (°C/°F → Kelvin, D-07). One constant
+# so the Kelvin-only forecast path has a single audited value, not four copies.
+KELVIN_OFFSET = 273.15
 
 # Descriptive default User-Agent. api.weather.gov REQUIRES a User-Agent (Pitfall 7) and it
 # is courteous on the other feeds; carrying it as a client default means no source can
@@ -69,6 +75,25 @@ def get_client(
         return httpx.AsyncClient(timeout=timeout, headers=merged)
 
 
+@asynccontextmanager
+async def managed_client(
+    client: httpx.AsyncClient | None = None,
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Yield a client, closing it ONLY if we created it (the injected-client lifecycle, D-14).
+
+    The single home for the ``owns_client = client is None; ... finally: if owns: aclose()``
+    dance every source repeated: an injected test client is left open for its owner, a
+    self-created one is closed on exit.
+    """
+    owns_client = client is None
+    client = client or get_client()
+    try:
+        yield client
+    finally:
+        if owns_client:
+            await client.aclose()
+
+
 async def request_with_retry(
     client: httpx.AsyncClient,
     method: str,
@@ -96,4 +121,11 @@ async def request_with_retry(
     return response
 
 
-__all__ = ["DEFAULT_TIMEOUT", "USER_AGENT", "get_client", "request_with_retry"]
+__all__ = [
+    "DEFAULT_TIMEOUT",
+    "KELVIN_OFFSET",
+    "USER_AGENT",
+    "get_client",
+    "managed_client",
+    "request_with_retry",
+]

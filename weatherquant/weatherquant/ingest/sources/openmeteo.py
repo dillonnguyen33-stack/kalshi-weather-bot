@@ -19,7 +19,11 @@ from typing import Any, cast
 import httpx
 
 from weatherquant.ingest.available_at import available_at
-from weatherquant.ingest.sources._client import get_client, request_with_retry
+from weatherquant.ingest.sources._client import (
+    KELVIN_OFFSET,
+    managed_client,
+    request_with_retry,
+)
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, parse_utc, settlement_window
@@ -37,12 +41,10 @@ N_MEMBERS = 31  # member00 .. member30
 # (1..30) -> "openmeteo:<member>" — never deduped with NOAA gfs/gefs or wethr:* (D-12).
 MODEL_BASE = "openmeteo"
 
-_KELVIN_OFFSET = 273.15
-
 
 def celsius_to_kelvin(temp_c: float) -> float:
     """The ONE °C->K conversion on the Open-Meteo path, keeping the units boundary auditable (D-07)."""
-    return temp_c + _KELVIN_OFFSET
+    return temp_c + KELVIN_OFFSET
 
 
 def member_label(member: int) -> str:
@@ -132,25 +134,21 @@ async def fetch_openmeteo_ensemble(
         "end_date": ds,
         # NOTE: no temperature_unit -> API-default Celsius (Pitfall 3 / D-07).
     }
-    owns_client = client is None
-    client = client or get_client()
-    try:
-        resp = await request_with_retry(
-            client, "GET", f"{OPEN_METEO_ENS_BASE}/ensemble", params=params
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning(
-            "Open-Meteo ensemble fetch failed for city=%s date=%s (%s) — degrading (D-11)",
-            city,
-            target_date,
-            exc,
-        )
-        return {}
-    finally:
-        if owns_client:
-            await client.aclose()
+    async with managed_client(client) as client:
+        try:
+            resp = await request_with_retry(
+                client, "GET", f"{OPEN_METEO_ENS_BASE}/ensemble", params=params
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "Open-Meteo ensemble fetch failed for city=%s date=%s (%s) — degrading (D-11)",
+                city,
+                target_date,
+                exc,
+            )
+            return {}
 
     win = settlement_window(station, target_date)
     return parse_members(payload, win)

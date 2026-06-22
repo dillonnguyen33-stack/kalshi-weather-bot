@@ -17,7 +17,11 @@ import httpx
 
 from weatherquant.db.engine import get_settings
 from weatherquant.ingest.available_at import available_at
-from weatherquant.ingest.sources._client import get_client, request_with_retry
+from weatherquant.ingest.sources._client import (
+    KELVIN_OFFSET,
+    managed_client,
+    request_with_retry,
+)
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 
@@ -29,12 +33,10 @@ WETHR_FORECAST_BASE = "https://wethr.net/api/v2/forecasts.php"
 # Deterministic Wethr models in scope (v3 WETHR_MODELS L531). Each stores under wethr:<model>.
 WETHR_MODELS = ("hrrr", "nbm", "rap", "nam4km", "gfs", "ecmwf-ifs")
 
-_KELVIN_OFFSET = 273.15
-
 
 def fahrenheit_to_kelvin(temp_f: float) -> float:
     """The ONE °F->K conversion on the Wethr path, keeping the units boundary auditable (D-07)."""
-    return (temp_f - 32.0) * 5.0 / 9.0 + _KELVIN_OFFSET
+    return (temp_f - 32.0) * 5.0 / 9.0 + KELVIN_OFFSET
 
 
 def model_label(model: str) -> str:
@@ -95,31 +97,27 @@ async def fetch_wethr_forecast(
         return None
 
     station = get_city(city).cli_station  # re-map by registry cli_station, NOT v3's station map
-    owns_client = client is None
     # Auth rides the per-request header below (covers both an injected client and one we own),
     # so the owned client needs no duplicate default Authorization header.
-    client = client or get_client()
-    try:
-        resp = await request_with_retry(
-            client,
-            "GET",
-            WETHR_FORECAST_BASE,
-            params={"location_name": station, "model": model, "run": "latest"},
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        resp.raise_for_status()
-        rows = resp.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning(
-            "Wethr fetch failed for city=%s model=%s (%s) — degrading (D-11)",
-            city,
-            model,
-            exc,
-        )
-        return None
-    finally:
-        if owns_client:
-            await client.aclose()
+    async with managed_client(client) as client:
+        try:
+            resp = await request_with_retry(
+                client,
+                "GET",
+                WETHR_FORECAST_BASE,
+                params={"location_name": station, "model": model, "run": "latest"},
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp.raise_for_status()
+            rows = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning(
+                "Wethr fetch failed for city=%s model=%s (%s) — degrading (D-11)",
+                city,
+                model,
+                exc,
+            )
+            return None
 
     high_f = _extract_high_f(rows, target_date)
     return fahrenheit_to_kelvin(high_f) if high_f is not None else None

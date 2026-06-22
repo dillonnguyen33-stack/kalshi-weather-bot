@@ -19,7 +19,7 @@ import httpx
 
 from weatherquant.db.engine import get_settings
 from weatherquant.ingest.errors import AvailabilityError
-from weatherquant.ingest.sources._client import get_client
+from weatherquant.ingest.sources._client import managed_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import CITIES
 
@@ -217,33 +217,29 @@ async def fetch_afd_text(
     Two-step: ``/products/types/AFD/locations/{wfo}`` → latest id → ``/products/{id}`` →
     ``productText``. Fixed host + static ``wfo`` map (no SSRF, T-02-11). ``None`` on error (D-11).
     """
-    owns_client = client is None
-    client = client or get_client()
-    try:
-        list_resp = await client.get(
-            f"{_NWS_API_BASE}/products/types/AFD/locations/{wfo}",
-            headers={"User-Agent": _USER_AGENT, "Accept": "application/geo+json"},
-        )
-        list_resp.raise_for_status()
-        products = list_resp.json().get("@graph", [])
-        if not products:
+    async with managed_client(client) as client:
+        try:
+            list_resp = await client.get(
+                f"{_NWS_API_BASE}/products/types/AFD/locations/{wfo}",
+                headers={"User-Agent": _USER_AGENT, "Accept": "application/geo+json"},
+            )
+            list_resp.raise_for_status()
+            products = list_resp.json().get("@graph", [])
+            if not products:
+                return None
+            latest_id = products[0].get("id")
+            if not latest_id:
+                return None
+            prod_resp = await client.get(
+                f"{_NWS_API_BASE}/products/{latest_id}",
+                headers={"User-Agent": _USER_AGENT},
+            )
+            prod_resp.raise_for_status()
+            text = prod_resp.json().get("productText", "")
+            return text if isinstance(text, str) else ""
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("AFD fetch failed for WFO=%s (%s)", wfo, exc)
             return None
-        latest_id = products[0].get("id")
-        if not latest_id:
-            return None
-        prod_resp = await client.get(
-            f"{_NWS_API_BASE}/products/{latest_id}",
-            headers={"User-Agent": _USER_AGENT},
-        )
-        prod_resp.raise_for_status()
-        text = prod_resp.json().get("productText", "")
-        return text if isinstance(text, str) else ""
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("AFD fetch failed for WFO=%s (%s)", wfo, exc)
-        return None
-    finally:
-        if owns_client:
-            await client.aclose()
 
 
 def store_afd_signal(

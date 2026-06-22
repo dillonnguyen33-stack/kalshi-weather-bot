@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import httpx
 
-from weatherquant.ingest.sources._client import get_client
+from weatherquant.ingest.sources._client import managed_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, parse_utc, settlement_window
@@ -204,9 +204,9 @@ def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
         if tmpf_s.strip().upper() in ("M", "", "T"):
             continue
         try:
-            ts = datetime.strptime(valid.strip(), "%Y-%m-%d %H:%M").replace(
-                tzinfo=UTC
-            )
+            # IEM emits ``YYYY-MM-DD HH:MM`` UTC; parse_utc (fromisoformat) handles the space
+            # separator and stamps the naive instant as UTC — same result, one parse seam.
+            ts = parse_utc(valid.strip())
             tmpf = float(tmpf_s)
         except ValueError:
             continue
@@ -229,9 +229,7 @@ async def fetch_asos_obs(
     # IEM strips the leading 'K' from the 4-letter ICAO for its 3-letter network ids.
     iem_station = station[1:] if station.startswith("K") and len(station) == 4 else station
 
-    owns_client = client is None
-    client = client or get_client()
-    try:
+    async with managed_client(client) as client:
         try:
             resp = await client.get(
                 _IEM_ASOS_CGI,
@@ -253,9 +251,6 @@ async def fetch_asos_obs(
         except (httpx.HTTPError, ValueError) as exc:
             logger.warning("IEM ASOS fetch failed for %s (%s); trying AWC fallback", city, exc)
             return await _fetch_awc_fallback(station, client, win)
-    finally:
-        if owns_client:
-            await client.aclose()
 
 
 async def _fetch_awc_fallback(

@@ -36,9 +36,9 @@ Mode = Literal["backfill", "live"]
 GRIB_MODELS: tuple[str, ...] = ("nbm", "hrrr", "gfs", "gefs")
 _GEFS_MEMBERS: tuple[str, ...] = ("c00",) + tuple(f"p{i:02d}" for i in range(1, 31))
 
-# The supplementary forecast sources (02-04) and the obs/AFD ground-truth path (02-03).
-# These are the labels logged in the structured fallback events; they are NOT NOAA models.
-SUPPLEMENTARY_SOURCES: tuple[str, ...] = ("nws", "openmeteo", "wethr")
+# The supplementary live-forward sources (02-04) are defined as the {name: handler} dispatch
+# table _SUPPLEMENTARY_HANDLERS below (the single source of truth); SUPPLEMENTARY_SOURCES is
+# derived from its keys so the set, the ingest_cycle dispatch, and the CLI selector never drift.
 
 
 def _gefs_members(model: str) -> tuple[str, ...]:
@@ -181,20 +181,15 @@ async def ingest_cycle(
             return await _ingest_grib_model(
                 bind, model, city, cycle_init, mode=mode, lead=lead
             )
-        if model in SUPPLEMENTARY_SOURCES:
-            # Live-forward sources have no historical archive: skip in backfill, run in live
-            # (WR-02 / D-09 / D-11; see docs/DECISIONS.md).
-            if mode == "backfill":
-                _log_live_only_skip(model, city, cycle_init)
-                return 0
-            if model == "nws":
-                return await _ingest_nws(bind, city, cycle_init, lead, mode=mode, client=client)
-            if model == "openmeteo":
-                return await _ingest_openmeteo(
-                    bind, city, cycle_init, lead, mode=mode, client=client
-                )
-            return await _ingest_wethr(bind, city, cycle_init, mode=mode, client=client)
-        raise ValueError(f"unknown ingest model/source: {model!r}")
+        handler = _SUPPLEMENTARY_HANDLERS.get(model)
+        if handler is None:
+            raise ValueError(f"unknown ingest model/source: {model!r}")
+        # Live-forward sources have no historical archive: skip in backfill, run in live
+        # (WR-02 / D-09 / D-11; see docs/DECISIONS.md).
+        if mode == "backfill":
+            _log_live_only_skip(model, city, cycle_init)
+            return 0
+        return await handler(bind, city, cycle_init, lead, mode=mode, client=client)
     except KeyError:
         # Unknown city code (ASVS V5) is a caller error, not graceful degradation — never swallow.
         raise
@@ -240,10 +235,14 @@ async def _ingest_openmeteo(
 
 
 async def _ingest_wethr(
-    bind: Bind, city: str, cycle_init: datetime, *, mode: Mode,
+    bind: Bind, city: str, cycle_init: datetime, lead: int, *, mode: Mode,
     client: httpx.AsyncClient | None = None,
 ) -> int:
-    """Wethr deterministic models -> per-model rows; graceful skip when key unset (02-04)."""
+    """Wethr deterministic models -> per-model rows; graceful skip when key unset (02-04).
+
+    ``lead`` is accepted for the uniform dispatch signature but Wethr serves the latest run only,
+    so rows are keyed at lead 0 (the cosmetic asymmetry is intentional — all callers pass 0).
+    """
     target_date = _target_date_for(city, cycle_init, 0)
     inserted = 0
     for model in wethr.WETHR_MODELS:
@@ -254,6 +253,18 @@ async def _ingest_wethr(
             bind, city, model, target_date, temp_kelvin, cycle=cycle_init, mode=mode
         )
     return inserted
+
+
+# The supplementary live-forward sources: name -> ingest handler, the SINGLE source of truth for
+# the supplementary set (02-04). ingest_cycle dispatches through this table and
+# SUPPLEMENTARY_SOURCES is derived from its keys, so adding a source is a one-line change here.
+# All handlers share ``(bind, city, cycle_init, lead, *, mode, client)``.
+_SUPPLEMENTARY_HANDLERS = {
+    "nws": _ingest_nws,
+    "openmeteo": _ingest_openmeteo,
+    "wethr": _ingest_wethr,
+}
+SUPPLEMENTARY_SOURCES: tuple[str, ...] = tuple(_SUPPLEMENTARY_HANDLERS)
 
 
 async def ingest_obs(

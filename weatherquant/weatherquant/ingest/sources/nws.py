@@ -19,7 +19,11 @@ import httpx
 
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import UnitError
-from weatherquant.ingest.sources._client import get_client, request_with_retry
+from weatherquant.ingest.sources._client import (
+    KELVIN_OFFSET,
+    managed_client,
+    request_with_retry,
+)
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, parse_utc, settlement_window
@@ -34,7 +38,6 @@ MODEL = "nws"
 
 # WMO unit codes api.weather.gov uses for ``properties.temperature.uom`` (Pitfall 3). The
 # unit is read from the payload, NEVER assumed; an unrecognized code raises (T-02-12).
-_KELVIN_OFFSET = 273.15
 
 
 def _to_kelvin(value: float, uom: str) -> float:
@@ -46,9 +49,9 @@ def _to_kelvin(value: float, uom: str) -> float:
     code = uom.split(":", 1)[1] if ":" in uom else uom
     code = code.strip().lower()
     if code in ("degc", "celsius", "c"):
-        return value + _KELVIN_OFFSET
+        return value + KELVIN_OFFSET
     if code in ("degf", "fahrenheit", "f"):
-        return (value - 32.0) * 5.0 / 9.0 + _KELVIN_OFFSET
+        return (value - 32.0) * 5.0 / 9.0 + KELVIN_OFFSET
     if code in ("k", "kelvin"):
         return value
     # An unrecognized unit is a correctness alarm (UnitError): storing an assumed unit into the
@@ -138,35 +141,31 @@ async def fetch_nws_forecast(
         client: optional injected ``httpx.AsyncClient`` (the unit test passes a mock).
     """
     station = get_city(city)
-    owns_client = client is None
-    client = client or get_client()
-    # Defense in depth (Pitfall 7): the shared client sets the User-Agent default, but assert
-    # it so a future client refactor cannot silently re-introduce the api.weather.gov 403.
-    assert client.headers.get("User-Agent"), "NWS requests require a User-Agent (Pitfall 7)"
-    try:
-        points_url = f"{NWS_API_BASE}/points/{station.lat},{station.lon}"
-        points_resp = await request_with_retry(
-            client, "GET", points_url, headers={"Accept": "application/geo+json"}
-        )
-        points_resp.raise_for_status()
-        grid_url = points_resp.json()["properties"]["forecastGridData"]
+    async with managed_client(client) as client:
+        # Defense in depth (Pitfall 7): the shared client sets the User-Agent default, but assert
+        # it so a future client refactor cannot silently re-introduce the api.weather.gov 403.
+        assert client.headers.get("User-Agent"), "NWS requests require a User-Agent (Pitfall 7)"
+        try:
+            points_url = f"{NWS_API_BASE}/points/{station.lat},{station.lon}"
+            points_resp = await request_with_retry(
+                client, "GET", points_url, headers={"Accept": "application/geo+json"}
+            )
+            points_resp.raise_for_status()
+            grid_url = points_resp.json()["properties"]["forecastGridData"]
 
-        grid_resp = await request_with_retry(
-            client, "GET", grid_url, headers={"Accept": "application/geo+json"}
-        )
-        grid_resp.raise_for_status()
-        temperature = grid_resp.json()["properties"]["temperature"]
-    except (httpx.HTTPError, KeyError, ValueError) as exc:
-        logger.warning(
-            "NWS gridpoint fetch failed for city=%s date=%s (%s) — degrading (D-11)",
-            city,
-            target_date,
-            exc,
-        )
-        return None
-    finally:
-        if owns_client:
-            await client.aclose()
+            grid_resp = await request_with_retry(
+                client, "GET", grid_url, headers={"Accept": "application/geo+json"}
+            )
+            grid_resp.raise_for_status()
+            temperature = grid_resp.json()["properties"]["temperature"]
+        except (httpx.HTTPError, KeyError, ValueError) as exc:
+            logger.warning(
+                "NWS gridpoint fetch failed for city=%s date=%s (%s) — degrading (D-11)",
+                city,
+                target_date,
+                exc,
+            )
+            return None
 
     win = settlement_window(station, target_date)
     return window_max_kelvin(temperature, win)
