@@ -128,6 +128,33 @@ def _blend_distribution(
     }
 
 
+def _price_bucket(
+    blend: dict[str, Any], ticker: str, mid: float
+) -> tuple[float, float, float, float]:
+    """Price one bucket on ``blend`` at ``mid`` — the shared run_price/run_paper money tail.
+
+    Returns ``(prob, p_used, ev, stake_fraction)``. The ONLY difference between the mocked
+    (``--market-mid``) and real (live ``mid_unit``) money paths is the ``mid`` arg, so both
+    share this one stake-arg ordering — EV and the sized stake stay on the SAME shrunk belief
+    (``p_used``) and can never silently disagree in sign near the boundary (D-08/D-16).
+    """
+    from weatherquant import price as pricing
+
+    lo, hi, open_lo, open_hi = pricing.parse_ticker(ticker)
+    c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
+    prob = pricing.bucket_prob(
+        blend["mu_blend"], blend["sigma_blend"], c_lo, c_hi, open_lo, open_hi
+    )
+    pu = pricing.p_used(prob, mid)
+    ev = pricing.bucket_ev(prob, mid, mid)
+    stake = pricing.stake_fraction(
+        pu, mid, pricing.exact_fee(1, mid),
+        blend["sigma_blend"], blend["n_train"], blend["pool_level"], blend["afd_flag"],
+        cap=blend["cap"],
+    )
+    return prob, pu, ev, stake
+
+
 def run_price(args: argparse.Namespace) -> dict[str, Any]:
     """Smoke-price one (city, date): latest→predict→blend→bucket/EV/Kelly (D-15/D-16).
 
@@ -151,9 +178,6 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     BEFORE this runs — ASVS V5 / T-04-15). All pure math lives in :mod:`weatherquant.price`;
     this function is the offline-untestable I/O edge only and returns a small result dict.
     """
-    # Imported lazily so the ingest/calibrate paths (and `--help`) never pay these imports.
-    from weatherquant import price as pricing
-
     city = args.city
     target = args.date
     lead = args.lead
@@ -169,9 +193,6 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     mu_blend = blend["mu_blend"]
     sigma_blend = blend["sigma_blend"]
     afd_flag = blend["afd_flag"]
-    n_train = blend["n_train"]
-    pool_level = blend["pool_level"]
-    cap = blend["cap"]
 
     logger.info(
         "price city=%s date=%s lead=%s models=%s mu_blend=%.2f sigma_blend=%.2f afd=%s",
@@ -191,20 +212,10 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     if args.ticker is not None:
-        lo, hi, open_lo, open_hi = pricing.parse_ticker(args.ticker)
-        c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
-        prob = pricing.bucket_prob(
-            mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi
-        )
-        # EV and the sized stake MUST share one decision basis. bucket_ev shrinks the model prob
-        # toward the market mid internally (D-08, p_used); size Kelly on that SAME shrunk belief
-        # so the printed edge and the stake agree in sign near the boundary.
-        pu = pricing.p_used(prob, market_mid)
-        ev = pricing.bucket_ev(prob, market_mid, market_mid)
-        stake = pricing.stake_fraction(
-            pu, market_mid, pricing.exact_fee(1, market_mid),
-            sigma_blend, n_train, pool_level, afd_flag, cap=cap,
-        )
+        # The shared money tail (also run by run_paper); the ONLY difference there is the REAL
+        # live-book midpoint replacing this MOCKED --market-mid (D-08/D-16). EV + stake share the
+        # one p_used basis inside _price_bucket so the printed edge and the stake never disagree.
+        prob, _pu, ev, stake = _price_bucket(blend, args.ticker, market_mid)
         bucket = {
             "ticker": args.ticker, "prob": prob, "ev": ev, "stake_fraction": stake,
         }

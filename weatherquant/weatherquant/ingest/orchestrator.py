@@ -24,7 +24,7 @@ from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
 from weatherquant.ingest.writer import Bind, insert_forecast
 from weatherquant.registry import get_city
-from weatherquant.time import settlement_window
+from weatherquant.time import coerce_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +59,7 @@ def _target_date_for(city_code: str, cycle_init: datetime, lead: int) -> date:
     docs/DECISIONS.md).
     """
     city = get_city(city_code)
-    valid = cycle_init + timedelta(hours=lead)
-    if valid.tzinfo is None:
-        valid = valid.replace(tzinfo=UTC)
+    valid = coerce_utc(cycle_init + timedelta(hours=lead))
     # Valid instant is within ~1 civil day of its UTC date for any US offset; check the UTC
     # date and its neighbours so the half-open window assignment is exact.
     base = valid.astimezone(UTC).date()

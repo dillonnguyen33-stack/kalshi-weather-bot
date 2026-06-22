@@ -21,7 +21,7 @@ from weatherquant.market.auth import KalshiSigner
 from weatherquant.market.client import fetch_snapshot
 from weatherquant.market.persist import persist_fill, persist_snapshot
 
-from .pricing import _blend_distribution
+from .pricing import _blend_distribution, _price_bucket
 
 logger = logging.getLogger(__name__)
 
@@ -187,26 +187,11 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit(f"paper: reflected midpoint {mid_unit} is not in [0, 1]")
 
     blend = _blend_distribution(bind, city, target, lead)
-    mu_blend = blend["mu_blend"]
-    sigma_blend = blend["sigma_blend"]
-    afd_flag = blend["afd_flag"]
-    n_train = blend["n_train"]
-    pool_level = blend["pool_level"]
-    cap = blend["cap"]
 
-    lo, hi, open_lo, open_hi = pricing.parse_ticker(ticker)
-    c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
-    prob = pricing.bucket_prob(mu_blend, sigma_blend, c_lo, c_hi, open_lo, open_hi)
-
-    # Feed the REAL [0,1] mid_unit into the SAME money path run_price mocks (D-08/D-16 loop
-    # closed): p_used shrinks the model prob toward the real mid, EV and Kelly size on that
-    # shrunk belief. mid_unit (NOT mid_cents) feeds pricing — the pricing path is in [0,1].
-    pu = pricing.p_used(prob, mid_unit)
-    ev = pricing.bucket_ev(prob, mid_unit, mid_unit)
-    stake = pricing.stake_fraction(
-        pu, mid_unit, pricing.exact_fee(1, mid_unit),
-        sigma_blend, n_train, pool_level, afd_flag, cap=cap,
-    )
+    # Feed the REAL [0,1] mid_unit into the SAME money tail run_price mocks (D-08/D-16 loop
+    # closed): _price_bucket shrinks the model prob toward the real mid (p_used), and EV + Kelly
+    # size on that shrunk belief. mid_unit (NOT mid_cents) feeds pricing — the path is in [0,1].
+    prob, pu, ev, stake = _price_bucket(blend, ticker, mid_unit)
 
     # Persist exactly ONE snapshot for this invocation (this command is single-shot; there is no
     # in-process cadence loop, WR-02), stamped with the REAL WS event time (D-08) and carrying the

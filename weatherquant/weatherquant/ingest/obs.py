@@ -21,7 +21,7 @@ import httpx
 from weatherquant.ingest.sources._client import KELVIN_OFFSET, managed_client
 from weatherquant.ingest.writer import Bind, insert_observation
 from weatherquant.registry import get_city
-from weatherquant.time import SettlementWindow, parse_utc, settlement_window
+from weatherquant.time import SettlementWindow, coerce_utc, parse_utc, settlement_window
 
 logger = logging.getLogger(__name__)
 
@@ -112,9 +112,7 @@ def _coerce_ts(ts_raw: object) -> datetime | None:
             return None
     else:
         return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=UTC)
-    return ts.astimezone(UTC)
+    return coerce_utc(ts).astimezone(UTC)
 
 
 def daily_high(
