@@ -36,6 +36,27 @@ def _parse_date(value: str) -> date:
         ) from exc
 
 
+def _positive_seconds(value: str) -> int:
+    """argparse ``type=`` for ``--max-duration``: a STRICTLY POSITIVE integer seconds (ASVS V5 / T-051-01).
+
+    The watch loop's safety cap (CONTEXT LOCKED) — it bounds the loop so a missing/garbled
+    settlement boundary can never run forever. Reject a non-positive cap at PARSE time so a
+    garbage/negative value can never produce an unbounded or negative-duration loop (a zero or
+    negative cap is not a meaningful bound).
+    """
+    try:
+        seconds = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-duration {value!r}: expected an integer number of seconds ({exc})"
+        ) from exc
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            f"invalid --max-duration {seconds}: must be a strictly positive number of seconds"
+        )
+    return seconds
+
+
 def _city_type(value: str) -> str:
     """argparse ``type=`` validating a city via :func:`get_city`; unknown → arg error (ASVS V5 / T-02-17)."""
     try:
@@ -204,6 +225,9 @@ def build_parser() -> argparse.ArgumentParser:
     # — closing the Phase-4 D-08/D-16 loop. It places NO real order (paper only — run_paper runs
     # only when execution_mode is NOT 'live') and persists the snapshot + (possibly partial) fill
     # via the audited market.persist path, stamped with the real WS event time.
+    # --watch turns the default single-shot REST read into a feed-driven loop (Plan 02); off by
+    # default keeps single-shot the default path. --max-duration is the LOCKED safety cap bounding
+    # that loop so a missing/garbled settlement boundary cannot run forever (T-051-01).
     paper = sub.add_parser(
         "paper",
         help="Paper-trade a (city, date): feed the REAL live-book midpoint into the "
@@ -237,6 +261,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo",
         action="store_true",
         help="Use the fixed Kalshi DEMO environment (REST + future WS hosts, SSRF-safe consts).",
+    )
+    paper.add_argument(
+        "--watch",
+        action="store_true",
+        help="Run a feed-driven loop (market.client.run_feed against the live book) until the "
+        "settlement-window end, instead of the default single-shot REST read. Off by default.",
+    )
+    paper.add_argument(
+        "--max-duration",
+        type=_positive_seconds,
+        default=14400,
+        help="Safety cap in SECONDS bounding the --watch loop so a missing/garbled settlement "
+        "boundary cannot run forever (default 14400 = 4h; must be strictly positive).",
     )
     return parser
 
