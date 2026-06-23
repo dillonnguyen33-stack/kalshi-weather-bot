@@ -160,6 +160,11 @@ def live_kxhigh_market() -> dict:
     Skipped (never errored) when creds are unset. Reuses ``market.auth.KalshiSigner`` and an
     ``httpx.AsyncClient`` (the same signer + REST seam the WS client/snapshot use) — no
     re-derived auth. The host defaults to DEMO (a real-money host is never the test default).
+
+    Creds may arrive via the shell OR via the ``.env`` ``conftest`` loads — so on a dev box the
+    gate has creds even with nothing exported. The default ticker is only a representative
+    placeholder (dated KXHIGH tickers expire), so a ``404`` means "no open market to check" —
+    that is the records-the-gap SKIP, not a money-path contradiction. Auth/5xx still fail loud.
     """
     if not _have_live_creds():
         pytest.skip("no live creds — handled by _skip_no_creds on the live tests")
@@ -180,6 +185,16 @@ def live_kxhigh_market() -> dict:
         async with httpx.AsyncClient() as http:
             headers = dict(signer.sign("GET", path))  # query-stripped path (Pitfall 6)
             response = await http.get(f"{rest_host}{path}", headers=headers)
+            if response.status_code == 404:
+                # Ticker not an open market (the default is a placeholder; dated tickers
+                # expire) — records-the-gap SKIP, not a contradiction. Auth/5xx fall through
+                # to raise_for_status and fail loud (a real signing/host problem).
+                pytest.skip(
+                    f"KXHIGH market {_LIVE_KXHIGH_TICKER!r} returned 404 on the "
+                    f"{'PROD' if _USE_PROD_HOST else 'DEMO'} host — no open market to "
+                    "cross-check. Set KXHIGH_CROSSCHECK_TICKER to a currently-open KXHIGH "
+                    "market to run the live half (D-16); encoded defaults retained, gap recorded."
+                )
             response.raise_for_status()
             payload = response.json()
             # The GetMarket response wraps the record under "market".
