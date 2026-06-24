@@ -57,10 +57,24 @@ class CalibrationError(CorrectnessError, ValueError):
     """
 
 
+class ObsFetchError(RuntimeError):
+    """An ASOS/METAR obs fetch failed transiently (e.g. HTTP 429 after retries) — skip the day.
+
+    Deliberately NOT a :class:`CorrectnessError`: a rate-limited fetch is an *expected transient*
+    failure, not a correctness breach. Raising it (instead of returning ``[]``) makes the failure
+    visible to the orchestrator so a fabricated empty label is never persisted; because it is a
+    plain ``RuntimeError`` the orchestrator's generic degrade handler skips *this day* and
+    continues the backfill, rather than aborting the whole run as a ``CorrectnessError`` would.
+    The distinction it preserves: "fetch failed (unknown high)" vs. an HTTP-200 empty answer
+    ("genuinely no obs", which still legitimately persists ``obs_count=0``).
+    """
+
+
 __all__ = [
     "AvailabilityError",
     "CalibrationError",
     "CorrectnessError",
+    "ObsFetchError",
     "SanityError",
     "TargetDateError",
     "UnitError",

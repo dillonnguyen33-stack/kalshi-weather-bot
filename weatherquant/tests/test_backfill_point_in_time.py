@@ -179,3 +179,43 @@ def test_target_date_for_raises_on_impossible_window(monkeypatch: pytest.MonkeyP
         orch._target_date_for("NYC", _CYCLE, 0)
     assert issubclass(TargetDateError, CorrectnessError)
     assert issubclass(TargetDateError, ValueError)
+
+
+# --- asos-rate-limit-empty-obs: a rate-limited obs fetch must NOT fabricate an empty label ----
+
+
+async def test_ingest_obs_rate_limited_fetch_writes_no_empty_label(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A persistent 429 (ObsFetchError) must SKIP the day — never persist daily_high_f=NULL,obs_count=0."""
+    from weatherquant.ingest import obs as obs_mod
+    from weatherquant.ingest.errors import ObsFetchError
+
+    written: list[dict] = []
+
+    def _record_insert(_bind, **kwargs):  # noqa: ANN001
+        written.append(kwargs)
+        return 1
+
+    async def _rate_limited(_city, _win, *_a, **_kw):  # noqa: ANN001
+        raise ObsFetchError("IEM ASOS rate-limited (429) after retries — fallback unavailable")
+
+    # Patch the writer the obs path routes through and force the fetch to fail-loud.
+    monkeypatch.setattr(obs_mod, "insert_observation", _record_insert)
+    monkeypatch.setattr(orchestrator.obs, "fetch_asos_obs", _rate_limited)
+
+    with caplog.at_level(logging.WARNING):
+        n = await orchestrator.ingest_obs(object(), "CHI", date(2025, 3, 1))
+
+    assert n == 0  # day skipped
+    assert written == []  # NO fabricated empty ground-truth row persisted
+    # ObsFetchError is a RuntimeError (not a CorrectnessError) → graceful per-day degrade, not abort.
+    assert any("source=asos" in r.message for r in caplog.records)
+
+
+def test_obs_fetch_error_is_not_a_correctness_error():
+    """ObsFetchError must be a plain RuntimeError so the orchestrator degrades (skips) rather than aborts."""
+    from weatherquant.ingest.errors import CorrectnessError, ObsFetchError
+
+    assert issubclass(ObsFetchError, RuntimeError)
+    assert not issubclass(ObsFetchError, CorrectnessError)
