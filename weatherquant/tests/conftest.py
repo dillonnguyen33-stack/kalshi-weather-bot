@@ -59,37 +59,158 @@ def _database_url() -> str | None:
     return url
 
 
+# --- Test-DB isolation (DATA-LOSS GUARD) -------------------------------------------------
+# WHY THIS EXISTS: on 2026-06-24 a full `pytest` run WIPED the real dev ledger. The
+# `pg_engine` fixture used to build its engine via the PRODUCTION ``get_engine()`` (bound to
+# the dev ``DATABASE_URL`` ending in ``/weatherquant``) and then ran ``metadata.drop_all`` +
+# ``create_all`` every session — destroying the Mar–Jun multi-model backfill (nbm/gfs/gefs,
+# incl. ~24.7k GEFS rows); only hrrr survived because it was re-ingested afterward.
+#
+# The ``drop_all`` is correct ON A TEST DB — the defect was the ENGINE MISBINDING (the test
+# fixture pointed at the dev/prod database). The fix below runs the integration suite against
+# an ISOLATED database and HARD-REFUSES to drop_all if the resolved test URL is missing or
+# equals the dev ``DATABASE_URL`` — so drop_all can NEVER hit dev data again, even under a
+# misconfigured env. See .planning/debug/resolved/test-suite-wipes-dev-ledger.md.
+
+
+def _derive_test_url(dev_url: str) -> str:
+    """Derive an isolated ``*_test`` database URL from the dev ``DATABASE_URL``.
+
+    Replaces only the trailing database NAME with ``<name>_test`` (preserving scheme, creds,
+    host, port, and any ``?query`` string). Used only when ``TEST_DATABASE_URL`` is unset, so
+    a bare ``DATABASE_URL`` still routes the destructive schema rebuild to a separate DB and
+    never to dev. Example: ``.../weatherquant`` → ``.../weatherquant_test``.
+    """
+    base, _, tail = dev_url.rpartition("/")
+    name, sep, query = tail.partition("?")
+    return f"{base}/{name}_test{sep}{query}"
+
+
+def _split_db_name(url: str) -> tuple[str, str, str]:
+    """Split a Postgres URL into ``(prefix_up_to_last_slash, db_name, ?query)``."""
+    base, _, tail = url.rpartition("/")
+    name, sep, query = tail.partition("?")
+    return base, name, (sep + query if sep else "")
+
+
+def _resolve_test_url(dev_url: str) -> str:
+    """Resolve the isolated test-DB URL and HARD-GUARD it can never be the dev DB (DATA-LOSS).
+
+    Order: explicit ``TEST_DATABASE_URL`` (if set/non-blank) wins; otherwise derive a
+    ``*_test`` database name from ``dev_url``. Then enforce two invariants before the caller
+    is ever allowed to ``drop_all``:
+
+    1. The resolved URL is non-empty.
+    2. The resolved URL does NOT equal the dev ``DATABASE_URL``.
+
+    Any violation raises ``RuntimeError`` (fail loud, refuse to run) rather than risking the
+    dev ledger. Also re-runs the psycopg3 scheme validator (D-09 / Pitfall 4) on the test URL.
+    """
+    from weatherquant.db.engine import require_psycopg3_scheme
+
+    explicit = os.environ.get("TEST_DATABASE_URL")
+    if explicit is not None and explicit.strip() != "":
+        test_url = explicit.strip()
+    else:
+        test_url = _derive_test_url(dev_url)
+
+    if not test_url:
+        raise RuntimeError(
+            "Refusing to run ledger integration tests: resolved TEST DATABASE URL is empty. "
+            "Set TEST_DATABASE_URL=postgresql+psycopg://.../weatherquant_test (a SEPARATE DB). "
+            "(DATA-LOSS GUARD — see test-suite-wipes-dev-ledger incident, 2026-06-24.)"
+        )
+    if test_url == dev_url:
+        raise RuntimeError(
+            "Refusing to run ledger integration tests: the TEST DATABASE URL equals the dev "
+            "DATABASE_URL. The fixture does metadata.drop_all/create_all and would WIPE dev "
+            "data. Point TEST_DATABASE_URL at a SEPARATE database (e.g. a '_test' suffix). "
+            "(DATA-LOSS GUARD — see test-suite-wipes-dev-ledger incident, 2026-06-24.)"
+        )
+
+    require_psycopg3_scheme(test_url)  # D-09 / Pitfall 4 — a bad scheme fails loud here too.
+    return test_url
+
+
+def _ensure_test_database(test_url: str) -> None:
+    """Create the isolated test database if it does not already exist (safe, idempotent).
+
+    Connects to the cluster's ``postgres`` maintenance database (NOT the dev DB) using the same
+    credentials/host, and issues ``CREATE DATABASE`` only — never any drop/truncate. If the DB
+    already exists (DuplicateDatabase), the error is swallowed. If the maintenance DB is itself
+    unreachable, the error propagates so the suite fails loud rather than silently mis-targeting.
+    """
+    import sqlalchemy as sa
+    from sqlalchemy.exc import ProgrammingError
+
+    base, db_name, _query = _split_db_name(test_url)
+    # Strip any query string from the maintenance URL — we just need a control connection.
+    admin_url = f"{base}/postgres"
+    admin_engine = sa.create_engine(admin_url, future=True, hide_parameters=True)
+    try:
+        with admin_engine.connect() as conn:
+            conn.execution_options(isolation_level="AUTOCOMMIT")  # CREATE DATABASE needs autocommit
+            exists = conn.execute(
+                sa.text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": db_name}
+            ).scalar()
+            if not exists:
+                # Identifier can't be a bound param; db_name is derived from our own config,
+                # not user input. Quote it to be safe.
+                conn.execute(sa.text(f'CREATE DATABASE "{db_name}"'))
+    except ProgrammingError as exc:  # e.g. a race created it between the check and CREATE
+        if "DuplicateDatabase" not in repr(exc) and "already exists" not in str(exc):
+            raise
+    finally:
+        admin_engine.dispose()
+
+
 @pytest.fixture(scope="session")
 def pg_engine():
-    """Yield a SQLAlchemy Engine bound to the test Postgres (DATABASE_URL).
+    """Yield a SQLAlchemy Engine bound to an ISOLATED test Postgres (never the dev DB).
 
-    Skips cleanly (not errors) when DATABASE_URL is unset, so the fast subset stays green
-    on machines without a database. When set, the engine is obtained via the production
-    ``weatherquant.db.engine.get_engine()`` — so the suite exercises the real engine
-    (validated psycopg3 scheme, ``hide_parameters``, and ``preserve_rowcount`` so INSERT
-    rowcount==1 holds, D-11) rather than an ad-hoc one. A trivial ``SELECT 1``
-    connectivity check runs before the integration tests; the schema is built from the
-    Core metadata (imported lazily).
+    Skips cleanly (not errors) when ``DATABASE_URL`` is unset, so the fast subset stays green
+    on machines without a database. When set, the destructive schema rebuild
+    (``drop_all``/``create_all``) is routed to a SEPARATE database — ``TEST_DATABASE_URL`` if
+    set, otherwise a ``*_test`` database derived from ``DATABASE_URL`` — and a HARD GUARD
+    (:func:`_resolve_test_url`) raises if that resolved URL is empty or equals the dev
+    ``DATABASE_URL``. This exists because a prior suite run wiped the dev ledger (2026-06-24);
+    drop_all must NEVER reach dev data.
+
+    The engine is built with the SAME production options as ``get_engine`` (``hide_parameters``
+    + ``preserve_rowcount`` so INSERT rowcount==1 holds, D-11) and the SAME validated psycopg3
+    scheme (D-09 / Pitfall 4), but bound to the isolated URL rather than the prod engine. A
+    trivial ``SELECT 1`` connectivity check runs first; the schema (incl. the append-only
+    UPDATE/DELETE/TRUNCATE guard triggers, installed via metadata ``after_create`` events) is
+    rebuilt from the Core metadata each session so DDL changes always take effect on the test DB.
     """
-    url = _database_url()
-    if url is None:
+    dev_url = _database_url()
+    if dev_url is None:
         pytest.skip(
             "DATABASE_URL unset — skipping ledger integration tests "
             "(set DATABASE_URL=postgresql+psycopg://... to enable)."
         )
 
-    # Obtain the PRODUCTION engine. get_settings() inside get_engine() runs the same
-    # exact-match psycopg3 scheme validator (Pitfall 4 / D-09); a bad scheme raises here.
     import sqlalchemy as sa
 
-    from weatherquant.db.engine import get_engine
-
+    # Resolve + hard-guard the ISOLATED test URL (raises if empty or == dev DATABASE_URL).
     try:
-        engine = get_engine()
-    except ValueError as exc:
+        test_url = _resolve_test_url(dev_url)
+    except ValueError as exc:  # bad psycopg3 scheme (D-09) surfaces as a clean test failure.
         pytest.fail(str(exc))
 
-    # Connectivity check — proves Postgres is reachable before integration tests run.
+    # Create the isolated test DB if missing (safe: CREATE DATABASE only, on the maintenance DB).
+    _ensure_test_database(test_url)
+
+    # Build an engine bound to the TEST URL with the production engine options (D-11) — NOT the
+    # prod get_engine() (that is bound to the dev DATABASE_URL and was the data-loss path).
+    engine = sa.create_engine(
+        test_url,
+        future=True,
+        hide_parameters=True,
+        execution_options={"preserve_rowcount": True},
+    )
+
+    # Connectivity check — proves the isolated Postgres is reachable before integration tests.
     with engine.connect() as conn:
         conn.execute(sa.text("SELECT 1"))
 
@@ -101,6 +222,7 @@ def pg_engine():
     # create_all is a no-op on pre-existing tables and would NOT re-run their after_create
     # trigger DDL, leaving a stale schema from a prior run. drop_all first guarantees the
     # current append-only guards (UPDATE/DELETE + TRUNCATE) are installed every session.
+    # SAFE because `engine` is bound to the guarded, isolated `test_url` — never the dev DB.
     metadata.drop_all(engine)
     metadata.create_all(engine)
     try:
