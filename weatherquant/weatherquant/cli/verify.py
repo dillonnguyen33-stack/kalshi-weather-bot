@@ -48,6 +48,17 @@ _SEED = 0
 # ROI/CLV must NEVER be declarable without pricing a real fill against a real closing line.
 _NOT_SCORED_CI = (0.0, 0.0)
 
+# 06-09 / GAP-2 (T-06-09-T1): the minimum number of DISTINCT LST fill-days below which ROI/CLV map
+# to the not_scored sentinel rather than a bootstrap CI. The paired day-block bootstrap (D-04)
+# resamples WHOLE DAYS with replacement; with a single distinct fill-day every resample draws that
+# same day, so the resample distribution is a DEGENERATE point (zero-width CI) — and a HIGHER_IS_BETTER
+# zero-width "interval" at a profitable point trivially excludes zero, manufacturing a Gate-1 PASS on
+# n=1 (exactly the "CIs EXCLUDING ZERO" risk PROJECT.md forbids). 2 distinct fill-days is the minimum
+# at which resampling can produce a non-degenerate (positive-width) day-block CI, so it is the
+# principled floor for scoring the money gate. Below it we honestly decline (the pinned sentinel),
+# never a degenerate point pass.
+_MIN_FILL_DAYS_FOR_CI = 2
+
 
 def run_verify(args: argparse.Namespace) -> int:
     """Run the Gate-1 paired proof / drift monitor and return a process exit code (D-12 / SYS-02).
@@ -181,11 +192,14 @@ def run_verify(args: argparse.Namespace) -> int:
 
     # ROI/CLV (real off the ledger): metrics.roi_from_fills / metrics.mean_clv read the real fills +
     # market_snapshots rows for the test-window ticker(s) and settle each fill against
-    # observations.daily_high_f. When the window's fills ledger is EMPTY (the common Phase-6 case —
-    # the window predates live paper trading), each maps to the PINNED _NOT_SCORED_CI = (0.0, 0.0)
-    # with a not_scored status — the gate FAILs explicitly ("not scored / FAIL"), never a proxy CI
-    # that could read as PASS (CR-01 / T-06-19/T-06-20). Caveat: ROI/CLV are scored taker-only at
-    # 1-contract sizing (RESEARCH Open Question 3 / A5) — recorded in the verdict text.
+    # observations.daily_high_f. ROI/CLV now go through the SAME paired day-block bootstrap as
+    # brier/crps/ece (06-09 / GAP-2), keyed on the LST SETTLEMENT DAY (WR-04, not raw UTC date) and
+    # threading sides into both metrics (side-aware ROI). When the window's fills ledger is EMPTY, OR
+    # there are fewer than _MIN_FILL_DAYS_FOR_CI distinct LST fill-days (a single profitable fill
+    # cannot yield a non-degenerate CI), each maps to the PINNED _NOT_SCORED_CI = (0.0, 0.0) with a
+    # not_scored status — the gate FAILs explicitly ("not scored / FAIL"), NEVER a zero-width point
+    # CI that could read as PASS on n=1 (CR-01 / T-06-09-T1 / T-06-19/T-06-20). Caveat: ROI/CLV are
+    # scored taker-only at 1-contract sizing (RESEARCH Open Question 3 / A5) — recorded in the verdict.
     (roi_ci, clv_ci), roi_clv_not_scored = _roi_clv_cis(
         bind, city, model, start, end, metrics
     )
@@ -307,31 +321,73 @@ def _crps_score_fn(scored, metrics):
     return score
 
 
+def _lst_settlement_day(event_time, city):
+    """Resolve a fill's LST SETTLEMENT DAY from its UTC ``event_time`` (WR-04 — the bootstrap key).
+
+    Kalshi settles a daily-high market on the city's midnight-to-midnight LOCAL STANDARD TIME day
+    (no DST — the v3 founding bug PROJECT.md calls out). ``time.settlement_window(city, D)`` defines
+    the half-open UTC window ``[start_utc, end_utc)`` for LST day ``D`` as ``midnight(D) - off``
+    (``off = std_offset_hours``); inverting, the LST day containing ``event_time`` is
+    ``(event_time + off).date()``. We CONFIRM the inversion against ``settlement_window`` (the single
+    LST primitive, D-03) so the block key is the same clock the obs/settlement paths use — NEVER the
+    raw UTC ``event_time.date()``, which would mis-block a near-boundary fill into the wrong day,
+    miscounting distinct fill-days (flipping the scored/not_scored gate) and resampling the wrong day.
+    """
+    from datetime import timedelta
+
+    from weatherquant.time import settlement_window
+
+    lst_day = (event_time + timedelta(hours=city.std_offset_hours)).date()
+    # Defensive confirm against the canonical LST primitive (D-03): event_time must lie inside the
+    # half-open window of the day we resolved. Fail loud rather than silently mis-block the money key.
+    if not settlement_window(city, lst_day).contains(event_time):
+        raise ValueError(
+            f"_lst_settlement_day: {event_time!r} does not fall in the LST settlement window of "
+            f"{lst_day} for {city.cli_station} — the block-key inversion disagrees with "
+            "time.settlement_window (refusing to mis-block the money-gate CI)."
+        )
+    return lst_day
+
+
 def _roi_clv_cis(bind, city, model, start, end, metrics):
-    """Real ROI/CLV CIs off the ledger, or the PINNED not_scored sentinel (CR-01 / T-06-19/20).
+    """Real ROI/CLV day-block bootstrap CIs off the ledger, or the PINNED not_scored sentinel.
 
     Reads the test-window ``fills`` + ``market_snapshots`` rows for the city's KXHIGH ticker(s) via
     ``db.queries.latest``, settles each fill against ``observations.daily_high_f`` (the bucket the
-    ticker resolves to vs the settled high — RESEARCH Code Example 2), and scores
-    ``metrics.roi_from_fills`` / ``metrics.mean_clv`` (CENTS, taker-only 1-contract sizing —
-    RESEARCH OQ3/A5). When NO fills exist for the window (the common Phase-6 case — the window
-    predates live paper trading), returns ``((_NOT_SCORED_CI, _NOT_SCORED_CI), True)``: roi/clv map
-    to the PINNED ``(0.0, 0.0)`` sentinel and the caller records the ``not_scored`` status so the
-    gate FAILs explicitly ("not scored / FAIL"), NEVER a proxy CI that can read as a PASS.
+    ticker resolves to vs the settled high — RESEARCH Code Example 2), groups the fills by their LST
+    SETTLEMENT DAY (WR-04 — via ``time.settlement_window`` / the city clock, NEVER the raw UTC
+    ``event_time.date()``), and routes ROI/CLV through the SAME ``bootstrap.paired_day_block_ci`` as
+    brier/crps/ece (CENTS, taker-only 1-contract sizing — RESEARCH OQ3/A5), threading ``sides`` into
+    BOTH ``metrics.roi_from_fills`` and ``metrics.mean_clv`` (closing the side-blind defect at the
+    call site).
+
+    The block key is the LST settlement day for BOTH the ``_MIN_FILL_DAYS_FOR_CI`` distinct-day gate
+    AND the bootstrap resample, so a near-boundary fill counts toward and resamples the correct day.
+    When NO fills exist for the window, OR fewer than ``_MIN_FILL_DAYS_FOR_CI`` distinct LST
+    fill-days exist (a single profitable fill cannot produce a non-degenerate day-block CI), returns
+    ``((_NOT_SCORED_CI, _NOT_SCORED_CI), True)``: roi/clv map to the PINNED ``(0.0, 0.0)`` sentinel
+    and the caller records the ``not_scored`` status so the gate FAILs explicitly ("not scored /
+    FAIL"), NEVER a degenerate zero-width point CI that can read as a PASS (T-06-09-T1, removing the
+    WR-06 hard-coded ``((roi, roi), (clv, clv))`` path).
 
     Returns ``((roi_ci, clv_ci), not_scored)``: ``not_scored`` is ``True`` when the ledger had no
-    fills (both CIs are ``_NOT_SCORED_CI``), ``False`` when real CIs were scored.
+    fills or too few distinct LST fill-days, ``False`` when real bootstrap CIs were scored.
     """
     from weatherquant.db import queries
+    from weatherquant.registry import get_city
+    from weatherquant.verify import bootstrap
     from weatherquant.verify.backtest import _resolve_city_key
 
     city_key = _resolve_city_key(city)
-    # Read the real fills ledger for the window's ticker(s). With no fills (the common Phase-6 case)
-    # the metric is NOT scorable — map to the pinned sentinel and fail loud, never fabricate a CI.
-    try:
+    # Read the real fills ledger for the window's ticker(s). WR-01 (fail loud per CLAUDE.md): an
+    # EMPTY ledger is the legitimate not_scored case (queries.latest returns [] — never raises), but
+    # a genuine read error (SQLAlchemyError / unexpected exception) on the MONEY gate must CRASH, not
+    # masquerade as not_scored — so we do NOT blanket-swallow exceptions. A ``None`` bind is the
+    # explicit "no ledger bound" sentinel the unit tests use (there is no engine to read) → no fills.
+    if bind is None:
+        fills: list = []
+    else:
         fills = list(queries.latest(bind, "fills"))
-    except Exception:  # noqa: BLE001 — a ledger read failure is a not_scored, not a crash
-        fills = []
     window_fills = [
         f for f in fills if _fill_in_window(f, city_key, start, end)
     ]
@@ -344,15 +400,62 @@ def _roi_clv_cis(bind, city, model, start, end, metrics):
         )
         return (_NOT_SCORED_CI, _NOT_SCORED_CI), True
 
-    # A real non-empty fills ledger: settle each fill and score the real ROI/CLV (CENTS). The day is
-    # the bootstrap block, but the fills ledger is sparse here — score the pooled point estimate as a
-    # degenerate CI so the real metric is exercised end-to-end (the integration test seeds this path).
+    # Settle each window fill, then GROUP by the LST settlement day (the WR-04 block key). The same
+    # key feeds the distinct-day gate AND the bootstrap resample so a near-boundary fill is correct
+    # in both. We thread sides into BOTH roi_from_fills and mean_clv (the side-blind fix).
     settled_yes, clv_fills, snaps_per_fill, sides = _settle_window_fills(
         bind, window_fills, city_key
     )
-    roi = metrics.roi_from_fills(window_fills, settled_yes)
-    clv = metrics.mean_clv(clv_fills, snaps_per_fill, sides)
-    return ((roi, roi), (clv, clv)), False
+    settle_city = get_city(city_key)
+    by_lst_day: dict = {}
+    for fill, syes, cfill, snaps, side in zip(
+        window_fills, settled_yes, clv_fills, snaps_per_fill, sides, strict=True
+    ):
+        event_time = fill["event_time"] if hasattr(fill, "__getitem__") else fill.event_time
+        lst_day = _lst_settlement_day(event_time, settle_city)
+        by_lst_day.setdefault(lst_day, []).append((fill, syes, cfill, snaps, side))
+
+    # Below the principled minimum distinct LST fill-days, a day-block CI is degenerate (zero-width)
+    # — decline honestly (the pinned sentinel), NEVER a degenerate point pass on n=1 (T-06-09-T1).
+    if len(by_lst_day) < _MIN_FILL_DAYS_FOR_CI:
+        logger.info(
+            "verify: only %d distinct LST fill-day(s) for %s (< %d) — ROI/CLV NOT SCORED "
+            "(pinned %s, FAIL); a single fill-day cannot yield a non-degenerate day-block CI.",
+            len(by_lst_day), city, _MIN_FILL_DAYS_FOR_CI, _NOT_SCORED_CI,
+        )
+        return (_NOT_SCORED_CI, _NOT_SCORED_CI), True
+
+    # Day-keyed score_fns mirroring _crps_score_fn: pool the fills for the resampled LST days and
+    # score the REAL pooled ROI / mean CLV (sides threaded into both). Fed to the SAME day-block
+    # bootstrap as brier/crps/ece, keyed on the LST settlement day.
+    def roi_score_fn(sampled_days):
+        rows = [row for d in sampled_days for row in by_lst_day.get(d, [])]
+        if not rows:
+            return 0.0
+        day_fills = [r[0] for r in rows]
+        day_settled = [r[1] for r in rows]
+        day_sides = [r[4] for r in rows]
+        return metrics.roi_from_fills(day_fills, day_settled, day_sides)
+
+    def clv_score_fn(sampled_days):
+        rows = [row for d in sampled_days for row in by_lst_day.get(d, [])]
+        if not rows:
+            return 0.0
+        day_clv_fills = [r[2] for r in rows]
+        day_snaps = [r[3] for r in rows]
+        day_sides = [r[4] for r in rows]
+        return metrics.mean_clv(day_clv_fills, day_snaps, day_sides)
+
+    lst_fill_day_keys = list(by_lst_day.keys())
+    roi_lo, roi_hi, _ = bootstrap.paired_day_block_ci(
+        lst_fill_day_keys, roi_score_fn, n_resamples=_N_RESAMPLES, seed=_SEED,
+        alpha=1.0 - _CI_LEVEL,
+    )
+    clv_lo, clv_hi, _ = bootstrap.paired_day_block_ci(
+        lst_fill_day_keys, clv_score_fn, n_resamples=_N_RESAMPLES, seed=_SEED,
+        alpha=1.0 - _CI_LEVEL,
+    )
+    return ((roi_lo, roi_hi), (clv_lo, clv_hi)), False
 
 
 class _AvgPriceFill:
@@ -370,7 +473,13 @@ class _AvgPriceFill:
 
 
 def _fill_in_window(fill, city_key, start, end) -> bool:
-    """True iff ``fill``'s ticker resolves to ``city_key`` and its event date is in ``[start, end)``."""
+    """True iff ``fill``'s ticker resolves to ``city_key`` and its LST settlement day is in ``[start, end)``.
+
+    WR-04 (windowing): the window membership is decided on the fill's LST SETTLEMENT DAY (the day
+    Kalshi resolves it on), consistent with the LST block key — never the raw UTC ``event_time.date()``,
+    which would window a near-boundary fill on the wrong day.
+    """
+    from weatherquant.registry import get_city
     from weatherquant.verify.backtest import _resolve_city_key
 
     ticker = fill.get("ticker") if hasattr(fill, "get") else getattr(fill, "ticker", None)
@@ -383,7 +492,7 @@ def _fill_in_window(fill, city_key, start, end) -> bool:
     event_time = fill.get("event_time") if hasattr(fill, "get") else getattr(fill, "event_time", None)
     if event_time is None:
         return False
-    d = event_time.date()
+    d = _lst_settlement_day(event_time, get_city(city_key))
     return start <= d < end
 
 
@@ -413,7 +522,10 @@ def _settle_window_fills(bind, window_fills, city_key):
     for fill in window_fills:
         ticker = fill["ticker"] if hasattr(fill, "__getitem__") else fill.ticker
         event_time = fill["event_time"] if hasattr(fill, "__getitem__") else fill.event_time
-        day = event_time.date()
+        # WR-04: settle and select closing snapshots on the fill's LST SETTLEMENT DAY (not the raw
+        # UTC event_time.date()), consistent with the LST block key — a near-boundary fill settles
+        # against the day Kalshi actually resolves it on, and its closing window is that LST day.
+        day = _lst_settlement_day(event_time, get_city(city_key))
         lo_i, hi_i, open_lo, open_hi = parse_ticker(ticker)
         lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
         obs = queries.latest(
