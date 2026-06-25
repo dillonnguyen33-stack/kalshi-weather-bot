@@ -43,7 +43,10 @@ def test_constant_per_day_delta_gives_ci_around_that_delta():
 
     day_keys, score_fn = _constant_delta_days(60, delta=0.05)
     lo, hi, _dist = bootstrap.paired_day_block_ci(day_keys, score_fn, n_resamples=2000, seed=1)
-    assert lo <= 0.05 <= hi
+    # ``np.mean`` of 60 copies of 0.05 is 0.04999999999999998 (one ULP below 0.05 — IEEE-754
+    # summation, not a bootstrap artifact), so bracket the delta at float tolerance, not the
+    # literal 0.05. The CI must still tightly enclose the true per-day delta.
+    assert lo <= 0.05 <= hi or (lo, hi) == pytest.approx((0.05, 0.05))
     assert (hi - lo) < 1e-6  # a constant delta has ~zero resample variance
 
 
