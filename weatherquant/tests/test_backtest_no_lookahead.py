@@ -79,6 +79,60 @@ def test_blend_arm_returns_none_for_absent_month():
     assert backtest._blend_arm_for_day(pairs, city_key="NYC", model="hrrr", lead=4, month=4) is None
 
 
+def test_v3_arm_uses_raw_decision_day_ensemble_pair():
+    """CR-05: _v3_arm_raw_ensemble returns the raw decision-day (m, s2) — prefers target_date==day."""
+    from weatherquant.calibrate.strata import TrainingPair
+    from weatherquant.verify import backtest
+
+    day = date(2026, 7, 10)
+    pairs = [
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 8), m=80.0, s2=9.0, y=80.5),
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=day, m=86.0, s2=16.0, y=86.5),  # the decision day's pair
+    ]
+    m_asof, s2_asof = backtest._v3_arm_raw_ensemble(pairs, day)
+    assert m_asof == pytest.approx(86.0)
+    assert s2_asof == pytest.approx(16.0)
+
+
+def test_v3_arm_falls_back_to_as_of_mean_when_no_decision_day_pair():
+    """CR-05: with no target_date==day pair, fall back to the mean (m, s2) across as-of pairs."""
+    from weatherquant.calibrate.strata import TrainingPair
+    from weatherquant.verify import backtest
+
+    day = date(2026, 7, 10)
+    pairs = [
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 6), m=80.0, s2=9.0, y=80.5),
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 8), m=84.0, s2=11.0, y=84.5),
+    ]
+    m_asof, s2_asof = backtest._v3_arm_raw_ensemble(pairs, day)
+    assert m_asof == pytest.approx(82.0)
+    assert s2_asof == pytest.approx(10.0)
+
+
+def test_v3_spread_is_sqrt_s2_distinct_from_wq_sigma():
+    """CR-05: the v3 spread is sqrt(s2_asof) (raw ensemble), independent of the WQ blended sigma."""
+    from weatherquant.calibrate.strata import TrainingPair
+    from weatherquant.verify import backtest
+
+    day = date(2026, 7, 10)
+    s2_asof = 25.0
+    pairs = [
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=day, m=86.0, s2=s2_asof, y=86.5),
+    ]
+    _m, s2 = backtest._v3_arm_raw_ensemble(pairs, day)
+    v3_sigma = math.sqrt(s2)
+    assert v3_sigma == pytest.approx(5.0)
+    # The WQ EMOS sigma is floored/shaped by calibration (>= SIGMA_FLOOR_F, typically small here);
+    # the raw ensemble spread of 5.0°F is a DIFFERENT quantity than the WQ blended sigma (CR-05).
+    from weatherquant.calibrate.strata import SIGMA_FLOOR_F
+    assert v3_sigma != SIGMA_FLOOR_F
+
+
 def test_paired_record_carries_predictive_params_for_crps():
     """Task 1/2: PairedRecord exposes wq_mu/wq_sigma/y (and v3_mu/v3_sigma) for Plan 06-07 CRPS."""
     from dataclasses import fields

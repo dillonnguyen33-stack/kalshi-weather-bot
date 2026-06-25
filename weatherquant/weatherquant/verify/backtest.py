@@ -199,6 +199,29 @@ def _point_in_time_bias(pairs) -> float:
     return float(residuals.mean())
 
 
+def _v3_arm_raw_ensemble(pairs, day: date) -> tuple[float, float]:
+    """The RAW decision-day ensemble pair ``(m_asof, s2_asof)`` for the v3 arm (CR-05/D-02).
+
+    verify-subtree D-02 (raw-ensemble v3): the v3 baseline must be priced from the SAME ledger
+    ensemble rows the WQ arm sees — the raw ``m`` / ``s2`` off ``assemble_pairs_from_rows`` — NOT
+    from WQ's EMOS-corrected ``mu_b`` / Vincentized ``sigma_b``. Otherwise the "v3 baseline" is
+    partly WQ's own calibration and the apples-to-apples comparison is voided (CR-05).
+
+    Prefers the ``TrainingPair`` whose ``target_date == day`` (the decision day's own ensemble);
+    if none exists (the as-of training set predates D), falls back to the mean ``m`` / mean ``s2``
+    across the as-of pairs — a documented point-in-time fallback that uses no future row. The v3
+    spread floor ``max(spread, 0.5)`` is applied INSIDE ``v3_bucket_probs`` (the legacy contract),
+    so this returns the un-floored raw ``s2``; the caller takes ``sqrt(s2)`` as the v3 spread.
+    """
+    for p in pairs:
+        if p.target_date == day:
+            return float(p.m), float(p.s2)
+    # No decision-day pair: the as-of mean ensemble (point-in-time, never a future row).
+    m_asof = float(np.mean([p.m for p in pairs]))
+    s2_asof = float(np.mean([p.s2 for p in pairs]))
+    return m_asof, s2_asof
+
+
 def _blend_arm_for_day(pairs, *, city_key: str, model: str, lead: int, month: int):
     """Refit EMOS and return the DECISION DAY'S month-fit WQ blend ``(mu_b, sigma_b)`` (D-04/CR-02).
 
@@ -356,16 +379,23 @@ def walk_forward(
             _log_exclusion(coverage_log, day, city, "no_market_ladder")
             continue
 
+        # CR-05/D-02: the v3 arm is priced from the RAW decision-day ensemble (m_asof, sqrt(s2_asof))
+        # plus the point-in-time bias — INDEPENDENT of WQ's EMOS mu_b / Vincentized sigma_b — so
+        # methodology is the only difference (VER-04). The v3 spread floor max(spread, 0.5) is
+        # applied inside v3_bucket_probs; do NOT pre-floor with SIGMA_FLOOR_F.
+        m_asof, s2_asof = _v3_arm_raw_ensemble(pairs, day)
         bias = _point_in_time_bias(pairs)
-        corrected_mean = mu_b + bias
+        v3_mu = m_asof + bias
+        v3_sigma = float(np.sqrt(s2_asof))
         # The shared continuous spans (lo_edge, hi_edge, open_lo, open_hi) — the ONE geometry both
         # arms price; never re-derived per arm (VER-04 — methodology is the only difference).
         wq_ladder = [b["span"] for b in ladder]
         v3_ladder = [b["entry"] for b in ladder]
         # WQ arm: production blend → bucket CDF differencing (price.buckets).
         wq = bucket_probs(mu_b, sigma_b, wq_ladder)
-        # v3 arm: SAME ensemble-derived mean/spread + point-in-time bias (D-02/A4, leak-safe).
-        v3 = v3_bucket_probs(corrected_mean, sigma_b, v3_ladder)
+        # v3 arm: RAW ensemble mean/spread + point-in-time bias (CR-05/D-02/A4, leak-safe) — NOT
+        # mu_b/sigma_b.
+        v3 = v3_bucket_probs(v3_mu, v3_sigma, v3_ladder)
         v3_list = list(v3.values())
 
         for i, b in enumerate(ladder):
@@ -380,9 +410,12 @@ def walk_forward(
                     v3_prob=float(v3_list[i]),
                     o_i=o_i,
                     # Per-record predictive params carried for Plan 06-07 real-CRPS scoring
-                    # (CR-02 WQ arm = the decision day's month-fit Gaussian).
+                    # (CR-02 WQ arm = the decision day's month-fit Gaussian; CR-05 v3 arm = the
+                    # raw decision-day ensemble (m+bias, sqrt(s2))).
                     wq_mu=float(mu_b),
                     wq_sigma=float(sigma_b),
+                    v3_mu=float(v3_mu),
+                    v3_sigma=float(v3_sigma),
                     y=float(y),
                 )
             )
