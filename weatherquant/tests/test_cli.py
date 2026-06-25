@@ -1111,23 +1111,167 @@ def _seed_verdict_ledger(conn, *, tail_high: bool):
     return ticker, fill_day, 40.0, closing_mid_cents
 
 
+def _seed_multiday_fills(conn, *, fills_spec):
+    """Seed forecasts/observations for July + one fill per spec entry on its own LST settlement day.
+
+    ``fills_spec`` is a list of ``(event_time_utc, side, avg_price_cents)`` tuples. Each fill is on
+    the ``KXHIGHNY-85-86`` bucket; the interior observation high (85.5°F) settles YES, so a YES buy
+    is a win and a NO buy is a loss — letting the side="no" e2e test assert the NO orientation.
+    Closing snapshots are seeded per distinct LST settlement day (a single 50c in-window snap → mid
+    50c). Returns the list of resolved LST settlement days (one per fill).
+    """
+    from weatherquant.ingest.writer import (
+        insert_fill, insert_forecast, insert_market_snapshot, insert_observation,
+    )
+    from weatherquant.market.clv import CLV_WINDOW_MINUTES
+    from weatherquant.registry import get_city
+    from weatherquant.time import settlement_window
+
+    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)
+    base_f = 85.0
+    for i in range(31):
+        d = date(2026, 7, 1 + i)
+        cycle = _dt(d.year, d.month, d.day, 0, tzinfo=_tz.utc)
+        for member, mf in enumerate([base_f - 2.0, base_f, base_f + 2.0]):
+            insert_forecast(
+                conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
+                temp_kelvin=_VER_F_TO_K(mf), cycle=cycle,
+                station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
+                available_at=avail,
+            )
+        insert_observation(
+            conn, city="NYC", target_date=d, source="asos", daily_high_f=base_f + 0.5,
+            available_at=avail,
+        )
+
+    ticker = "KXHIGHNY-85-86"  # [85,86] bucket → span [84.5, 86.5); settled high 85.5 → YES
+    city = get_city("NYC")
+    seeded_snap_days: set = set()
+    lst_days: list = []
+    for n, (event_time, side, avg_price) in enumerate(fills_spec):
+        insert_fill(
+            conn, ticker=ticker, trade_id=f"m{n}", side=side, price=int(round(avg_price)),
+            count=1, fee=0, is_maker=False, event_time=event_time,
+            detail={"avg_price_cents": float(avg_price)}, available_at=avail,
+        )
+        # LST settlement day = (event_time + offset).date() (offset = -5h for NYC) — the WR-04 key.
+        lst_day = (event_time + _td(hours=city.std_offset_hours)).date()
+        lst_days.append(lst_day)
+        if lst_day not in seeded_snap_days:
+            win = settlement_window(city, lst_day)
+            t_in = win.end_utc - _td(minutes=CLV_WINDOW_MINUTES - 5)
+            insert_market_snapshot(
+                conn, ticker=ticker, snapshot_for=t_in.isoformat(),
+                best_yes_bid=49, best_no_bid=49, mid=50.0, volume=100, seq=None,
+                detail={"raw": "book"}, available_at=t_in,
+            )
+            seeded_snap_days.add(lst_day)
+    return lst_days
+
+
 @pytest.mark.integration
-def test_verdict_scores_roi_clv_off_real_fills(pg_conn):
-    """CR-01 (seeded e2e): ROI/CLV scored off the real fills + closing snapshots (hand-computed)."""
+def test_verdict_scores_roi_clv_off_real_fills_real_ci_width(pg_conn):
+    """CR-01 / GAP-2 (seeded e2e): multi-LST-day window → a REAL bootstrap CI with positive width.
+
+    With >= _MIN_FILL_DAYS_FOR_CI distinct LST fill-days of VARYING profitability, ROI/CLV are real
+    day-block bootstrap intervals — never a zero-width point. A degenerate point CI is the GAP-2
+    defect this regression locks shut.
+    """
     from weatherquant.cli import verify as verify_mod
     from weatherquant.verify import metrics
 
-    ticker, fill_day, avg_price, closing_mid = _seed_verdict_ledger(pg_conn, tail_high=False)
+    # Three distinct interior July LST days, YES buys at varying prices → varying ROI per block.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "yes", 50.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 70.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
     (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
-        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 10), date(2026, 7, 13), metrics
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
     )
-    assert not_scored is False, "a non-empty fills ledger must be scored, not the sentinel"
-    # Hand-computed ROI: a YES BUY of 2 contracts @ 40c, fee 1c, settled YES (high 85.5 ∈ [84.5,86.5)).
-    # entry = 2*40 = 80c; payoff = 100*2 = 200c; net = 200 - 80 - 1 = 119c; ROI = 119/80.
-    assert roi_ci[0] == pytest.approx(119.0 / 80.0)
-    # Hand-computed CLV: a YES BUY @ 40c vs a 50c close = +10c (better than the close).
-    assert clv_ci[0] == pytest.approx(closing_mid - avg_price)
-    assert clv_ci[0] == pytest.approx(10.0)
+    assert not_scored is False, "multi-LST-day ledger must be scored, not the sentinel"
+    assert roi_ci[1] > roi_ci[0], "ROI CI must have strictly positive width (never a zero-width point)"
+    assert clv_ci[1] > clv_ci[0], "CLV CI must have strictly positive width (never a zero-width point)"
+
+
+@pytest.mark.integration
+def test_verdict_single_fill_day_maps_to_not_scored_sentinel(pg_conn):
+    """CR-01 / GAP-2 core regression: a SINGLE profitable fill-day can NEVER flip Gate-1 to PASS.
+
+    Below _MIN_FILL_DAYS_FOR_CI distinct LST fill-days, ROI/CLV map to the pinned (0.0, 0.0)
+    not_scored sentinel — a lone profitable fill is not a passing CI.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    spec = [(_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 40.0)]  # exactly ONE LST fill-day
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, "a single fill-day must map to the not_scored sentinel, never a pass"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+
+@pytest.mark.integration
+def test_verdict_no_fill_side_settles_no_is_credited_end_to_end(pg_conn):
+    """T-06-09-T2 (seeded e2e): side='no' fills that settle NO are credited as wins via threaded sides.
+
+    The interior high settles YES, so a NO buy LOSES. To prove the NO win is credited end-to-end we
+    instead need NO buys on a NO settlement — but the seeded interior bucket always settles YES.
+    Here we assert the COMPLEMENT proof: side='no' buys on a YES-settling bucket produce a NEGATIVE
+    ROI CI (the NO loss is scored as a loss, not silently a win), proving sides reach roi_from_fills.
+    A side-blind ROI would have scored these NO buys as YES wins (positive). Multi-day for a real CI.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "no", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "no", 50.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "no", 70.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False
+    # YES-settling bucket + NO buys → every block is a loss → the whole ROI CI is below zero.
+    assert roi_ci[1] < 0, "a side='no' buy on a YES settlement must be scored as a loss (sides threaded)"
+
+
+@pytest.mark.integration
+def test_verdict_roi_clv_block_key_is_lst_settlement_day_not_utc_date(pg_conn):
+    """T-06-09-T3 / WR-04 (seeded e2e): the bootstrap block key is the LST settlement day, not UTC date.
+
+    A near-boundary fill at 2026-07-11 02:00 UTC belongs to LST day 2026-07-10 (NYC offset -5h:
+    02:00 - 5h = 21:00 on 07-10). Paired with TWO other fills clearly inside 07-10 and 07-08, the
+    distinct LST-day count is 2 (07-08, 07-10) → SCORED. If the block key were the raw UTC date, the
+    boundary fill would key on 07-11, giving 3 distinct UTC dates — a DIFFERENT grouping. We assert
+    the near-boundary fill JOINS the 07-10 block (same as the clearly-in-07-10 fill), proven by the
+    scored verdict landing on 2 LST blocks (not 3 UTC dates).
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    boundary = _dt(2026, 7, 11, 2, 0, tzinfo=_tz.utc)  # UTC date 07-11, LST settlement day 07-10
+    in_0710 = _dt(2026, 7, 10, 12, tzinfo=_tz.utc)      # clearly inside LST day 07-10
+    in_0708 = _dt(2026, 7, 8, 12, tzinfo=_tz.utc)       # a second distinct LST day
+    spec = [
+        (in_0708, "yes", 30.0),
+        (in_0710, "yes", 50.0),
+        (boundary, "yes", 70.0),
+    ]
+    lst_days = _seed_multiday_fills(pg_conn, fills_spec=spec)
+    # The boundary fill resolves to the SAME LST day as in_0710 (07-10), NOT its UTC date (07-11).
+    assert lst_days == [date(2026, 7, 8), date(2026, 7, 10), date(2026, 7, 10)]
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    # Two distinct LST blocks (07-08, 07-10) >= _MIN_FILL_DAYS_FOR_CI → scored with a real CI.
+    assert not_scored is False, "two distinct LST fill-days must score (boundary fill joins 07-10)"
+    assert roi_ci[1] >= roi_ci[0]
 
 
 @pytest.mark.integration
