@@ -315,3 +315,56 @@ def test_verify_window_must_be_disjoint_from_phase3_oos(pg_conn):
         oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
     )
     assert [r for r in records if r.excluded_reason is None]
+
+
+# --- 06-07 Task 1: CR-03 the ladder tiles (-inf, +inf) with open tail buckets -----------------
+#
+# A CLOSED ±4σ degree ladder scores any realized high in a tail o_i=0 EVERYWHERE (no bucket is its
+# YES) with NO coverage-log entry — a silent drop of exactly the surprise/tail days. Task 1 tiles
+# the ladder with a `<= lo` open-lower and a `>= hi` open-upper bucket so EVERY realized high has a
+# YES bucket, and coverage-logs a tail-settled day as `tail_settlement` (still scored — an audit
+# annotation, not a drop).
+
+
+def test_ladder_for_day_tiles_open_tail_buckets():
+    """CR-03: _ladder_for_day appends an open_lo lower-tail and an open_hi upper-tail bucket."""
+    from weatherquant.verify import backtest
+
+    ladder = backtest._ladder_for_day(85.0, 2.0)
+    assert ladder, "a finite (mu, sigma) must produce a non-empty ladder"
+    open_los = [b for b in ladder if b["edges"][2] is True]  # open_lo flag in (lo, hi, open_lo, ...)
+    open_his = [b for b in ladder if b["edges"][3] is True]  # open_hi flag
+    assert len(open_los) == 1, "exactly one <= lo open-lower tail bucket"
+    assert len(open_his) == 1, "exactly one >= hi open-upper tail bucket"
+    # The open spans reach the ∓inf sentinel so the ladder tiles (-inf, +inf).
+    lower_span = open_los[0]["span"]
+    upper_span = open_his[0]["span"]
+    assert lower_span[0] == -math.inf
+    assert upper_span[1] == math.inf
+
+
+def test_tiled_ladder_wq_probs_sum_to_one():
+    """CR-03/VER-04: the full tiled WQ ladder (open tails included) sums to ~1 — tiles (-inf, +inf)."""
+    from weatherquant.price.buckets import bucket_probs
+    from weatherquant.verify import backtest
+
+    mu_b, sigma_b = 85.0, 3.0
+    ladder = backtest._ladder_for_day(mu_b, sigma_b)
+    wq = bucket_probs(mu_b, sigma_b, [b["span"] for b in ladder])
+    assert float(wq.sum()) == pytest.approx(1.0, abs=1e-9)
+
+
+def test_tail_high_lands_in_open_upper_bucket_not_zero_everywhere():
+    """CR-03: a realized high ABOVE the interior range is o_i=1 in the open-upper bucket (not 0 ⁠all)."""
+    from weatherquant.verify import backtest
+
+    mu_b, sigma_b = 85.0, 2.0
+    ladder = backtest._ladder_for_day(mu_b, sigma_b)
+    # A surprise high far above center + 4σ — with a closed ladder it would be o_i=0 everywhere.
+    y_tail = mu_b + 100.0
+    outcomes = [
+        backtest._outcome_for_bucket(y_tail, *b["edges"]) for b in ladder
+    ]
+    assert sum(outcomes) == 1, "the tail high must land in exactly one (open-upper) bucket"
+    yes_bucket = ladder[outcomes.index(1)]
+    assert yes_bucket["edges"][3] is True, "the YES bucket for a high tail is the open-upper bucket"

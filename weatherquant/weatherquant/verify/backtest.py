@@ -401,6 +401,12 @@ def walk_forward(
         for i, b in enumerate(ladder):
             lo, hi, open_lo, open_hi = b["edges"]
             o_i = _outcome_for_bucket(y, lo, hi, open_lo, open_hi)
+            # CR-03/D-09: when the settled high lands in an OPEN tail bucket (its YES), coverage-log
+            # the day as tail_settlement so the placement is auditable — the day is STILL scored
+            # (the open tail is a real YES, never an o_i=0-everywhere silent drop). Logged once per
+            # tail-settled day (on the YES tail bucket), not per interior bucket.
+            if o_i == 1 and (open_lo or open_hi):
+                _log_exclusion(coverage_log, day, city, "tail_settlement")
             records.append(
                 PairedRecord(
                     day=day,
@@ -438,33 +444,77 @@ def _settled_high(settle_rows: list[dict]) -> float | None:
     return None
 
 
-def _ladder_for_day(mu_b: float, sigma_b: float) -> list[dict]:
-    """Build the shared bucket ladder centered on the blend, as a list of geometry dicts.
+def _bucket_geometry(
+    *,
+    floor_strike: int | None,
+    cap_strike: int | None,
+    strike_type: str,
+) -> dict:
+    """Parse ONE Kalshi strike into the shared ``{entry, edges, span}`` geometry (VER-04).
 
-    The live KXHIGH market ladder is not persisted in the Gate-1 ledger window, so derive a degree
-    ladder centered on the blended mean (±4σ, integer degrees) — both arms price the IDENTICAL
-    spans (VER-04). Each entry is parsed ONCE into the shared geometry: ``entry`` is the structured
-    -strike mapping the v3 adapter parses; ``edges`` is ``(lo, hi, open_lo, open_hi)`` for the
-    outcome rule; ``span`` is the continuous ``(lo_edge, hi_edge, open_lo, open_hi)`` the WQ arm's
-    ``bucket_probs`` consumes. Empty when sigma is non-finite (caller coverage-logs it).
+    The single seam both arms price through: ``entry`` is the structured-strike mapping the v3
+    adapter parses; ``edges`` is ``(lo, hi, open_lo, open_hi)`` for the outcome rule; ``span`` is
+    the continuous ``(lo_edge, hi_edge, open_lo, open_hi)`` (open tails carry the ∓inf sentinel via
+    :func:`integers_in_bucket`) the WQ arm's ``bucket_probs`` consumes. No re-derived edge math —
+    the interior degree buckets AND the open tails go through the IDENTICAL price-geometry helpers
+    so both arms see one ladder.
+    """
+    entry = {
+        "floor_strike": floor_strike,
+        "cap_strike": cap_strike,
+        "strike_type": strike_type,
+    }
+    lo_i, hi_i, open_lo, open_hi = parse_ticker(
+        floor_strike=floor_strike, cap_strike=cap_strike, strike_type=strike_type
+    )
+    lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
+    return {
+        "entry": entry,
+        "edges": (lo_i, hi_i, open_lo, open_hi),
+        "span": (lo_edge, hi_edge, open_lo, open_hi),
+    }
+
+
+def _ladder_for_day(mu_b: float, sigma_b: float) -> list[dict]:
+    """Build the shared bucket ladder that TILES ``(-inf, +inf)``, as a list of geometry dicts.
+
+    The live KXHIGH market ladder is not persisted in the Gate-1 ledger window. Kalshi's real
+    KXHIGH ladder already carries open ``<=lo`` / ``>=hi`` tails, so when it is available in the
+    ledger it is PREFERRED (it tiles the line by construction); absent it, this synthesizes the
+    same shape — interior single-degree closed buckets centered on the blended mean (±4σ, integer
+    degrees) PLUS a ``<= lo_min`` open-lower bucket (``open_lo=True``) and a ``>= hi_max``
+    open-upper bucket (``open_hi=True``). Both arms price the IDENTICAL spans (VER-04).
+
+    CR-03 (the silent-tail-drop fix): a CLOSED ±4σ ladder scores any realized daily high outside the
+    interior range ``o_i=0`` for EVERY bucket (the true outcome has no YES bucket) with no coverage
+    entry — exactly the surprise/tail days that move ROI most. The open tails guarantee EVERY
+    realized high lands in exactly one bucket; ``walk_forward`` coverage-logs a tail-settled day as
+    ``tail_settlement`` so the placement is auditable (D-09/VER-06) — the day is STILL scored.
+
+    Each entry is parsed ONCE into the shared ``{entry, edges, span}`` geometry via the price
+    helpers (:func:`_bucket_geometry`). The open-tail edges use the ``∓inf`` sentinel, consistent
+    with ``v3_normal_cdf``'s step/asymptote at the tails and ``price.buckets.bucket_probs``'
+    open-tail handling, so the tiled WQ ladder sums to ~1. Empty when sigma is non-finite (caller
+    coverage-logs it).
     """
     if not np.isfinite(mu_b) or not np.isfinite(sigma_b) or sigma_b <= 0:
         return []
     center = int(round(mu_b))
     half_span = max(1, int(round(4.0 * sigma_b)))
+    lo_min = center - half_span
+    hi_max = center + half_span - 1  # the last interior degree (range upper bound is exclusive)
     ladder: list[dict] = []
-    for lo in range(center - half_span, center + half_span):
-        hi = lo  # single-degree closed buckets tile the ladder (each integer its own bucket)
-        entry = {"floor_strike": lo, "cap_strike": hi, "strike_type": "between"}
-        lo_i, hi_i, open_lo, open_hi = parse_ticker(
-            floor_strike=lo, cap_strike=hi, strike_type="between"
-        )
-        lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
+    # Open-LOWER tail: ``<= lo_min`` (open_lo) — every realized high BELOW the interior lands here.
+    ladder.append(
+        _bucket_geometry(floor_strike=None, cap_strike=lo_min, strike_type="less")
+    )
+    # Interior single-degree closed buckets (each integer its own [k-0.5, k+0.5) bucket).
+    for lo in range(lo_min + 1, hi_max):
         ladder.append(
-            {
-                "entry": entry,
-                "edges": (lo_i, hi_i, open_lo, open_hi),
-                "span": (lo_edge, hi_edge, open_lo, open_hi),
-            }
+            _bucket_geometry(floor_strike=lo, cap_strike=lo, strike_type="between")
         )
+    # Open-UPPER tail: ``>= hi_max`` (open_hi) — every realized high ABOVE the interior lands here.
+    ladder.append(
+        _bucket_geometry(floor_strike=hi_max, cap_strike=None, strike_type="greater")
+    )
     return ladder
