@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 from datetime import date
 
+import numpy as np
 import pytest
 
 
@@ -201,3 +202,116 @@ def test_walk_forward_logs_voided_days_with_a_reason(pg_conn):
         start=date(2026, 1, 1), end=date(2026, 2, 1), oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
     )
     assert all("reason" in entry for entry in coverage)
+
+
+# --- 06-06 Task 4: seeded NON-EMPTY-ledger end-to-end proof that CR-02/CR-04/CR-05 are closed ---
+#
+# The prior integration tests run against an EMPTY DB, so the non-empty walk_forward scoring path
+# (where CR-02/CR-05 live) was never exercised. THIS test seeds a real two-season ledger and is the
+# standing proof: a green unit suite alone is NOT the evidence.
+
+from datetime import datetime, timezone  # noqa: E402
+
+_F_TO_K = lambda f: (f - 32.0) * 5.0 / 9.0 + 273.15  # noqa: E731 - test-only inverse of the K→°F seam
+
+
+def _seed_two_season_ledger(conn):
+    """Seed NYC/hrrr forecasts+observations across January (~30°F) and July (~85°F).
+
+    >= N_MIN (30) distinct target_dates per season so BOTH season parents (and hence both
+    month-fits) are retained. 3 members per day so s2 > 0 (a real ensemble spread). All rows are
+    stamped available_at well before any replayed July decision cutoff (no look-ahead). January's
+    mean (~30°F) and July's mean (~85°F) are far apart so an all-month average would land ~57°F —
+    distinguishable from either month-fit (the CR-02 discriminator).
+    """
+    from weatherquant.ingest.writer import insert_forecast, insert_observation
+
+    avail = datetime(2026, 1, 1, tzinfo=timezone.utc)  # before every Jan/Jul decision cutoff
+
+    def _seed_month(year_month_first: date, base_f: float, n_days: int):
+        for i in range(n_days):
+            d = date(year_month_first.year, year_month_first.month, 1 + i)
+            members_f = [base_f - 2.0, base_f, base_f + 2.0]  # 3 members → s2 > 0
+            cycle = datetime(d.year, d.month, d.day, 0, tzinfo=timezone.utc)
+            for member, mf in enumerate(members_f):
+                insert_forecast(
+                    conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
+                    temp_kelvin=_F_TO_K(mf), cycle=cycle,
+                    station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
+                    available_at=avail,
+                )
+            # The verifying daily-high obs (tracks the ensemble mean closely).
+            insert_observation(
+                conn, city="NYC", target_date=d, source="asos", daily_high_f=base_f + 0.5,
+                available_at=avail,
+            )
+
+    _seed_month(date(2026, 1, 1), base_f=30.0, n_days=31)  # January, DJF season
+    _seed_month(date(2026, 7, 1), base_f=85.0, n_days=31)  # July, JJA season
+
+
+@pytest.mark.integration
+def test_walk_forward_uses_decision_month_fit_not_all_month_average(pg_conn):
+    """CR-02 (seeded e2e): a scored July record's wq_mu tracks the JULY fit, not the all-month mean."""
+    from weatherquant.verify import backtest
+
+    _seed_two_season_ledger(pg_conn)
+    records, coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=date(2026, 7, 10), end=date(2026, 7, 13),  # a window INSIDE July
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),  # disjoint from the Gate-1 window
+    )
+    scored = [r for r in records if r.excluded_reason is None]
+    assert scored, "the seeded non-empty ledger must produce at least one scored record"
+    # CR-02: the WQ predictive mean tracks the JULY month (~85°F), NOT the cross-month midpoint
+    # (~57.5°F that an equal-weight Jan+Jul average would produce).
+    wq_mus = [r.wq_mu for r in scored if r.wq_mu is not None]
+    assert wq_mus, "scored records must carry wq_mu"
+    assert min(wq_mus) > 70.0  # firmly in July's range, far above the ~57.5°F all-month midpoint
+
+
+@pytest.mark.integration
+def test_v3_arm_priced_from_raw_ensemble_spread_not_wq_sigma(pg_conn):
+    """CR-05 (seeded e2e): v3_sigma == sqrt(s2_asof) of the raw decision-day ensemble, != wq_sigma."""
+    import math
+
+    from weatherquant.verify import backtest
+
+    _seed_two_season_ledger(pg_conn)
+    records, _coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=date(2026, 7, 10), end=date(2026, 7, 13),
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    scored = [r for r in records if r.excluded_reason is None]
+    assert scored
+    # The raw ensemble for a July day is members {83, 85, 87} → population var = 8/3 → sqrt ≈ 1.633.
+    expected_v3_sigma = math.sqrt(np.var([83.0, 85.0, 87.0]))
+    v3_sigmas = {round(r.v3_sigma, 6) for r in scored if r.v3_sigma is not None}
+    wq_sigmas = {round(r.wq_sigma, 6) for r in scored if r.wq_sigma is not None}
+    assert v3_sigmas, "scored records must carry v3_sigma"
+    # CR-05: v3 spread is the raw ensemble sqrt(s2), independent of the EMOS/Vincentized wq_sigma.
+    assert all(s == pytest.approx(expected_v3_sigma, abs=1e-3) for s in v3_sigmas)
+    assert v3_sigmas.isdisjoint(wq_sigmas)  # the two arms' spreads are genuinely different
+
+
+@pytest.mark.integration
+def test_verify_window_must_be_disjoint_from_phase3_oos(pg_conn):
+    """CR-04 (seeded e2e): an OOS slice overlapping the Gate-1 window raises on the real path."""
+    from weatherquant.verify import backtest
+
+    _seed_two_season_ledger(pg_conn)
+    # OOS slice [2026-07-11, 2026-07-20) overlaps the Gate-1 window [2026-07-10, 2026-07-13).
+    with pytest.raises(ValueError):
+        backtest.walk_forward(
+            pg_conn, "KXHIGHNY", "hrrr", lead=0,
+            start=date(2026, 7, 10), end=date(2026, 7, 13),
+            oos_slice=(date(2026, 7, 11), date(2026, 7, 20)),
+        )
+    # A disjoint slice scores records (the guard passes, the non-empty path runs).
+    records, _coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=date(2026, 7, 10), end=date(2026, 7, 13),
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    assert [r for r in records if r.excluded_reason is None]
