@@ -347,12 +347,26 @@ def _roi_clv_cis(bind, city, model, start, end, metrics):
     # A real non-empty fills ledger: settle each fill and score the real ROI/CLV (CENTS). The day is
     # the bootstrap block, but the fills ledger is sparse here — score the pooled point estimate as a
     # degenerate CI so the real metric is exercised end-to-end (the integration test seeds this path).
-    settled_yes, snaps_per_fill, sides = _settle_window_fills(
+    settled_yes, clv_fills, snaps_per_fill, sides = _settle_window_fills(
         bind, window_fills, city_key
     )
     roi = metrics.roi_from_fills(window_fills, settled_yes)
-    clv = metrics.mean_clv(window_fills, snaps_per_fill, sides)
+    clv = metrics.mean_clv(clv_fills, snaps_per_fill, sides)
     return ((roi, roi), (clv, clv)), False
+
+
+class _AvgPriceFill:
+    """Minimal CLV fill adapter exposing the float ``avg_price_cents`` (D-01, never the rounded price).
+
+    ``market.clv.clv_cents`` reads the fill's ``avg_price_cents`` ATTRIBUTE; a ledger ``fills`` row
+    (a ``RowMapping``) carries it under ``detail['avg_price_cents']``. This thin adapter surfaces the
+    float so the real CLV is scored off the un-rounded price (never the ±0.5c-rounded ``price`` column).
+    """
+
+    __slots__ = ("avg_price_cents",)
+
+    def __init__(self, avg_price_cents: float) -> None:
+        self.avg_price_cents = float(avg_price_cents)
 
 
 def _fill_in_window(fill, city_key, start, end) -> bool:
@@ -374,21 +388,26 @@ def _fill_in_window(fill, city_key, start, end) -> bool:
 
 
 def _settle_window_fills(bind, window_fills, city_key):
-    """Settle each window fill against the observed daily high; build (settled_yes, snaps, sides).
+    """Settle each window fill against the observed daily high; build the ROI/CLV scoring inputs.
 
     For each fill: parse its ticker to the resolved bucket, read the settled ``daily_high_f`` for
     the fill's target day via ``db.queries.latest`` (read ONLY to settle the YES/NO outcome, never a
-    feature), and select the closing-window snapshots for the CLV. ``settled_yes[i]`` is whether the
-    settled high falls in the fill's bucket; ``snaps_per_fill[i]`` the closing-window snapshots for
-    the CLV; ``sides[i]`` the fill side. Fails loud (RESEARCH Code Example 2) on a malformed fill.
+    feature), and select the closing-window snapshots for the CLV. Returns
+    ``(settled_yes, clv_fills, snaps_per_fill, sides)``: ``settled_yes[i]`` is whether the settled
+    high falls in the fill's bucket (for ``roi_from_fills``); ``clv_fills[i]`` an avg-price adapter
+    (``mean_clv``/``clv_cents`` read the float ``avg_price_cents`` ATTRIBUTE — never the rounded
+    ``price``); ``snaps_per_fill[i]`` the closing-window snapshots; ``sides[i]`` the fill side. Fails
+    loud (RESEARCH Code Example 2) on a malformed fill.
     """
     from weatherquant.db import queries
     from weatherquant.market import clv as clv_mod
     from weatherquant.price.buckets import integers_in_bucket
     from weatherquant.price.ticker import parse_ticker
     from weatherquant.registry import get_city
+    from weatherquant.verify.metrics import _fill_avg_price_cents
 
     settled_yes: list[bool] = []
+    clv_fills: list[_AvgPriceFill] = []
     snaps_per_fill: list[list] = []
     sides: list[str] = []
     for fill in window_fills:
@@ -408,6 +427,8 @@ def _settle_window_fills(bind, window_fills, city_key):
                 "a window fill cannot be settled (never fabricate a settlement)."
             )
         settled_yes.append(bool(lo_edge <= float(y) < hi_edge))
+        # The CLV path reads the float avg_price_cents attribute (never the rounded price column).
+        clv_fills.append(_AvgPriceFill(_fill_avg_price_cents(fill)))
         # The closing-window snapshots for this fill's ticker (volume-weighted CLV mid).
         all_snaps = queries.latest(bind, "market_snapshots", where={"ticker": ticker})
         snaps = clv_mod.closing_window_snapshots(
@@ -416,7 +437,7 @@ def _settle_window_fills(bind, window_fills, city_key):
         snaps_per_fill.append(snaps)
         side_raw = fill["side"] if hasattr(fill, "__getitem__") else fill.side
         sides.append("buy" if side_raw in ("yes", "buy") else "sell")
-    return settled_yes, snaps_per_fill, sides
+    return settled_yes, clv_fills, snaps_per_fill, sides
 
 
 def _records_for_report(scored):

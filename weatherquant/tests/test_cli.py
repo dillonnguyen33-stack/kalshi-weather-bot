@@ -948,3 +948,225 @@ def test_verify_verdict_records_oos_slice_in_artifact(monkeypatch: pytest.Monkey
     assert rc == 0
     payload = json.loads((tmp_path / "GATE1-VERDICT.json").read_text())
     assert payload["oos_slice"] == ["2025-01-01", "2025-06-01"]
+
+
+# --- 06-07 Task 2/3: CR-01 real CRPS + ledger ROI/CLV + the pinned not_scored sentinel ---------
+#
+# These prove the verdict scores the PRE-REGISTERED metrics, not the deleted (wq-v3)*(2o-1) proxy:
+# a fast unit proof of the no-fills not_scored sentinel + the crps_blend wiring, then a seeded
+# NON-EMPTY-ledger integration proof (fills + closing snapshots + a tail-high day).
+
+
+def test_roi_clv_not_scored_sentinel_fails_loud_when_no_fills():
+    """CR-01/T-06-20: no fills → roi/clv map to the pinned (0.0,0.0) sentinel, gate1 FAILs cleanly."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import gate1, metrics
+
+    # bind=None → the fills read returns nothing → not_scored. No exception, the pinned sentinel.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        None, "NYC", "hrrr", date(2026, 6, 1), date(2026, 6, 15), metrics
+    )
+    assert roi_ci == (0.0, 0.0) == clv_ci == verify_mod._NOT_SCORED_CI
+    assert not_scored is True
+    # The full five-key dict keeps the exact set so gate1_passes does NOT raise — it returns False.
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": roi_ci, "clv": clv_ci,
+    }
+    assert set(cis) == gate1.GATE1_METRICS  # the key-set assertion will not raise
+    assert gate1.gate1_passes(cis) is False  # a FAIL VERDICT, not an exception (roi/clv 0.0 > 0 fails)
+    # And the not_scored sentinel is NOT an inf/NaN that would break metric_passes' comparisons.
+    assert gate1.metric_passes("roi", *roi_ci) is False
+    assert gate1.metric_passes("clv", *clv_ci) is False
+
+
+def test_not_scored_renders_not_scored_fail_in_verdict_artifact(tmp_path):
+    """CR-01: a not_scored roi/clv renders 'not scored / FAIL' verbatim in GATE1-VERDICT.md."""
+    from weatherquant.verify import report
+
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": (0.0, 0.0), "clv": (0.0, 0.0),
+    }
+    verdict = {"passed": False, "seed": 0, "not_scored": {"roi": True, "clv": True}}
+    report.render_reports([], cis, verdict, out_dir=str(tmp_path), seed=0, coverage=[])
+    md = (tmp_path / "GATE1-VERDICT.md").read_text()
+    assert "not scored / FAIL" in md
+    # The numeric CIs for the not_scored metrics must NOT appear as a real computation.
+    assert "| roi | 0.0 | 0.0 |" not in md
+    assert "| clv | 0.0 | 0.0 |" not in md
+
+
+def test_crps_score_fn_is_real_crps_blend_delta_not_proxy():
+    """CR-01: _crps_score_fn returns crps_blend(wq) - crps_blend(v3), NOT the deleted proxy."""
+    import numpy as np
+
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+    from weatherquant.verify.backtest import PairedRecord
+
+    day = date(2026, 7, 10)
+    # Two records on ONE day, each carrying the per-record predictive Gaussians 06-06 populates.
+    recs = [
+        PairedRecord(
+            day=day, city="KXHIGHNY", bucket=(85, 85), wq_prob=0.6, v3_prob=0.55, o_i=1,
+            wq_mu=85.0, wq_sigma=2.0, v3_mu=84.0, v3_sigma=3.0, y=85.5,
+        ),
+        PairedRecord(
+            day=day, city="KXHIGHNY", bucket=(86, 86), wq_prob=0.3, v3_prob=0.35, o_i=0,
+            wq_mu=85.0, wq_sigma=2.0, v3_mu=84.0, v3_sigma=3.0, y=85.5,
+        ),
+    ]
+    score_fn = verify_mod._crps_score_fn(recs, metrics)
+    got = score_fn([day])
+    # Hand-computed: crps_blend pools BOTH records' (mu, sigma, y) for each arm.
+    wq_mu = np.array([85.0, 85.0]); wq_sigma = np.array([2.0, 2.0]); y = np.array([85.5, 85.5])
+    v3_mu = np.array([84.0, 84.0]); v3_sigma = np.array([3.0, 3.0])
+    expected = metrics.crps_blend(wq_mu, wq_sigma, y) - metrics.crps_blend(v3_mu, v3_sigma, y)
+    assert got == pytest.approx(expected)
+    # The deleted proxy mean((wq-v3)*(2o-1)) would be a DIFFERENT number on these records.
+    proxy = float(np.mean((np.array([0.6, 0.3]) - np.array([0.55, 0.35])) * (2.0 * np.array([1.0, 0.0]) - 1.0)))
+    assert got != pytest.approx(proxy)
+
+
+def test_crps_score_fn_fails_loud_without_predictive_params():
+    """CR-01: a scored record missing the predictive params raises — never silently a proxy."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+    from weatherquant.verify.backtest import PairedRecord
+
+    day = date(2026, 7, 10)
+    rec = PairedRecord(day=day, city="KXHIGHNY", bucket=(85, 85), wq_prob=0.6, v3_prob=0.55, o_i=1)
+    score_fn = verify_mod._crps_score_fn([rec], metrics)
+    with pytest.raises(ValueError):
+        score_fn([day])
+
+
+# --- 06-07 Task 3: seeded NON-EMPTY-ledger end-to-end proof CR-01/CR-03 are closed -------------
+#
+# The verifier flagged that the prior integration tests ran against an EMPTY DB, so the real
+# scoring path (fills/closing-snapshots ROI/CLV + the tail-day coverage) was never exercised
+# end-to-end. THESE seeded tests are the standing proof — a green unit suite alone is NOT evidence.
+
+from datetime import datetime as _dt, timezone as _tz, timedelta as _td  # noqa: E402
+
+_VER_F_TO_K = lambda f: (f - 32.0) * 5.0 / 9.0 + 273.15  # noqa: E731 - test-only inverse K→°F seam
+
+
+def _seed_verdict_ledger(conn, *, tail_high: bool):
+    """Seed a NON-EMPTY July ledger: forecasts+observations, fills, closing snapshots, a tail day.
+
+    >= N_MIN (30) distinct July target_dates (3 members each → s2 > 0) so the July month-fit is
+    retained. The last replayed day's observation is a TAIL high (far above the interior ±4σ range)
+    when ``tail_high`` so CR-03's open-upper bucket + tail_settlement coverage-log is exercised.
+    Returns the (ticker, day, avg_price_cents, closing_mid_cents) for the seeded fill so the
+    caller can hand-compute ROI/CLV.
+    """
+    from weatherquant.ingest.writer import (
+        insert_fill, insert_forecast, insert_market_snapshot, insert_observation,
+    )
+    from weatherquant.registry import get_city
+    from weatherquant.time import settlement_window
+
+    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)  # before every July decision cutoff (no look-ahead)
+    base_f = 85.0
+    for i in range(31):
+        d = date(2026, 7, 1 + i)
+        members_f = [base_f - 2.0, base_f, base_f + 2.0]
+        cycle = _dt(d.year, d.month, d.day, 0, tzinfo=_tz.utc)
+        for member, mf in enumerate(members_f):
+            insert_forecast(
+                conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
+                temp_kelvin=_VER_F_TO_K(mf), cycle=cycle,
+                station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
+                available_at=avail,
+            )
+        # The last day in the replay window (2026-07-12) gets a TAIL high if requested.
+        high = (base_f + 100.0) if (tail_high and d == date(2026, 7, 12)) else (base_f + 0.5)
+        insert_observation(
+            conn, city="NYC", target_date=d, source="asos", daily_high_f=high,
+            available_at=avail,
+        )
+
+    # Seed ONE fill on 2026-07-10 (in the Gate-1 window) on the 85°F bucket + its closing snapshots.
+    fill_day = date(2026, 7, 10)
+    ticker = "KXHIGHNY-85-86"  # the [85,86] bucket → span [84.5, 86.5) (settled high 85.5 → YES)
+    fill_event = _dt(2026, 7, 10, 12, tzinfo=_tz.utc)
+    insert_fill(
+        conn, ticker=ticker, trade_id="t1", side="yes", price=40, count=2, fee=1,
+        is_maker=False, event_time=fill_event,
+        detail={"avg_price_cents": 40.0}, available_at=avail,
+    )
+    # Closing-window snapshots inside [end - CLV_WINDOW_MINUTES, end) for the fill's settlement day.
+    from weatherquant.market.clv import CLV_WINDOW_MINUTES
+
+    win = settlement_window(get_city("NYC"), fill_day)
+    closing_mid_cents = 50.0  # a single in-window snapshot → vol-weighted mid = 50.0c
+    t_in = win.end_utc - _td(minutes=CLV_WINDOW_MINUTES - 5)
+    insert_market_snapshot(
+        conn, ticker=ticker, snapshot_for=t_in.isoformat(),
+        best_yes_bid=49, best_no_bid=49, mid=closing_mid_cents, volume=100, seq=None,
+        detail={"raw": "book"}, available_at=t_in,
+    )
+    return ticker, fill_day, 40.0, closing_mid_cents
+
+
+@pytest.mark.integration
+def test_verdict_scores_roi_clv_off_real_fills(pg_conn):
+    """CR-01 (seeded e2e): ROI/CLV scored off the real fills + closing snapshots (hand-computed)."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    ticker, fill_day, avg_price, closing_mid = _seed_verdict_ledger(pg_conn, tail_high=False)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 10), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False, "a non-empty fills ledger must be scored, not the sentinel"
+    # Hand-computed ROI: a YES BUY of 2 contracts @ 40c, fee 1c, settled YES (high 85.5 ∈ [84.5,86.5)).
+    # entry = 2*40 = 80c; payoff = 100*2 = 200c; net = 200 - 80 - 1 = 119c; ROI = 119/80.
+    assert roi_ci[0] == pytest.approx(119.0 / 80.0)
+    # Hand-computed CLV: a YES BUY @ 40c vs a 50c close = +10c (better than the close).
+    assert clv_ci[0] == pytest.approx(closing_mid - avg_price)
+    assert clv_ci[0] == pytest.approx(10.0)
+
+
+@pytest.mark.integration
+def test_verdict_roi_clv_not_scored_sentinel_fails_loud_when_no_fills(pg_conn):
+    """CR-01 (seeded e2e): with NO fills for the window, roi/clv map to (0.0,0.0) → gate1 FAIL."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import gate1, metrics
+
+    _seed_verdict_ledger(pg_conn, tail_high=False)  # seeds a fill on 2026-07-10 ...
+    # ... but score a DIFFERENT (later, fill-free) window so the fills ledger is empty for it.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 20), date(2026, 7, 25), metrics
+    )
+    assert not_scored is True
+    assert roi_ci == (0.0, 0.0) == clv_ci
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": roi_ci, "clv": clv_ci,
+    }
+    assert gate1.gate1_passes(cis) is False  # FAIL verdict, not an exception
+
+
+@pytest.mark.integration
+def test_tail_high_day_is_scored_and_coverage_logged(pg_conn):
+    """CR-03 (seeded e2e): a tail-high day is o_i=1 in the open-upper bucket + coverage-logged."""
+    from weatherquant.verify import backtest
+
+    _seed_verdict_ledger(pg_conn, tail_high=True)  # 2026-07-12 settles at a tail high (185°F)
+    records, coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=date(2026, 7, 10), end=date(2026, 7, 13),
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    tail_day = date(2026, 7, 12)
+    # The tail day is coverage-logged tail_settlement (auditable, never a silent o_i=0 drop).
+    assert any(
+        e.get("day") == tail_day and e.get("reason") == "tail_settlement" for e in coverage
+    ), "the tail-high day must be coverage-logged tail_settlement (CR-03/D-09)"
+    # The tail day's records are STILL scored, and exactly ONE bucket (the open-upper) is its YES.
+    tail_records = [r for r in records if r.day == tail_day and r.excluded_reason is None]
+    assert tail_records, "the tail day must still be scored (not dropped)"
+    assert sum(r.o_i for r in tail_records) == 1, "exactly one YES bucket for the tail high"
