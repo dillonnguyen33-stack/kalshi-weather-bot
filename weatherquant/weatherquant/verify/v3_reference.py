@@ -18,12 +18,14 @@ bucket geometry (never re-implemented). Bodies land Wave 2; ``tests/test_v3_refe
 
 from __future__ import annotations
 
-# ``math`` + the shared bucket geometry are imported now (the Wave-2 numeric port reuses them
-# rather than re-implementing erf or the bucket edges); referenced once the stubs land.
-import math  # noqa: F401  (Wave-2 seam)
+import math
+from collections.abc import Mapping, Sequence
+from typing import Any
 
-from weatherquant.price.buckets import integers_in_bucket  # noqa: F401  (Wave-2 seam)
-from weatherquant.price.ticker import parse_ticker  # noqa: F401  (Wave-2 seam)
+# Shared bucket geometry (D-02): BOTH arms price the identical (lo−_HALF, hi+_HALF) spans via the
+# same parser/edge helpers — methodology (AS-vs-erf ensemble averaging) is the only difference.
+from weatherquant.price.buckets import integers_in_bucket
+from weatherquant.price.ticker import parse_ticker
 
 __all__ = ["v3_normal_cdf", "v3_bucket_prob", "v3_bucket_probs"]
 
@@ -42,29 +44,91 @@ _V3_PROB_HI = 0.99
 
 
 def v3_normal_cdf(x: float, mean: float, spread: float) -> float:
-    """Legacy v3 normal CDF (Abramowitz-Stegun, 6-dp rounded) — verbatim numeric port (D-02).
+    """Legacy v3 normal CDF (Abramowitz-Stegun 7.1.26, 6-dp rounded) — verbatim port (D-02).
 
-    Reproduces ``kalshi_weather_bot_v3._normal_cdf`` exactly, including the ``spread == 0`` step,
-    the rational tail approximation, and the final ``round(..., 6)``. Body lands Wave 2.
+    Bit-faithful reproduction of ``kalshi_weather_bot_v3._normal_cdf`` (lines 1319-1326): the
+    ``spread == 0`` step, the rational tail approximation with the frozen AS constants, and the
+    final ``round(..., 6)``. This is the AS approximation, NOT ``math.erf`` — the head-to-head is
+    about methodology, and AS-vs-erf is part of v3's methodology (D-02, golden-tested).
     """
-    raise NotImplementedError("verify.v3_reference.v3_normal_cdf lands in Wave 2 (VER-04).")
+    if spread == 0:
+        return 0.0 if x < mean else 1.0
+    z = (x - mean) / spread
+    t = 1.0 / (1.0 + _AS_T_COEFF * abs(z))
+    p = t * (
+        _AS_C1 + t * (_AS_C2 + t * (_AS_C3 + t * (_AS_C4 + t * _AS_C5)))
+    )
+    phi = 1.0 - (1.0 / math.sqrt(2.0 * math.pi)) * math.exp(-0.5 * z * z) * p
+    return round(phi if z >= 0 else 1.0 - phi, 6)
 
 
 def v3_bucket_prob(corrected_mean: float, spread: float, lo: float, hi: float) -> float:
     """Legacy v3 bucket probability (ensemble branch only, D-03) — ``cdf(hi) − cdf(lo)``.
 
-    Mirrors the kind=="B" ENSEMBLE path of ``model_probability``: spread floored at ``0.5``, the
-    bucket mass via :func:`v3_normal_cdf`, clamped to ``[0.01, 0.99]`` and 4-dp rounded. NO ASOS
-    override, NO same-day obs, NO threshold branch (D-03). Body lands Wave 2.
+    Mirrors the kind=="B" ENSEMBLE path of ``model_probability`` (lines 1332/1350-1351/1364):
+    spread floored at ``0.5``, bucket mass via :func:`v3_normal_cdf`, clamped to ``[0.01, 0.99]``
+    and 4-dp rounded. The ``obs_high`` ASOS-override blend, the ``is_next_day`` branch, and the
+    threshold (kind!="B") branch are all EXCLUDED (D-03) — there is deliberately no ``obs`` argument.
     """
-    raise NotImplementedError("verify.v3_reference.v3_bucket_prob lands in Wave 2 (VER-04).")
+    spread = max(spread, _V3_SPREAD_FLOOR)
+    ensemble_prob = v3_normal_cdf(hi, corrected_mean, spread) - v3_normal_cdf(
+        lo, corrected_mean, spread
+    )
+    return round(max(_V3_PROB_LO, min(_V3_PROB_HI, ensemble_prob)), 4)
 
 
-def v3_bucket_probs(corrected_mean: float, spread: float, ladder) -> dict:
-    """Legacy v3 bucket probabilities across a ladder (D-02/D-03).
+def v3_bucket_probs(
+    corrected_mean: float,
+    spread: float,
+    ladder: Sequence[Mapping[str, Any] | str],
+) -> dict[str, float]:
+    """Legacy v3 bucket probabilities across a full Kalshi ladder (D-02/D-03).
 
-    ``ladder`` carries the integer-°F bucket edges; reuses ``parse_ticker`` / ``integers_in_bucket``
-    for the shared geometry and :func:`v3_bucket_prob` per bucket. Returns a per-bucket mapping.
-    Body lands Wave 2.
+    Prices every bucket on the SHARED geometry the weatherquant arm uses: each ladder entry is
+    parsed by :func:`weatherquant.price.ticker.parse_ticker` into ``(lo, hi, open_lo, open_hi)``
+    inclusive integer edges, mapped to the continuous ``(lo−_HALF, hi+_HALF)`` span by
+    :func:`weatherquant.price.buckets.integers_in_bucket`, then priced by :func:`v3_bucket_prob`.
+    BOTH arms therefore share identical bucket geometry — methodology is the only difference (VER-04).
+
+    Each ladder entry is either a ticker string or a mapping carrying ``ticker`` and/or structured
+    strikes (``floor_strike``/``cap_strike``/``strike_type``) plus optional ``label``; the returned
+    key is the entry's ticker (or its repr when only structured strikes are supplied). Open-tail
+    buckets use the ``∓inf`` edge — ``v3_normal_cdf`` returns the legacy step/asymptote there. NO
+    same-day obs is read anywhere (D-03 leak guard is structural — no ``obs`` parameter exists).
     """
-    raise NotImplementedError("verify.v3_reference.v3_bucket_probs lands in Wave 2 (VER-04).")
+    out: dict[str, float] = {}
+    for entry in ladder:
+        ticker, key, parse_kwargs = _ladder_entry_to_parse_args(entry)
+        lo_i, hi_i, open_lo, open_hi = parse_ticker(ticker, **parse_kwargs)
+        lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
+        out[key] = v3_bucket_prob(corrected_mean, spread, lo_edge, hi_edge)
+    return out
+
+
+def _ladder_entry_to_parse_args(
+    entry: Mapping[str, Any] | str,
+) -> tuple[str | None, str, dict[str, Any]]:
+    """Normalize a ladder entry to ``(ticker, result_key, parse_ticker kwargs)`` (D-02 geometry).
+
+    A bare string is a positional ticker; a mapping forwards ``ticker`` plus the structured strike
+    fields (``floor_strike``/``cap_strike``/``strike_type``/``label``) to :func:`parse_ticker`. The
+    result key is the ticker when present, else a stable repr of the structured strikes.
+    """
+    if isinstance(entry, str):
+        return entry, entry, {}
+    if isinstance(entry, Mapping):
+        ticker = entry.get("ticker")
+        parse_kwargs = {
+            name: entry[name]
+            for name in ("floor_strike", "cap_strike", "strike_type", "label")
+            if name in entry
+        }
+        key = (
+            str(ticker)
+            if ticker is not None
+            else "|".join(f"{k}={parse_kwargs[k]}" for k in sorted(parse_kwargs))
+        )
+        return ticker, key, parse_kwargs
+    raise ValueError(
+        f"v3_bucket_probs: ladder entry must be a ticker string or a mapping; got {entry!r}."
+    )
