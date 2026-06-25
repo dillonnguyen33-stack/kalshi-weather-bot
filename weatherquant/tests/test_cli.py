@@ -1020,8 +1020,11 @@ def test_crps_score_fn_is_real_crps_blend_delta_not_proxy():
     score_fn = verify_mod._crps_score_fn(recs, metrics)
     got = score_fn([day])
     # Hand-computed: crps_blend pools BOTH records' (mu, sigma, y) for each arm.
-    wq_mu = np.array([85.0, 85.0]); wq_sigma = np.array([2.0, 2.0]); y = np.array([85.5, 85.5])
-    v3_mu = np.array([84.0, 84.0]); v3_sigma = np.array([3.0, 3.0])
+    wq_mu = np.array([85.0, 85.0])
+    wq_sigma = np.array([2.0, 2.0])
+    y = np.array([85.5, 85.5])
+    v3_mu = np.array([84.0, 84.0])
+    v3_sigma = np.array([3.0, 3.0])
     expected = metrics.crps_blend(wq_mu, wq_sigma, y) - metrics.crps_blend(v3_mu, v3_sigma, y)
     assert got == pytest.approx(expected)
     # The deleted proxy mean((wq-v3)*(2o-1)) would be a DIFFERENT number on these records.
@@ -1053,42 +1056,65 @@ from datetime import datetime as _dt, timezone as _tz, timedelta as _td  # noqa:
 _VER_F_TO_K = lambda f: (f - 32.0) * 5.0 / 9.0 + 273.15  # noqa: E731 - test-only inverse K→°F seam
 
 
+def _seed_jja_forecasts_observations(conn, *, tail_high: bool = False, tail_day=None):
+    """Seed June+July NYC/hrrr forecasts+observations on the PRODUCTION no-look-ahead path (06-10).
+
+    Decision-day settled obs are stamped at ``settlement_window(get_city("NYC"), d).end_utc`` (the
+    realistic LST settlement instant on/after day d), NOT back-dated to 2026-01-01; forecasts are
+    stamped at ``d-2d`` 00:00 UTC (strictly before the ``d-1d`` 00:00 UTC cutoff). Seeds JUNE 01..30
+    + JULY 01..31 (the JJA season) so >= N_MIN JJA pairs survive the cutoff for the scored July
+    window and the July month-fit is retained (the same feasibility arithmetic as the backtest
+    seeder — June pairs all settle before a mid-July cutoff). When ``tail_high``, ``tail_day``'s obs
+    is a TAIL high (far above the interior ±4σ range) so CR-03's open-upper bucket + tail_settlement
+    coverage-log is exercised on the production path.
+    """
+    from weatherquant.ingest.writer import insert_forecast, insert_observation
+
+    base_f = 85.0
+
+    def _seed_month(month: int, n_days: int):
+        for i in range(n_days):
+            d = date(2026, month, 1 + i)
+            members_f = [base_f - 2.0, base_f, base_f + 2.0]  # 3 members → s2 = 8/3 > 0
+            cycle = _dt(d.year, d.month, d.day, 0, tzinfo=_tz.utc)
+            # Forecasts at d-2d 00:00 UTC — strictly before the d-1d cutoff (own forecast survives).
+            fc_avail = _dt(d.year, d.month, d.day, tzinfo=_tz.utc) - _td(days=2)
+            for member, mf in enumerate(members_f):
+                insert_forecast(
+                    conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
+                    temp_kelvin=_VER_F_TO_K(mf), cycle=cycle,
+                    station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
+                    available_at=fc_avail,
+                )
+            high = (base_f + 100.0) if (tail_high and d == tail_day) else (base_f + 0.5)
+            # Decision-day obs at the realistic LST SETTLEMENT instant (excluded from the < d-1d
+            # training read, present in the < d+2d outcome read).
+            obs_avail = settlement_window(get_city("NYC"), d).end_utc
+            insert_observation(
+                conn, city="NYC", target_date=d, source="asos", daily_high_f=high,
+                available_at=obs_avail,
+            )
+
+    _seed_month(6, 30)  # June, JJA — season-retention fill so >= N_MIN JJA pairs survive the cutoff
+    _seed_month(7, 31)  # July, JJA — the scored month
+
+
 def _seed_verdict_ledger(conn, *, tail_high: bool):
     """Seed a NON-EMPTY July ledger: forecasts+observations, fills, closing snapshots, a tail day.
 
-    >= N_MIN (30) distinct July target_dates (3 members each → s2 > 0) so the July month-fit is
-    retained. The last replayed day's observation is a TAIL high (far above the interior ±4σ range)
-    when ``tail_high`` so CR-03's open-upper bucket + tail_settlement coverage-log is exercised.
-    Returns the (ticker, day, avg_price_cents, closing_mid_cents) for the seeded fill so the
-    caller can hand-compute ROI/CLV.
+    06-10: re-stamped to the PRODUCTION no-look-ahead path — decision-day obs at settlement, forecasts
+    at d-2d, with June+July (JJA) seeded so >= N_MIN JJA pairs survive the cutoff and the July
+    month-fit is retained for the scored window (the verdict path scores rather than no_month_fit).
+    The last replayed day's observation is a TAIL high when ``tail_high`` so CR-03's open-upper bucket
+    + tail_settlement coverage-log is exercised. Returns the (ticker, day, avg_price_cents,
+    closing_mid_cents) for the seeded fill so the caller can hand-compute ROI/CLV.
     """
-    from weatherquant.ingest.writer import (
-        insert_fill, insert_forecast, insert_market_snapshot, insert_observation,
-    )
-    from weatherquant.registry import get_city
-    from weatherquant.time import settlement_window
+    from weatherquant.ingest.writer import insert_fill, insert_market_snapshot
 
-    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)  # before every July decision cutoff (no look-ahead)
-    base_f = 85.0
-    for i in range(31):
-        d = date(2026, 7, 1 + i)
-        members_f = [base_f - 2.0, base_f, base_f + 2.0]
-        cycle = _dt(d.year, d.month, d.day, 0, tzinfo=_tz.utc)
-        for member, mf in enumerate(members_f):
-            insert_forecast(
-                conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
-                temp_kelvin=_VER_F_TO_K(mf), cycle=cycle,
-                station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
-                available_at=avail,
-            )
-        # The last day in the replay window (2026-07-12) gets a TAIL high if requested.
-        high = (base_f + 100.0) if (tail_high and d == date(2026, 7, 12)) else (base_f + 0.5)
-        insert_observation(
-            conn, city="NYC", target_date=d, source="asos", daily_high_f=high,
-            available_at=avail,
-        )
+    _seed_jja_forecasts_observations(conn, tail_high=tail_high, tail_day=date(2026, 7, 12))
 
     # Seed ONE fill on 2026-07-10 (in the Gate-1 window) on the 85°F bucket + its closing snapshots.
+    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)  # fills/snapshots back-stamp is fine (not a settled obs)
     fill_day = date(2026, 7, 10)
     ticker = "KXHIGHNY-85-86"  # the [85,86] bucket → span [84.5, 86.5) (settled high 85.5 → YES)
     fill_event = _dt(2026, 7, 10, 12, tzinfo=_tz.utc)
@@ -1111,40 +1137,27 @@ def _seed_verdict_ledger(conn, *, tail_high: bool):
     return ticker, fill_day, 40.0, closing_mid_cents
 
 
-def _seed_multiday_fills(conn, *, fills_spec):
+def _seed_multiday_fills(conn, *, fills_spec, ticker="KXHIGHNY-85-86"):
     """Seed forecasts/observations for July + one fill per spec entry on its own LST settlement day.
 
-    ``fills_spec`` is a list of ``(event_time_utc, side, avg_price_cents)`` tuples. Each fill is on
-    the ``KXHIGHNY-85-86`` bucket; the interior observation high (85.5°F) settles YES, so a YES buy
-    is a win and a NO buy is a loss — letting the side="no" e2e test assert the NO orientation.
-    Closing snapshots are seeded per distinct LST settlement day (a single 50c in-window snap → mid
-    50c). Returns the list of resolved LST settlement days (one per fill).
+    ``fills_spec`` is a list of ``(event_time_utc, side, avg_price_cents)`` tuples. The default
+    ``ticker`` is the ``KXHIGHNY-85-86`` bucket; the interior observation high (85.5°F) settles YES,
+    so a YES buy is a win and a NO buy is a loss — letting the side="no" e2e tests assert the NO
+    orientation. Pass a NON-containing bucket (e.g. ``KXHIGHNY-50-51``, span [49.5, 51.5)) so the
+    settled high 85.5 is OUTSIDE it → the bucket settles NO → a NO buy WINS. Closing snapshots are
+    seeded per distinct LST settlement day (a single 50c in-window snap → mid 50c). Returns the list
+    of resolved LST settlement days (one per fill).
+
+    06-10: forecasts/observations are seeded via the shared PRODUCTION-path seeder (decision-day obs
+    at settlement, forecasts at d-2d) — the fills are settled by ``_settle_window_fills`` via a plain
+    ``queries.latest`` obs read (no as-of cutoff), so realistic obs stamping is correct here.
     """
-    from weatherquant.ingest.writer import (
-        insert_fill, insert_forecast, insert_market_snapshot, insert_observation,
-    )
+    from weatherquant.ingest.writer import insert_fill, insert_market_snapshot
     from weatherquant.market.clv import CLV_WINDOW_MINUTES
-    from weatherquant.registry import get_city
-    from weatherquant.time import settlement_window
 
-    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)
-    base_f = 85.0
-    for i in range(31):
-        d = date(2026, 7, 1 + i)
-        cycle = _dt(d.year, d.month, d.day, 0, tzinfo=_tz.utc)
-        for member, mf in enumerate([base_f - 2.0, base_f, base_f + 2.0]):
-            insert_forecast(
-                conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
-                temp_kelvin=_VER_F_TO_K(mf), cycle=cycle,
-                station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
-                available_at=avail,
-            )
-        insert_observation(
-            conn, city="NYC", target_date=d, source="asos", daily_high_f=base_f + 0.5,
-            available_at=avail,
-        )
+    _seed_jja_forecasts_observations(conn)
 
-    ticker = "KXHIGHNY-85-86"  # [85,86] bucket → span [84.5, 86.5); settled high 85.5 → YES
+    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)  # fills/snapshots back-stamp (not a settled obs)
     city = get_city("NYC")
     seeded_snap_days: set = set()
     lst_days: list = []
@@ -1239,6 +1252,34 @@ def test_verdict_no_fill_side_settles_no_is_credited_end_to_end(pg_conn):
     assert not_scored is False
     # YES-settling bucket + NO buys → every block is a loss → the whole ROI CI is below zero.
     assert roi_ci[1] < 0, "a side='no' buy on a YES settlement must be scored as a loss (sides threaded)"
+
+
+@pytest.mark.integration
+def test_verdict_roi_side_no_fill_settles_no_is_a_win(pg_conn):
+    """T-06-09-T2 (seeded e2e, 06-10): a side='no' fill on a NO-settling bucket is CREDITED as a win.
+
+    The complement of the loss test: here the fills sit on a NON-containing bucket (KXHIGHNY-50-51,
+    span [49.5, 51.5)) — the settled interior high (85.5°F) is OUTSIDE it, so the bucket settles NO
+    and a NO buy WINS. The positive ROI CI proves the NO win is credited end-to-end through
+    ``_settle_window_fills`` → ``roi_from_fills(sides=...)`` (a side-blind ROI would have scored these
+    NO buys on a non-containing bucket as YES losses → a negative CI).
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # NO buys (cheap) on a bucket the settled high does NOT land in → each NO position wins.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "no", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "no", 35.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "no", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec, ticker="KXHIGHNY-50-51")
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False
+    # NO-settling bucket + NO buys → every block wins → the whole ROI CI is above zero.
+    assert roi_ci[0] > 0, "a side='no' buy that settles NO must be credited as a win (sides threaded)"
 
 
 @pytest.mark.integration
