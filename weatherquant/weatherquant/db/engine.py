@@ -31,6 +31,12 @@ _ALLOWED_EXECUTION_MODES = frozenset({"paper", "live"})
 # Default execution mode (D-15): paper-only this milestone (Gate 1).
 DEFAULT_EXECUTION_MODE = "paper"
 
+# Phase-6 drift monitor default (D-10): a trailing-window per-(city, model) reliability error (ECE)
+# above this is a calibration-drift breach. 0.10 = 10 calibration points, a principled "the 70%
+# bucket is now resolving ~60% or ~80%" alarm line; operator-tunable, NOT a secret (stays out of
+# the redacted repr). Must lie in (0, 1] (a non-positive or >1 threshold is meaningless for ECE).
+DRIFT_RELIABILITY_THRESHOLD_DEFAULT = 0.10
+
 
 def require_psycopg3_scheme(url: str) -> None:
     """Raise ``ValueError`` unless ``url``'s dialect is exactly ``postgresql+psycopg``.
@@ -78,6 +84,11 @@ class Settings(BaseSettings):
     # below so it can't silently unlock a live path. Defaults to paper (Gate 1).
     execution_mode: str = DEFAULT_EXECUTION_MODE
 
+    # Phase-6 drift monitor (D-10). NOT a secret — an operator-tunable policy number kept out of
+    # the redacted repr. Trailing-window ECE above this per (city, model) is a drift breach
+    # (SYS-02); validated to (0, 1] below.
+    drift_reliability_threshold: float = DRIFT_RELIABILITY_THRESHOLD_DEFAULT
+
     @field_validator("database_url")
     @classmethod
     def _validate_psycopg3_scheme(cls, value: str) -> str:
@@ -116,6 +127,20 @@ class Settings(BaseSettings):
             allowed = ", ".join(sorted(_ALLOWED_EXECUTION_MODES))
             raise ValueError(
                 f"execution_mode must be one of {{{allowed}}} (D-15). Got: {value!r}"
+            )
+        return value
+
+    @field_validator("drift_reliability_threshold")
+    @classmethod
+    def _validate_drift_threshold(cls, value: float) -> float:
+        """Reject a drift-reliability threshold outside ``(0, 1]`` (D-10).
+
+        Fail-loud at construction: ECE lives in ``[0, 1]``, so a non-positive threshold would alarm
+        always and a >1 threshold could never alarm — both are operator misconfigurations (SYS-02).
+        """
+        if not (0.0 < value <= 1.0):
+            raise ValueError(
+                f"drift_reliability_threshold must be in (0, 1] (D-10). Got: {value}"
             )
         return value
 
