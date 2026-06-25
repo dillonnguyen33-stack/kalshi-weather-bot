@@ -74,6 +74,32 @@ def run_verify(args: argparse.Namespace) -> int:
     end = args.end
     out_dir = Path(args.out_dir)
 
+    # CR-04: fail loud on a missing/empty verdict window BEFORE any pre-registration freeze or
+    # ledger access. --start/--end are argparse-required, but mirror _resolve_range's end<=start /
+    # empty-window rejection so a degenerate window can never be scored.
+    if start is None or end is None:
+        raise SystemExit("verify: --start and --end are required for the Gate-1 verdict")
+    if end <= start:
+        raise SystemExit(
+            f"verify: --end {end} must be strictly after --start {start} "
+            "(an empty/inverted Gate-1 verdict window is rejected — CR-04)"
+        )
+
+    # CR-04: resolve the REAL Phase-3 OOS (tuning) slice FAIL-CLOSED. If either bound is unset, or
+    # the slice is empty/inverted, REFUSE to run — never degrade to oos_slice=None (which would make
+    # assert_window_disjoint a no-op and silently score the whole ledger incl. the tuning slice,
+    # invalidating the pre-registration — D-10/D-12). A non-empty slice is threaded into
+    # walk_forward so the disjointness guard fires AND recorded into the verdict for auditability.
+    oos_start = settings.verify_phase3_oos_start
+    oos_end = settings.verify_phase3_oos_end
+    if oos_start is None or oos_end is None or oos_end <= oos_start:
+        raise SystemExit(
+            "verify: the Phase-3 OOS slice (verify_phase3_oos_start/end) is unset or empty — "
+            "refusing to run a Gate-1 verdict without a non-empty disjoint tuning window "
+            "(CR-04, D-10/D-12)"
+        )
+    oos_slice = (oos_start, oos_end)
+
     # The model that defines the comparison arm (a single model selector — the proof scores one
     # blend/model against v3). With --all-models we take the first as the pooled label.
     model = models[0]
@@ -101,8 +127,12 @@ def run_verify(args: argparse.Namespace) -> int:
     # Fail loud if this live run's params drifted from the frozen endpoint (seed/lead/window/metrics).
     gate1.assert_matches_preregistration(prereg, spec)
 
-    # 2. Walk-forward as-of-correct paired backtest (no look-ahead, D-08).
-    records, coverage = backtest.walk_forward(bind, city, model, lead, start, end, oos_slice=None)
+    # 2. Walk-forward as-of-correct paired backtest (no look-ahead, D-08). The real non-empty
+    #    Phase-3 OOS slice is threaded in so assert_window_disjoint FIRES (CR-04) — an overlapping
+    #    Gate-1 window fails loud rather than scoring on tuning data.
+    records, coverage = backtest.walk_forward(
+        bind, city, model, lead, start, end, oos_slice=oos_slice
+    )
     scored = [r for r in records if r.excluded_reason is None]
 
     # 3. Five pooled CIs via the paired day-block bootstrap (VER-05). Each metric's score_fn pools
@@ -131,6 +161,9 @@ def run_verify(args: argparse.Namespace) -> int:
         "seed": _SEED,
         "excluded_days": coverage,
         "test_window": [str(start), str(end)],
+        # CR-04: record the resolved Phase-3 OOS slice into the verdict so a mis-set or surprising
+        # tuning window is auditable in GATE1-VERDICT.{json,md} — never a silent no-op.
+        "oos_slice": [str(oos_start), str(oos_end)],
         "primary_lead": lead,
         "preregistration": prereg,
     }

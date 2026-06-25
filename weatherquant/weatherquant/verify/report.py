@@ -138,7 +138,7 @@ def render_reports(
     # Carry through the optional provenance the caller front-loads onto the verdict (window/lead/
     # secondaries) so the JSON is self-describing — without inventing keys the caller did not pass.
     if isinstance(verdict, dict):
-        for key in ("test_window", "primary_lead", "secondaries", "preregistration"):
+        for key in ("test_window", "oos_slice", "primary_lead", "secondaries", "preregistration"):
             if key in verdict:
                 payload[key] = verdict[key]
 
@@ -259,6 +259,8 @@ def _render_verdict_md(payload: dict[str, Any]) -> str:
         lines.append(f"- Primary lead: `{payload['primary_lead']}`")
     if payload.get("test_window") is not None:
         lines.append(f"- Test window: `{payload['test_window']}`")
+    if payload.get("oos_slice") is not None:
+        lines.append(f"- Phase-3 OOS slice (disjoint, CR-04): `{payload['oos_slice']}`")
 
     secondaries = payload.get("secondaries")
     if secondaries:

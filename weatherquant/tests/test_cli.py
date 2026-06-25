@@ -842,8 +842,10 @@ def test_main_verify_propagates_nonzero_exit(monkeypatch: pytest.MonkeyPatch):
 
     cli_main = sys.modules["weatherquant.cli.main"]  # the MODULE (cli.main is the re-exported fn)
     monkeypatch.setattr(cli_main, "run_verify", lambda args: 3)
+    # --start/--end are now MANDATORY on the verify subparser (CR-04) even for the monitor flag.
     rc = cli.main(
-        ["verify", "--city", "NYC", "--model", "hrrr", "--monitor"]
+        ["verify", "--city", "NYC", "--model", "hrrr",
+         "--start", "2026-06-01", "--end", "2026-06-15", "--monitor"]
     )
     assert rc == 3  # propagated unchanged (NOT collapsed to 0 like the count-dict branches)
 
@@ -854,5 +856,95 @@ def test_main_verify_returns_zero_on_clean_run(monkeypatch: pytest.MonkeyPatch):
 
     cli_main = sys.modules["weatherquant.cli.main"]  # the MODULE (cli.main is the re-exported fn)
     monkeypatch.setattr(cli_main, "run_verify", lambda args: 0)
-    rc = cli.main(["verify", "--city", "NYC", "--model", "hrrr"])
+    # --start/--end are now MANDATORY on the verify subparser (CR-04).
+    rc = cli.main(
+        ["verify", "--city", "NYC", "--model", "hrrr", "--start", "2026-06-01", "--end", "2026-06-15"]
+    )
     assert rc == 0
+
+
+# --- verify verdict-path window + fail-closed OOS-slice guards (06-06 Task 3, CR-04) ----------
+
+
+def _verify_args(**overrides):
+    """A minimal argparse.Namespace for run_verify's verdict path (monitor off)."""
+    import argparse
+
+    base = dict(
+        city="NYC", model="hrrr", all_cities=False, all_models=False,
+        start=date(2026, 6, 1), end=date(2026, 6, 15), lead=0, monitor=False,
+        window_days=30, out_dir="reports",
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _patch_verify_settings(monkeypatch, *, oos_start, oos_end):
+    """Patch cli.verify's get_engine/get_settings seams with a fake Settings carrying the OOS knob."""
+    from weatherquant import cli as _cli
+
+    settings = type(
+        "S", (), {"verify_phase3_oos_start": oos_start, "verify_phase3_oos_end": oos_end}
+    )()
+    monkeypatch.setattr(_cli.verify, "get_engine", lambda: object())
+    monkeypatch.setattr(_cli.verify, "get_settings", lambda: settings)
+    return settings
+
+
+def test_verify_verdict_rejects_inverted_window(monkeypatch: pytest.MonkeyPatch):
+    """The verdict path raises SystemExit when end <= start (CR-04)."""
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=date(2025, 1, 1), oos_end=date(2025, 6, 1))
+    args = _verify_args(start=date(2026, 6, 15), end=date(2026, 6, 1))  # inverted
+    with pytest.raises(SystemExit):
+        run_verify(args)
+
+
+def test_verify_verdict_rejects_unset_oos_slice(monkeypatch: pytest.MonkeyPatch):
+    """The verdict path raises SystemExit when the Phase-3 OOS knob is UNSET (fail-closed, CR-04)."""
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=None, oos_end=None)  # knob unset
+    with pytest.raises(SystemExit):
+        run_verify(_verify_args())
+
+
+def test_verify_verdict_rejects_empty_oos_slice(monkeypatch: pytest.MonkeyPatch):
+    """The verdict path raises SystemExit when the OOS slice is empty/inverted (CR-04)."""
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=date(2025, 6, 1), oos_end=date(2025, 1, 1))
+    with pytest.raises(SystemExit):
+        run_verify(_verify_args())
+
+
+def test_verify_verdict_overlapping_oos_slice_fails_loud(monkeypatch: pytest.MonkeyPatch):
+    """A NON-EMPTY OOS slice overlapping the Gate-1 window raises ValueError on the real path (CR-04).
+
+    The OOS slice is fed into walk_forward, which runs assert_window_disjoint FIRST (before any
+    ledger access, so bind=object() never executes a query) — proving the guard is no longer a no-op.
+    """
+    from weatherquant.cli.verify import run_verify
+
+    # OOS slice [2026-06-10, 2026-06-20) overlaps the Gate-1 window [2026-06-01, 2026-06-15).
+    _patch_verify_settings(monkeypatch, oos_start=date(2026, 6, 10), oos_end=date(2026, 6, 20))
+    with pytest.raises(ValueError):
+        run_verify(_verify_args())
+
+
+def test_verify_verdict_records_oos_slice_in_artifact(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """The resolved non-empty OOS slice is recorded into the GATE1-VERDICT artifact (CR-04)."""
+    import json
+
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=date(2025, 1, 1), oos_end=date(2025, 6, 1))
+    # bind=None so walk_forward returns no records (disjoint slice → guard passes, empty verdict).
+    from weatherquant import cli as _cli
+
+    monkeypatch.setattr(_cli.verify, "get_engine", lambda: None)
+    rc = run_verify(_verify_args(out_dir=str(tmp_path)))
+    assert rc == 0
+    payload = json.loads((tmp_path / "GATE1-VERDICT.json").read_text())
+    assert payload["oos_slice"] == ["2025-01-01", "2025-06-01"]

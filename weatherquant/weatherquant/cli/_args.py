@@ -294,14 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument(
         "--start",
         type=_parse_date,
-        default=None,
-        help="Start of the Gate-1 test window (YYYY-MM-DD, inclusive); requires --end.",
+        required=True,
+        help="Start of the Gate-1 verdict window (YYYY-MM-DD, inclusive). MANDATORY: the "
+        "verdict must be scored on a frozen, disjoint window (CR-04, D-10/D-12 anti-p-hacking).",
     )
     verify.add_argument(
         "--end",
         type=_parse_date,
-        default=None,
-        help="End of the Gate-1 test window (YYYY-MM-DD, half-open); used with --start.",
+        required=True,
+        help="End of the Gate-1 verdict window (YYYY-MM-DD, half-open). MANDATORY alongside "
+        "--start; run_verify rejects end<=start before any ledger access (CR-04).",
     )
     verify.add_argument(
         "--lead",

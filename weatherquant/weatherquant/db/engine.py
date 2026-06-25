@@ -7,6 +7,7 @@ logged or ``repr``'d (ASVS V14).
 
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 
 from pydantic import field_validator
@@ -88,6 +89,14 @@ class Settings(BaseSettings):
     # the redacted repr. Trailing-window ECE above this per (city, model) is a drift breach
     # (SYS-02); validated to (0, 1] below.
     drift_reliability_threshold: float = DRIFT_RELIABILITY_THRESHOLD_DEFAULT
+
+    # Phase-6 Gate-1 disjointness knob (D-10/D-12 anti-p-hacking, CR-04). The Phase-3 OOS
+    # (calibration-tuning) slice as a half-open ``[start, end)`` date pair. NOT secrets — policy
+    # dates kept out of the redacted repr. Nullable so an UNSET knob is detectable: run_verify is
+    # FAIL-CLOSED — it raises rather than scoring the Gate-1 verdict on a None/empty tuning window
+    # (a verdict scored on tuning data is a false "proof is valid", the worst possible error).
+    verify_phase3_oos_start: date | None = None
+    verify_phase3_oos_end: date | None = None
 
     @field_validator("database_url")
     @classmethod
