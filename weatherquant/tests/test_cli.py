@@ -797,3 +797,62 @@ def test_run_paper_refuses_live_mode(monkeypatch: pytest.MonkeyPatch):
     )
     with pytest.raises(SystemExit, match="live"):
         cli.run_paper(_paper_args())
+
+
+# --- verify subcommand (06-05 Task 3) — parse parity + non-zero-exit propagation -------------
+#
+# These pin the verify subcommand's CONTRACT (the heavy proof/drift orchestration is exercised in
+# the verify unit/integration suites): the subparser mirrors the calibrate/paper selectors, the
+# validators reject a bad city BEFORE the body (ASVS V5), and cli.main propagates run_verify's int
+# exit code (a drift breach therefore yields a non-zero process exit — SYS-02).
+
+
+def test_verify_subcommand_parses_selectors_and_flags():
+    """A valid `verify` invocation parses the window/lead/monitor/window-days/out-dir + selectors."""
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "verify", "--city", "NYC", "--model", "hrrr",
+            "--start", "2026-06-01", "--end", "2026-06-15",
+            "--lead", "0", "--monitor", "--window-days", "14", "--out-dir", "out",
+        ]
+    )
+    assert args.command == "verify"
+    assert args.city == "NYC"
+    assert args.model == "hrrr"
+    assert args.start == date(2026, 6, 1)
+    assert args.end == date(2026, 6, 15)
+    assert args.monitor is True
+    assert args.window_days == 14
+    assert args.out_dir == "out"
+
+
+def test_verify_unknown_city_rejected_before_body(capsys: pytest.CaptureFixture):
+    """An unknown `verify --city` is rejected by argparse via _city_type — ASVS V5 / T-06-19."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["verify", "--city", "ZZZ", "--model", "hrrr"])
+    assert excinfo.value.code != 0
+    assert "ZZZ" in capsys.readouterr().err
+
+
+def test_main_verify_propagates_nonzero_exit(monkeypatch: pytest.MonkeyPatch):
+    """cli.main returns run_verify's int — a non-zero (drift breach) propagates (SYS-02)."""
+    import sys
+
+    cli_main = sys.modules["weatherquant.cli.main"]  # the MODULE (cli.main is the re-exported fn)
+    monkeypatch.setattr(cli_main, "run_verify", lambda args: 3)
+    rc = cli.main(
+        ["verify", "--city", "NYC", "--model", "hrrr", "--monitor"]
+    )
+    assert rc == 3  # propagated unchanged (NOT collapsed to 0 like the count-dict branches)
+
+
+def test_main_verify_returns_zero_on_clean_run(monkeypatch: pytest.MonkeyPatch):
+    """A clean verify run returns 0 through cli.main (the verdict PASS/FAIL lives in the artifact)."""
+    import sys
+
+    cli_main = sys.modules["weatherquant.cli.main"]  # the MODULE (cli.main is the re-exported fn)
+    monkeypatch.setattr(cli_main, "run_verify", lambda args: 0)
+    rc = cli.main(["verify", "--city", "NYC", "--model", "hrrr"])
+    assert rc == 0

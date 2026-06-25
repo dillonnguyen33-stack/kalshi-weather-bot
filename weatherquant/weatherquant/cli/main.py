@@ -9,6 +9,7 @@ from .calibrate import run_calibrate
 from .ingest import run_ingest
 from .paper import run_paper
 from .pricing import run_price
+from .verify import run_verify
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "price":
         run_price(args)  # prints the blend/bucket/EV/Kelly smoke line(s) itself (D-16)
         return 0
+    if args.command == "verify":
+        # Unlike the count-dict branches above, propagate run_verify's int exit code so a drift
+        # breach (--monitor) yields a NON-ZERO process exit (SYS-02 / D-12).
+        return run_verify(args)
     run_paper(args)  # prints the real-midpoint loop-closure smoke line itself (D-08/D-16)
     return 0
 
