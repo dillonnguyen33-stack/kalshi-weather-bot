@@ -75,6 +75,12 @@ class PairedRecord:
     ``o_i`` is the realized ``{0, 1}`` YES outcome for the bucket. ``excluded_reason`` is ``None``
     for a scored row, or a short reason string for a coverage-logged exclusion (D-09 — never a
     silent drop).
+
+    The per-record predictive parameters (``wq_mu``/``wq_sigma`` for the WQ arm, ``v3_mu``/
+    ``v3_sigma`` for the v3 arm, and the realized ``y``) are carried (Optional, default ``None``)
+    so Plan 06-07 can score real Gaussian CRPS per record for each arm. They default to ``None``
+    so the original six positional fields (and their order) and the existing constructor calls
+    stay valid.
     """
 
     day: object
@@ -84,6 +90,11 @@ class PairedRecord:
     v3_prob: float
     o_i: int
     excluded_reason: str | None = None
+    wq_mu: float | None = None
+    wq_sigma: float | None = None
+    v3_mu: float | None = None
+    v3_sigma: float | None = None
+    y: float | None = None
 
 
 def assert_window_disjoint(
@@ -188,38 +199,39 @@ def _point_in_time_bias(pairs) -> float:
     return float(residuals.mean())
 
 
-def _blend_arm_for_day(pairs, *, city_key: str, model: str, lead: int):
-    """Refit EMOS on the as-of training pairs and return the WQ blend ``(mu_b, sigma_b)`` (D-04).
+def _blend_arm_for_day(pairs, *, city_key: str, model: str, lead: int, month: int):
+    """Refit EMOS and return the DECISION DAY'S month-fit WQ blend ``(mu_b, sigma_b)`` (D-04/CR-02).
 
-    PURE REUSE: ``fit_pooled_month_strata`` (the existing Phase-3 fitter — no new calibration math)
-    → per-month ``StratumFit``; ``link.predict`` reconstructs each month's predictive Gaussian on
-    its own ``(m, s2)``; the day's month-fit is blended via ``price.blend`` (accuracy-weighted by
-    each fit's ``crps_oos`` when available, else equal weight). Returns ``None`` when no month fit
-    covers the day's month (caller coverage-logs it). The blend over a single present model is the
-    identity, preserving the production blend path verbatim.
+    PURE REUSE (no new calibration math, verify-subtree D-04): ``fit_pooled_month_strata`` (the
+    existing Phase-3 fitter) → per-month ``StratumFit``; this selects the SINGLE fit whose
+    ``fit.month == month`` (the decision day D's month) and reconstructs ITS predictive Gaussian
+    via ``link.predict`` over its own ``StratumSamples``. The blend is across MODELS only — with a
+    single present model that is the identity, so the production single-model blend path is
+    preserved verbatim. It NEVER iterates all retained month-fits into an equal-weight
+    ``blend_gaussians`` average across the twelve calendar months: a July day must be priced from
+    the July fit, not a cross-month midpoint (CR-02 — the seasonal-contamination defect).
+
+    Returns ``None`` when no retained month-fit covers ``month`` (the caller coverage-logs
+    ``no_month_fit``, D-09 — absence is absence, never silently blended from other months).
     """
     fits = fit_pooled_month_strata(pairs, city=city_key, model=model, lead=lead)
-    if not fits:
-        return None
-    # Use every retained month fit as a component priced on its own training (m, s2): the WQ arm
-    # blends the present month-fits exactly as the production blend would (D-01).
-    mus: list[float] = []
-    sigmas: list[float] = []
-    crps_proxy: list[float] = []
-    for month_samples, _target_dates, fit in fits:
-        params = (fit.a, fit.b, fit.c, fit.d, fit.sigma_floor)
-        mu, sigma = predict(params, month_samples.m, month_samples.s2)
-        # One representative (mu, sigma) per fit: the mean over its training rows (the fit's
-        # central predictive Gaussian). The blend then Vincentizes the present fits (D-01).
-        mus.append(float(np.mean(mu)))
-        sigmas.append(float(np.mean(sigma)))
-        # crps_oos is not carried on StratumFit here; use an equal-quality proxy so the
-        # accuracy weights degrade to equal weight (no re-derived metric — D-04).
-        crps_proxy.append(1.0)
-    weights = accuracy_weights(np.array(crps_proxy, dtype=float))
-    mu_b, sigma_b = blend_gaussians(
-        np.array(mus, dtype=float), np.array(sigmas, dtype=float), weights
+    # CR-02: select the ONE fit for the decision day's month — never an across-month average.
+    selected = next(
+        ((samples, fit) for samples, _target_dates, fit in fits if fit.month == month),
+        None,
     )
+    if selected is None:
+        return None
+    month_samples, fit = selected
+    params = (fit.a, fit.b, fit.c, fit.d, fit.sigma_floor)
+    mu, sigma = predict(params, month_samples.m, month_samples.s2)
+    # One representative single-model component: the mean over the fit's own training rows (its
+    # central predictive Gaussian). The blend over a single present model is the identity, mirroring
+    # the production single-model blend (D-01) — accuracy weight degrades to 1.0 for one component.
+    mus = np.array([float(np.mean(mu))], dtype=float)
+    sigmas = np.array([float(np.mean(sigma))], dtype=float)
+    weights = accuracy_weights(np.array([1.0], dtype=float))
+    mu_b, sigma_b = blend_gaussians(mus, sigmas, weights)
     sigma_b = max(sigma_b, SIGMA_FLOOR_F)  # never a degenerate sigma into the CDF (D-09)
     return mu_b, sigma_b
 
@@ -316,9 +328,13 @@ def walk_forward(
             _log_exclusion(coverage_log, day, city, "no_training_data")
             continue
 
-        blend = _blend_arm_for_day(pairs, city_key=city_key, model=model, lead=lead)
+        blend = _blend_arm_for_day(
+            pairs, city_key=city_key, model=model, lead=lead, month=day.month
+        )
         if blend is None:
-            _log_exclusion(coverage_log, day, city, "no_model_fit")
+            # CR-02/D-09: the decision day's month has no retained month-fit — coverage-log it,
+            # never silently blend the WQ arm from other months.
+            _log_exclusion(coverage_log, day, city, "no_month_fit")
             continue
         mu_b, sigma_b = blend
 
@@ -363,6 +379,11 @@ def walk_forward(
                     wq_prob=float(wq[i]),
                     v3_prob=float(v3_list[i]),
                     o_i=o_i,
+                    # Per-record predictive params carried for Plan 06-07 real-CRPS scoring
+                    # (CR-02 WQ arm = the decision day's month-fit Gaussian).
+                    wq_mu=float(mu_b),
+                    wq_sigma=float(sigma_b),
+                    y=float(y),
                 )
             )
 

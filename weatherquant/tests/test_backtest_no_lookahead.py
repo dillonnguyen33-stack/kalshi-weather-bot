@@ -15,9 +15,84 @@ collection stays green while the implementation is RED.
 
 from __future__ import annotations
 
+import math
 from datetime import date
 
 import pytest
+
+
+def _two_month_pairs():
+    """Build TrainingPairs across TWO seasons with clearly different means (CR-02 fixture).
+
+    January (DJF, mean≈30°F) and July (JJA, mean≈85°F): each season is its own parent so both
+    month-fits are retained (≥N_MIN per season). The means are far apart so an equal-weight
+    all-month average (≈57.5) would land BETWEEN them — distinguishable from either month-fit.
+    """
+    from weatherquant.calibrate.strata import TrainingPair
+
+    pairs: list[TrainingPair] = []
+    for i in range(40):  # >= N_MIN (30) per season so each season parent is retained
+        # January: cold; obs tracks the ensemble mean (b≈1, small spread).
+        m_jan = 30.0 + (i % 5)
+        pairs.append(
+            TrainingPair(
+                city="NYC", model="hrrr", lead=1, month=1,
+                target_date=date(2026, 1, 1 + (i % 28)), m=m_jan, s2=4.0, y=m_jan + 0.2,
+            )
+        )
+        # July: hot; same well-behaved relationship at a far-away mean.
+        m_jul = 85.0 + (i % 5)
+        pairs.append(
+            TrainingPair(
+                city="NYC", model="hrrr", lead=7, month=7,
+                target_date=date(2026, 7, 1 + (i % 28)), m=m_jul, s2=4.0, y=m_jul + 0.2,
+            )
+        )
+    return pairs
+
+
+def test_blend_arm_selects_decision_month_fit_not_all_month_average():
+    """CR-02: _blend_arm_for_day(month=7) tracks the JULY fit, NOT the cross-month midpoint."""
+    from weatherquant.verify import backtest
+
+    pairs = _two_month_pairs()
+    jan = backtest._blend_arm_for_day(pairs, city_key="NYC", model="hrrr", lead=1, month=1)
+    jul = backtest._blend_arm_for_day(pairs, city_key="NYC", model="hrrr", lead=7, month=7)
+    assert jan is not None and jul is not None
+    mu_jan, _ = jan
+    mu_jul, _ = jul
+    # The two month-fits price near their own months' means (~32 and ~87), far apart.
+    assert mu_jul > 70.0  # July fit is hot
+    assert mu_jan < 50.0  # January fit is cold
+    # The cross-month equal-weight midpoint would be ~ (mu_jan + mu_jul)/2 — the July fit must
+    # NOT collapse toward it (CR-02: never an all-month average).
+    midpoint = (mu_jan + mu_jul) / 2.0
+    assert mu_jul > midpoint + 10.0
+
+
+def test_blend_arm_returns_none_for_absent_month():
+    """CR-02/D-09: a decision month with no retained month-fit returns None (caller logs it)."""
+    from weatherquant.verify import backtest
+
+    pairs = _two_month_pairs()  # only months 1 and 7 are present
+    # April (month=4, MAM season) has no pairs → no season parent → no month-fit → None.
+    assert backtest._blend_arm_for_day(pairs, city_key="NYC", model="hrrr", lead=4, month=4) is None
+
+
+def test_paired_record_carries_predictive_params_for_crps():
+    """Task 1/2: PairedRecord exposes wq_mu/wq_sigma/y (and v3_mu/v3_sigma) for Plan 06-07 CRPS."""
+    from dataclasses import fields
+
+    from weatherquant.verify.backtest import PairedRecord
+
+    names = {f.name for f in fields(PairedRecord)}
+    assert {"wq_mu", "wq_sigma", "y", "v3_mu", "v3_sigma"} <= names
+    # Defaults keep the existing constructor calls valid.
+    rec = PairedRecord(
+        day=date(2026, 7, 1), city="KXHIGHNY", bucket=(85, 86), wq_prob=0.6, v3_prob=0.55, o_i=1
+    )
+    assert rec.wq_mu is None and rec.wq_sigma is None and rec.y is None
+    assert rec.v3_mu is None and rec.v3_sigma is None
 
 
 def test_paired_record_is_a_frozen_coverage_aware_dataclass():
