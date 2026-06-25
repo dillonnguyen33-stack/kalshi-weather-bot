@@ -199,26 +199,46 @@ def _point_in_time_bias(pairs) -> float:
     return float(residuals.mean())
 
 
-def _v3_arm_raw_ensemble(pairs, day: date) -> tuple[float, float]:
-    """The RAW decision-day ensemble pair ``(m_asof, s2_asof)`` for the v3 arm (CR-05/D-02).
+def _v3_arm_raw_ensemble(pairs, day: date, month: int) -> tuple[float, float] | None:
+    """The RAW decision-month ensemble pair ``(m_asof, s2_asof)`` for the v3 arm (CR-02-for-v3/D-02).
 
     verify-subtree D-02 (raw-ensemble v3): the v3 baseline must be priced from the SAME ledger
     ensemble rows the WQ arm sees — the raw ``m`` / ``s2`` off ``assemble_pairs_from_rows`` — NOT
     from WQ's EMOS-corrected ``mu_b`` / Vincentized ``sigma_b``. Otherwise the "v3 baseline" is
     partly WQ's own calibration and the apples-to-apples comparison is voided (CR-05).
 
-    Prefers the ``TrainingPair`` whose ``target_date == day`` (the decision day's own ensemble);
-    if none exists (the as-of training set predates D), falls back to the mean ``m`` / mean ``s2``
-    across the as-of pairs — a documented point-in-time fallback that uses no future row. The v3
-    spread floor ``max(spread, 0.5)`` is applied INSIDE ``v3_bucket_probs`` (the legacy contract),
-    so this returns the un-floored raw ``s2``; the caller takes ``sqrt(s2)`` as the v3 spread.
+    MONTH FILTER FIRST (CR-02-for-v3, GAP 1): the v3 arm is restricted to the decision day's month
+    — ``month_pairs = [p for p in pairs if p.month == month]`` — mirroring the WQ arm's CR-02
+    month-selection in :func:`_blend_arm_for_day` (which selects the single ``fit.month == month``),
+    so BOTH arms price the SAME seasonal subset and methodology is the only remaining difference
+    (VER-04). Without this filter the mean averages ``m``/``s2`` across the ENTIRE as-of training
+    set — every retained month, all seasons — flattening a July baseline toward the cross-season
+    midpoint (the verifier-confirmed contamination: ``v3_mu≈56`` for a July decision day).
+
+    On the PRODUCTION no-look-ahead path the decision-day pair is ABSENT: ``available_at < cutoff``
+    filters it out because ``assemble_pairs_from_rows`` only builds a pair when a settled obs exists
+    for ``(city, target_date)``, and the daily-high for day D is not known until on/after D. So the
+    MONTH-FILTERED mean is the production-NORMAL branch, not a rare fallback. The decision-day
+    preference (``p.target_date == day`` → return that pair verbatim) is retained for the rare case
+    a decision-day pair is present (e.g. a back-dated obs in a test fixture), but it is selected
+    only from ``month_pairs`` so a present cross-season pair can never be picked.
+
+    Returns ``None`` when the decision month has no as-of pairs (absence is absence — the caller
+    coverage-logs ``no_v3_ensemble``, mirroring the WQ arm's ``None`` contract in
+    :func:`_blend_arm_for_day`). The v3 spread floor ``max(spread, 0.5)`` is applied INSIDE
+    ``v3_bucket_probs`` (the legacy contract), so this returns the un-floored raw ``s2``; the
+    caller takes ``sqrt(s2)`` as the v3 spread.
     """
-    for p in pairs:
+    month_pairs = [p for p in pairs if p.month == month]
+    if not month_pairs:
+        return None
+    # Decision-day preference, selected ONLY from the decision-month subset (never cross-season).
+    for p in month_pairs:
         if p.target_date == day:
             return float(p.m), float(p.s2)
-    # No decision-day pair: the as-of mean ensemble (point-in-time, never a future row).
-    m_asof = float(np.mean([p.m for p in pairs]))
-    s2_asof = float(np.mean([p.s2 for p in pairs]))
+    # Production-normal: the decision-MONTH mean ensemble (point-in-time, never a future row).
+    m_asof = float(np.mean([p.m for p in month_pairs]))
+    s2_asof = float(np.mean([p.s2 for p in month_pairs]))
     return m_asof, s2_asof
 
 
