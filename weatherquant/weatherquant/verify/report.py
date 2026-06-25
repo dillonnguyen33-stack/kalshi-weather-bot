@@ -138,7 +138,10 @@ def render_reports(
     # Carry through the optional provenance the caller front-loads onto the verdict (window/lead/
     # secondaries) so the JSON is self-describing — without inventing keys the caller did not pass.
     if isinstance(verdict, dict):
-        for key in ("test_window", "oos_slice", "primary_lead", "secondaries", "preregistration"):
+        for key in (
+            "test_window", "oos_slice", "primary_lead", "secondaries",
+            "not_scored", "roi_clv_caveat", "preregistration",
+        ):
             if key in verdict:
                 payload[key] = verdict[key]
 
@@ -247,14 +250,22 @@ def _render_verdict_md(payload: dict[str, Any]) -> str:
         "| Metric | CI low | CI high |",
         "| ------ | ------ | ------- |",
     ]
+    # CR-01 / T-06-20: a metric flagged not_scored renders "not scored / FAIL" verbatim rather than
+    # implying the pinned (0.0, 0.0) sentinel CI was a real numeric computation off the ledger.
+    not_scored = payload.get("not_scored") or {}
     for metric in _GATE1_METRICS:
         if metric in payload["cis"]:
-            lo, hi = payload["cis"][metric]
-            lines.append(f"| {metric} | {lo} | {hi} |")
+            if not_scored.get(metric):
+                lines.append(f"| {metric} | not scored / FAIL | not scored / FAIL |")
+            else:
+                lo, hi = payload["cis"][metric]
+                lines.append(f"| {metric} | {lo} | {hi} |")
     lines += [
         "",
         f"- RNG seed: `{payload['seed']}`",
     ]
+    if payload.get("roi_clv_caveat"):
+        lines.append(f"- ROI/CLV caveat: {payload['roi_clv_caveat']}")
     if payload.get("primary_lead") is not None:
         lines.append(f"- Primary lead: `{payload['primary_lead']}`")
     if payload.get("test_window") is not None:
