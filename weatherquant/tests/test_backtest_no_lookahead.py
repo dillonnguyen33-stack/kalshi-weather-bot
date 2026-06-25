@@ -588,3 +588,35 @@ def test_v3_arm_month_tracked_under_realistic_stamping(pg_conn):
     v3_mus = [r.v3_mu for r in scored if r.v3_mu is not None]
     assert v3_mus, "scored records must carry v3_mu"
     assert min(v3_mus) > 70.0  # month-correct on the PRODUCTION path (closes the v3_mu=56.27 probe)
+
+
+# --- 06-10 Task 3: the STANDING no-back-dating guard (GAP 3 stays closed) ----------------------
+#
+# A structural regression guard: the seeders can NEVER silently regress to the 2026-01-01
+# back-dating of decision-day settled obs. Read the seeded observation rows back and assert each
+# one's available_at is at/after its OWN settlement window end — so a future edit that re-stamps
+# obs before their settlement (re-admitting the day's own outcome into the < D-1d training read)
+# fails LOUD here, not as a silently re-contaminated "proof".
+
+
+@pytest.mark.integration
+def test_seeded_decision_day_obs_are_not_back_dated(pg_conn):
+    """GAP 3 standing guard: every seeded settled obs is stamped at/after its settlement window end."""
+    from weatherquant.db import queries
+
+    _seed_two_season_ledger(pg_conn)
+    obs_rows = queries.latest(
+        pg_conn, "observations", where={"city": "NYC", "source": "asos"}
+    )
+    assert obs_rows, "the seeder must produce settled observation rows to guard"
+    offenders = []
+    for row in obs_rows:
+        target_date = row["target_date"]
+        available_at = row["available_at"]
+        settle_end = settlement_window(get_city("NYC"), target_date).end_utc
+        if available_at < settle_end:
+            offenders.append((target_date, available_at.isoformat(), settle_end.isoformat()))
+    assert not offenders, (
+        "decision-day settled obs must be stamped at/after their settlement window end "
+        f"(no 2026-01-01 back-dating — GAP 3); back-dated rows: {offenders}"
+    )
