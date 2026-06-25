@@ -81,7 +81,7 @@ def test_blend_arm_returns_none_for_absent_month():
 
 
 def test_v3_arm_uses_raw_decision_day_ensemble_pair():
-    """CR-05: _v3_arm_raw_ensemble returns the raw decision-day (m, s2) — prefers target_date==day."""
+    """Test B (CR-05): when a target_date==day pair exists in the decision month it is preferred."""
     from weatherquant.calibrate.strata import TrainingPair
     from weatherquant.verify import backtest
 
@@ -92,26 +92,54 @@ def test_v3_arm_uses_raw_decision_day_ensemble_pair():
         TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
                      target_date=day, m=86.0, s2=16.0, y=86.5),  # the decision day's pair
     ]
-    m_asof, s2_asof = backtest._v3_arm_raw_ensemble(pairs, day)
+    m_asof, s2_asof = backtest._v3_arm_raw_ensemble(pairs, day, month=7)
     assert m_asof == pytest.approx(86.0)
     assert s2_asof == pytest.approx(16.0)
 
 
-def test_v3_arm_falls_back_to_as_of_mean_when_no_decision_day_pair():
-    """CR-05: with no target_date==day pair, fall back to the mean (m, s2) across as-of pairs."""
+def test_v3_arm_month_filtered_mean_when_no_decision_day_pair():
+    """Test A (CR-02-for-v3): production-normal path — decision-day pair ABSENT.
+
+    A July (month=7, mean ~85°F) set PLUS a January (month=1, mean ~30°F) set, with NO pair whose
+    target_date == the July decision day. The returned mean must be the July-only mean (~85°F), NOT
+    the cross-season ~57°F midpoint that averaging across BOTH months would yield.
+    """
     from weatherquant.calibrate.strata import TrainingPair
     from weatherquant.verify import backtest
 
-    day = date(2026, 7, 10)
+    day = date(2026, 7, 10)  # no pair has this target_date — the production-normal branch
     pairs = [
+        # July set (month=7) — the decision month, ~85°F, none on the decision day.
         TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
-                     target_date=date(2026, 7, 6), m=80.0, s2=9.0, y=80.5),
+                     target_date=date(2026, 7, 6), m=84.0, s2=9.0, y=84.5),
         TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
-                     target_date=date(2026, 7, 8), m=84.0, s2=11.0, y=84.5),
+                     target_date=date(2026, 7, 8), m=86.0, s2=11.0, y=86.5),
+        # January set (month=1) — a different season, ~30°F; MUST NOT enter the July mean.
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 6), m=29.0, s2=4.0, y=29.5),
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 8), m=31.0, s2=6.0, y=31.5),
     ]
-    m_asof, s2_asof = backtest._v3_arm_raw_ensemble(pairs, day)
-    assert m_asof == pytest.approx(82.0)
+    m_asof, s2_asof = backtest._v3_arm_raw_ensemble(pairs, day, month=7)
+    # The July-only mean of {84, 86} = 85.0 / {9, 11} = 10.0 — NOT the cross-season ~57°F midpoint.
+    assert m_asof == pytest.approx(85.0)
     assert s2_asof == pytest.approx(10.0)
+    assert 70.0 < m_asof < 100.0  # firmly in July's range, never the all-month midpoint
+
+
+def test_v3_arm_returns_none_when_decision_month_absent():
+    """Test C (CR-02-for-v3): a decision month with no as-of pairs returns None (caller logs it)."""
+    from weatherquant.calibrate.strata import TrainingPair
+    from weatherquant.verify import backtest
+
+    day = date(2026, 7, 10)  # July decision day
+    pairs = [  # only January rows — the July month has NO ensemble.
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 6), m=29.0, s2=4.0, y=29.5),
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 8), m=31.0, s2=6.0, y=31.5),
+    ]
+    assert backtest._v3_arm_raw_ensemble(pairs, day, month=7) is None
 
 
 def test_v3_spread_is_sqrt_s2_distinct_from_wq_sigma():
@@ -125,7 +153,9 @@ def test_v3_spread_is_sqrt_s2_distinct_from_wq_sigma():
         TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
                      target_date=day, m=86.0, s2=s2_asof, y=86.5),
     ]
-    _m, s2 = backtest._v3_arm_raw_ensemble(pairs, day)
+    result = backtest._v3_arm_raw_ensemble(pairs, day, month=7)
+    assert result is not None
+    _m, s2 = result
     v3_sigma = math.sqrt(s2)
     assert v3_sigma == pytest.approx(5.0)
     # The WQ EMOS sigma is floored/shaped by calibration (>= SIGMA_FLOOR_F, typically small here);
