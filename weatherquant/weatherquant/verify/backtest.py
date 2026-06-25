@@ -399,11 +399,19 @@ def walk_forward(
             _log_exclusion(coverage_log, day, city, "no_market_ladder")
             continue
 
-        # CR-05/D-02: the v3 arm is priced from the RAW decision-day ensemble (m_asof, sqrt(s2_asof))
-        # plus the point-in-time bias — INDEPENDENT of WQ's EMOS mu_b / Vincentized sigma_b — so
-        # methodology is the only difference (VER-04). The v3 spread floor max(spread, 0.5) is
-        # applied inside v3_bucket_probs; do NOT pre-floor with SIGMA_FLOOR_F.
-        m_asof, s2_asof = _v3_arm_raw_ensemble(pairs, day)
+        # CR-05/D-02 + CR-02-for-v3: the v3 arm is priced from the RAW decision-MONTH ensemble
+        # (m_asof, sqrt(s2_asof)) plus the point-in-time bias — INDEPENDENT of WQ's EMOS mu_b /
+        # Vincentized sigma_b — so methodology is the only difference (VER-04). day.month is passed
+        # (matching the WQ arm's _blend_arm_for_day(..., month=day.month)) so the v3 mean is the
+        # decision month's seasonal subset, never the cross-season midpoint. The v3 spread floor
+        # max(spread, 0.5) is applied inside v3_bucket_probs; do NOT pre-floor with SIGMA_FLOOR_F.
+        v3_ensemble = _v3_arm_raw_ensemble(pairs, day, month=day.month)
+        if v3_ensemble is None:
+            # CR-02-for-v3/D-09: the decision month has no v3 ensemble — coverage-log it and skip
+            # the day; NEVER fall through to price a contaminated/absent v3 mean (absence is absence).
+            _log_exclusion(coverage_log, day, city, "no_v3_ensemble")
+            continue
+        m_asof, s2_asof = v3_ensemble
         bias = _point_in_time_bias(pairs)
         v3_mu = m_asof + bias
         v3_sigma = float(np.sqrt(s2_asof))

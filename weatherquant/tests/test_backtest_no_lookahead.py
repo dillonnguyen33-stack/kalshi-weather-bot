@@ -398,3 +398,35 @@ def test_tail_high_lands_in_open_upper_bucket_not_zero_everywhere():
     assert sum(outcomes) == 1, "the tail high must land in exactly one (open-upper) bucket"
     yes_bucket = ladder[outcomes.index(1)]
     assert yes_bucket["edges"][3] is True, "the YES bucket for a high tail is the open-upper bucket"
+
+
+# --- 06-08 Task 2: the v3 arm month-filter is NOT the cross-season midpoint (seeded e2e) -------
+#
+# GAP 1 / SC2 / VER-04: on the production no-look-ahead path the v3 arm previously averaged m/s2
+# across the ENTIRE as-of training set (all seasons), flattening a July baseline toward the
+# cross-season ~57°F midpoint (verifier probe: v3_mu=56.27 vs wq_mu=85.5 — voiding the
+# apples-to-apples head-to-head). This seeded regression proves the month-filtered v3 arm now
+# prices the July range (v3_mu > 70°F). NOTE: this relies on the current back-dated obs stamping
+# (_seed_two_season_ledger), which makes the decision-day pair PRESENT; plan 06-10 re-stamps to the
+# realistic production path and re-asserts this on the absent-decision-day-pair branch. Its value
+# HERE is asserting the month-filter math, not the back-dating.
+
+
+@pytest.mark.integration
+def test_v3_arm_month_filtered_not_cross_season(pg_conn):
+    """GAP 1/VER-04 (seeded e2e): every scored July v3_mu tracks July (>70°F), not the ~57°F midpoint."""
+    from weatherquant.verify import backtest
+
+    _seed_two_season_ledger(pg_conn)
+    records, _coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=date(2026, 7, 10), end=date(2026, 7, 13),  # a window INSIDE July
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),  # disjoint from the Gate-1 window
+    )
+    scored = [r for r in records if r.excluded_reason is None]
+    assert scored, "the seeded non-empty ledger must produce at least one scored record"
+    v3_mus = [r.v3_mu for r in scored if r.v3_mu is not None]
+    assert v3_mus, "scored records must carry v3_mu"
+    # The v3 arm prices the JULY range (~85°F), NOT the ~57°F cross-season Jan+Jul midpoint that the
+    # pre-fix all-month average produced. Every scored July record must be firmly above 70°F.
+    assert min(v3_mus) > 70.0
