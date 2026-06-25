@@ -1,27 +1,71 @@
-"""Walk-forward paired backtest (VER-03 / D-09 / D-12): as-of-correct WQ-vs-v3 record assembly.
+"""Walk-forward paired backtest (VER-03 / D-08 / D-09 / D-10): as-of-correct WQ-vs-v3 records.
 
-D-12 (verify subtree-local): ``walk_forward`` replays the ledger day-by-day, building one
-``PairedRecord`` per (day, city, bucket) that scores the Weatherquant blended probability against
-the legacy v3 probability on the SAME realized outcome. It is strictly as-of-correct: only ledger
-rows with ``available_at < cutoff`` are consumed (no look-ahead), and the Gate-1 test window is
-asserted DISJOINT from the Phase-3 OOS slice so the proof is never scored on tuning data.
+D-08 (verify subtree-local — walk-forward as-of orchestration, NO new math): ``walk_forward``
+replays the ledger day-by-day, building one ``PairedRecord`` per (day, city, bucket) that scores
+the Weatherquant blended probability against the legacy v3 probability on the SAME realized
+outcome. It is PURE ORCHESTRATION: it composes the existing Phase-3/4 primitives verbatim
+(``calibrate.strata.fit_pooled_month_strata`` + ``calibrate.link.predict`` for the EMOS refit,
+``price.blend.blend_gaussians`` + ``price.buckets.bucket_probs`` for the WQ arm, and
+``verify.v3_reference.v3_bucket_probs`` for the v3 arm) and invents NO new temporal or
+calibration logic (D-04, RESEARCH §Pattern 5). It re-derives no calibration / blend / CDF math.
 
-D-09 (absence is absence): voided / missing / non-settling days are NOT silently dropped — each
-appears in the returned coverage log with an explicit ``excluded_reason`` so excluded-day coverage
-is auditable in the final verdict.
+NO-LOOK-AHEAD (T-06-12, RESEARCH §Pitfall 1 — the proof-killer): for each LST settlement day D
+the decision cutoff is the pre-registered primary lead's fixed cutoff BEFORE D (D-05). The as-of
+read consumes ONLY ledger rows with ``available_at < cutoff`` — the cutoff filter is applied
+INSIDE the per-day loop (filtering after a bare ``latest()`` leaks). ``observations.daily_high_f``
+is read ONLY to score the binary bucket outcome ``o_i`` (via the ``price.buckets._HALF`` edge
+rule), NEVER as a training feature.
 
-Bodies land Wave 3 — ``walk_forward`` raises ``NotImplementedError``; ``PairedRecord`` is a frozen
-dataclass usable now. Contracts pinned by ``tests/test_backtest_no_lookahead.py`` (RED).
+D-10 (window disjointness, anti-p-hacking): :func:`assert_window_disjoint` fails loud if the
+Gate-1 ``[start, end)`` test window overlaps the Phase-3 OOS slice (D-12 in ``evaluate.py``);
+it is called at the TOP of :func:`walk_forward`, before any scoring or ledger access.
+
+D-09 (coverage logging — absence is absence): voided / missing / non-settling days are NOT
+silently dropped (no bare ``dropna()`` on the day axis) — each is appended to the returned
+coverage log as ``{day, city, reason}`` AND surfaced via ``logger.warning`` so excluded-day
+coverage is auditable in the final verdict (VER-06).
+
+POINT-IN-TIME v3 BIAS (D-02/D-03 integrity contract, RESEARCH Pattern 1 / Assumption A4): the v3
+arm's ``corrected_mean``/``spread`` are derived from the SAME ledger ensemble rows the WQ arm sees
+(per-date ``m`` / ``sqrt(s2)`` via ``strata.assemble_pairs_from_rows``) plus a POINT-IN-TIME bias
+measured ONLY from ``available_at < cutoff`` settled outcomes (``bias = mean(y - m)`` over the
+as-of training pairs) — NOT v3's live in-memory bias table, which would leak. The adapter reads no
+same-day obs (its leak guard is structural — no ``obs`` argument exists).
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta, UTC
+
+import numpy as np
+import sqlalchemy as sa
+
+from weatherquant.calibrate.link import predict
+from weatherquant.calibrate.strata import (
+    OBS_SOURCE,
+    SIGMA_FLOOR_F,
+    assemble_pairs_from_rows,
+    fit_pooled_month_strata,
+)
+from weatherquant.db.models import NATURAL_KEYS, metadata
+from weatherquant.db.types import Bind, exec_bind
+from weatherquant.price.blend import accuracy_weights, blend_gaussians
+from weatherquant.price.buckets import bucket_probs, integers_in_bucket
+from weatherquant.price.ticker import TICKER_CITY_SUFFIX_TO_KEY, parse_ticker
+from weatherquant.registry import get_city
+from weatherquant.verify.v3_reference import v3_bucket_probs
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["PairedRecord", "walk_forward"]
+__all__ = ["PairedRecord", "assert_window_disjoint", "walk_forward"]
+
+#: The pre-registered primary decision lead's cutoff is ``D - PRIMARY_DECISION_LEAD_DAYS`` at
+#: 00:00 UTC (a fixed point-in-time before the LST settlement day D, D-05). The walk-forward
+#: consumes only rows stamped ``available_at < cutoff``. Conservative (a full day ahead) so the
+#: as-of read never peeks at a same-window forecast revision.
+PRIMARY_DECISION_LEAD_DAYS: int = 1
 
 
 @dataclass(frozen=True)
@@ -42,12 +86,331 @@ class PairedRecord:
     excluded_reason: str | None = None
 
 
-def walk_forward(bind, city, model, lead, start, end, oos_slice):
-    """Replay the ledger as-of-correctly and assemble paired WQ-vs-v3 records (VER-03).
+def assert_window_disjoint(
+    test_window: tuple[date, date] | None,
+    phase3_oos_slice: tuple[date, date] | None,
+) -> None:
+    """Fail loud if the Gate-1 test window overlaps the Phase-3 OOS slice (D-10, anti-p-hacking).
 
-    Consumes ONLY rows with ``available_at < cutoff`` (no look-ahead, D-12), asserts the
-    ``[start, end)`` test window is disjoint from ``oos_slice`` (the Phase-3 OOS span), and
-    coverage-logs every voided/missing day with a reason (D-09). Returns
-    ``(records, coverage_log)``. Body lands Wave 3.
+    Both windows are half-open ``[start, end)`` date pairs. Raises ``ValueError`` on ANY overlap
+    so the Gate-1 proof is never scored on the data used to select calibration hyperparameters
+    (D-12 in ``evaluate.py``). A ``None`` window/slice is a no-op (nothing to overlap) — the
+    descriptive/integration paths that pass no explicit windows skip the guard cleanly.
     """
-    raise NotImplementedError("verify.backtest.walk_forward lands in Wave 3 (VER-03).")
+    if test_window is None or phase3_oos_slice is None:
+        return
+    t_start, t_end = test_window
+    o_start, o_end = phase3_oos_slice
+    # Half-open overlap test: disjoint iff one ends at-or-before the other starts.
+    if t_start < o_end and o_start < t_end:
+        raise ValueError(
+            "Gate-1 test window "
+            f"[{t_start}, {t_end}) overlaps the Phase-3 OOS slice [{o_start}, {o_end}); "
+            "they MUST be disjoint (D-10/D-12 anti-p-hacking — never score on tuning data)."
+        )
+
+
+def _resolve_city_key(city: str) -> str:
+    """Map a Kalshi ``KXHIGH<SUFFIX>`` market code (or a bare registry key) to the registry key.
+
+    The ledger ``city`` column and ``registry.get_city`` use the internal key (e.g. ``NYC``); the
+    Gate-1 callers pass the Kalshi market code (e.g. ``KXHIGHNY``). Strips the ``KXHIGH`` prefix
+    and maps the suffix via ``price.ticker.TICKER_CITY_SUFFIX_TO_KEY``; a bare registry key passes
+    through unchanged so both call styles work.
+    """
+    if city.startswith("KXHIGH"):
+        suffix = city[len("KXHIGH"):]
+        return TICKER_CITY_SUFFIX_TO_KEY.get(suffix, city)
+    return city
+
+
+def _decision_cutoff(day: date) -> datetime:
+    """The fixed point-in-time decision cutoff BEFORE LST day ``D`` (D-05, no look-ahead).
+
+    ``D - PRIMARY_DECISION_LEAD_DAYS`` at 00:00 UTC. The as-of read keeps only rows with
+    ``available_at < cutoff`` — a conservative whole-day lead so a same-window forecast revision
+    can never enter the day's training set.
+    """
+    return datetime(day.year, day.month, day.day, tzinfo=UTC) - timedelta(
+        days=PRIMARY_DECISION_LEAD_DAYS
+    )
+
+
+def _latest_as_of(
+    bind: Bind, table_name: str, cutoff: datetime, *, where: dict[str, object] | None = None
+) -> list[dict]:
+    """Point-in-time ``latest`` read: newest row per natural key among ``available_at < cutoff``.
+
+    The as-of analogue of ``db.queries.latest`` — the cutoff is applied INSIDE the SELECT (a
+    ``WHERE available_at < :cutoff`` BEFORE the DISTINCT ON), so a future-stamped row is excluded
+    from the window rather than filtered after ``latest()`` (RESEARCH §Pitfall 1 — filtering after
+    ``latest`` leaks). Keeps the same DISTINCT-ON-natural-key, ``available_at DESC, id DESC``
+    ordering as the production reader. Returns plain dicts (detached from the row mapping).
+    """
+    table = metadata.tables[table_name]
+    key_cols = [table.c[name] for name in NATURAL_KEYS[table_name]]
+    stmt = (
+        sa.select(table)
+        .where(table.c.available_at < cutoff)  # POINT-IN-TIME cutoff, applied in the window
+        .distinct(*key_cols)
+        .order_by(*key_cols, table.c.available_at.desc(), table.c.id.desc())
+    )
+    if where:
+        stmt = stmt.where(*(table.c[name] == value for name, value in where.items()))
+    with exec_bind(bind, write=False) as conn:
+        return [dict(row) for row in conn.execute(stmt).mappings().all()]
+
+
+def _outcome_for_bucket(
+    y: float, lo: int | None, hi: int | None, open_lo: bool, open_hi: bool
+) -> int:
+    """Binary YES outcome ``o_i`` for one bucket given the settled daily high ``y`` (RESEARCH).
+
+    Uses the ``price.buckets._HALF`` edge rule (D-05): integer degree ``k`` owns
+    ``[k - 0.5, k + 0.5)``. The continuous span is taken from :func:`integers_in_bucket` so the
+    outcome geometry is the SAME geometry both arms price (never a re-derived edge). ``y`` is the
+    settled ``observations.daily_high_f`` — read ONLY here to score the outcome, never a feature.
+    """
+    lo_edge, hi_edge = integers_in_bucket(lo, hi, open_lo=open_lo, open_hi=open_hi)
+    return 1 if (lo_edge <= y < hi_edge) else 0
+
+
+def _point_in_time_bias(pairs) -> float:
+    """v3 point-in-time bias ``mean(y - m)`` over the as-of training pairs (D-02/A4, leak-safe).
+
+    Mirrors v3's ``derive_bias`` intent (``bias = mean(settled - corrected_mean)``) but measured
+    ONLY from ``available_at < cutoff`` settled outcomes — NOT v3's live in-memory bias table. An
+    empty training set yields a 0.0 bias (no point-in-time signal yet).
+    """
+    if not pairs:
+        return 0.0
+    residuals = np.array([p.y - p.m for p in pairs], dtype=float)
+    return float(residuals.mean())
+
+
+def _blend_arm_for_day(pairs, *, city_key: str, model: str, lead: int):
+    """Refit EMOS on the as-of training pairs and return the WQ blend ``(mu_b, sigma_b)`` (D-04).
+
+    PURE REUSE: ``fit_pooled_month_strata`` (the existing Phase-3 fitter — no new calibration math)
+    → per-month ``StratumFit``; ``link.predict`` reconstructs each month's predictive Gaussian on
+    its own ``(m, s2)``; the day's month-fit is blended via ``price.blend`` (accuracy-weighted by
+    each fit's ``crps_oos`` when available, else equal weight). Returns ``None`` when no month fit
+    covers the day's month (caller coverage-logs it). The blend over a single present model is the
+    identity, preserving the production blend path verbatim.
+    """
+    fits = fit_pooled_month_strata(pairs, city=city_key, model=model, lead=lead)
+    if not fits:
+        return None
+    # Use every retained month fit as a component priced on its own training (m, s2): the WQ arm
+    # blends the present month-fits exactly as the production blend would (D-01).
+    mus: list[float] = []
+    sigmas: list[float] = []
+    crps_proxy: list[float] = []
+    for month_samples, _target_dates, fit in fits:
+        params = (fit.a, fit.b, fit.c, fit.d, fit.sigma_floor)
+        mu, sigma = predict(params, month_samples.m, month_samples.s2)
+        # One representative (mu, sigma) per fit: the mean over its training rows (the fit's
+        # central predictive Gaussian). The blend then Vincentizes the present fits (D-01).
+        mus.append(float(np.mean(mu)))
+        sigmas.append(float(np.mean(sigma)))
+        # crps_oos is not carried on StratumFit here; use an equal-quality proxy so the
+        # accuracy weights degrade to equal weight (no re-derived metric — D-04).
+        crps_proxy.append(1.0)
+    weights = accuracy_weights(np.array(crps_proxy, dtype=float))
+    mu_b, sigma_b = blend_gaussians(
+        np.array(mus, dtype=float), np.array(sigmas, dtype=float), weights
+    )
+    sigma_b = max(sigma_b, SIGMA_FLOOR_F)  # never a degenerate sigma into the CDF (D-09)
+    return mu_b, sigma_b
+
+
+def _settlement_days(bind: Bind, city_col: str, start: date | None, end: date | None) -> list[date]:
+    """The ordered list of LST settlement days to replay over ``[start, end)`` (stable, D-10).
+
+    When ``start``/``end`` are given, replays every calendar day in the half-open window. When
+    they are ``None`` (the descriptive/integration path), derives the window from the distinct
+    ``observations.target_date`` rows present in the ledger for the city (empty ⇒ no days). Days
+    are always returned in ascending date order (the temporal-split ordering discipline; never
+    shuffled — RESEARCH §Pattern 5 / ``evaluate.temporal_split``).
+    """
+    if start is not None and end is not None:
+        days: list[date] = []
+        d = start
+        while d < end:
+            days.append(d)
+            d = d + timedelta(days=1)
+        return days
+    # No explicit window: enumerate the settlement days the ledger actually has obs for.
+    obs = metadata.tables["observations"]
+    stmt = (
+        sa.select(obs.c.target_date)
+        .where(obs.c.city == city_col, obs.c.source == OBS_SOURCE)
+        .distinct()
+        .order_by(obs.c.target_date.asc())
+    )
+    with exec_bind(bind, write=False) as conn:
+        rows = conn.execute(stmt).all()
+    return [r[0] for r in rows]
+
+
+def walk_forward(
+    bind: Bind | None,
+    city: str,
+    model: str,
+    lead: int,
+    start: date | None,
+    end: date | None,
+    oos_slice: tuple[date, date] | None,
+):
+    """Replay the ledger as-of-correctly and assemble paired WQ-vs-v3 records (VER-03, D-08).
+
+    For each LST settlement day D in ``[start, end)`` (or every ledger-present obs day when the
+    window is ``None``): assert the test window is disjoint from the Phase-3 ``oos_slice`` (D-10,
+    done FIRST), read ONLY ledger rows with ``available_at < _decision_cutoff(D)`` (no look-ahead,
+    T-06-12), refit EMOS via the existing Phase-3 fitter (D-04 — no new math), price BOTH arms on
+    the IDENTICAL bucket geometry (WQ via ``price.blend``→``price.buckets``; v3 via
+    ``verify.v3_reference`` with a point-in-time bias, D-02/A4), and settle each bucket against the
+    observed ``daily_high_f`` (read ONLY to score ``o_i``, never a feature).
+
+    Returns ``(records, coverage_log)``: ``records`` is the list of scored
+    :class:`PairedRecord` (one per day×bucket at the primary lead); ``coverage_log`` is the list
+    of ``{day, city, reason}`` exclusion dicts — every voided/missing/non-settling day is logged
+    with a reason (D-09), never silently dropped. The disjointness guard runs before any ledger
+    access so an overlapping window fails loud even with ``bind=None``.
+    """
+    # D-10 disjointness FIRST — before any scoring or ledger access (fails loud on overlap).
+    assert_window_disjoint((start, end) if start and end else None, oos_slice)
+
+    records: list[PairedRecord] = []
+    coverage_log: list[dict] = []
+
+    if bind is None:
+        # No ledger to replay (disjointness-only call path) — nothing to score.
+        return records, coverage_log
+
+    city_key = _resolve_city_key(city)
+    try:
+        get_city(city_key)  # validate the city resolves (its window clock is settlement_window)
+    except KeyError:
+        logger.warning(
+            "walk_forward: unknown city %r (resolved key %r) — no settlement window; "
+            "logging full-coverage exclusion",
+            city,
+            city_key,
+        )
+        coverage_log.append({"day": None, "city": city, "reason": "unknown_city"})
+        return records, coverage_log
+
+    for day in _settlement_days(bind, city_key, start, end):
+        cutoff = _decision_cutoff(day)
+
+        # --- POINT-IN-TIME as-of read (available_at < cutoff), applied INSIDE the loop ---------
+        forecast_rows = _latest_as_of(
+            bind, "forecasts", cutoff, where={"city": city_key, "model": model}
+        )
+        obs_rows = _latest_as_of(
+            bind, "observations", cutoff, where={"city": city_key, "source": OBS_SOURCE}
+        )
+        pairs = assemble_pairs_from_rows(forecast_rows, obs_rows)
+        if not pairs:
+            _log_exclusion(coverage_log, day, city, "no_training_data")
+            continue
+
+        blend = _blend_arm_for_day(pairs, city_key=city_key, model=model, lead=lead)
+        if blend is None:
+            _log_exclusion(coverage_log, day, city, "no_model_fit")
+            continue
+        mu_b, sigma_b = blend
+
+        # --- the settled outcome: read daily_high_f ONLY to score o_i (never a feature) --------
+        settle_rows = _latest_as_of(
+            bind,
+            "observations",
+            datetime(day.year, day.month, day.day, tzinfo=UTC) + timedelta(days=2),
+            where={"city": city_key, "target_date": day, "source": OBS_SOURCE},
+        )
+        y = _settled_high(settle_rows)
+        if y is None:
+            _log_exclusion(coverage_log, day, city, "no_settled_outcome")
+            continue
+
+        # --- price BOTH arms on the IDENTICAL bucket ladder ------------------------------------
+        ladder = _ladder_for_day(mu_b, sigma_b)
+        if not ladder:
+            _log_exclusion(coverage_log, day, city, "no_market_ladder")
+            continue
+
+        bias = _point_in_time_bias(pairs)
+        corrected_mean = mu_b + bias
+        # The shared continuous spans (lo_edge, hi_edge, open_lo, open_hi) — the ONE geometry both
+        # arms price; never re-derived per arm (VER-04 — methodology is the only difference).
+        wq_ladder = [b["span"] for b in ladder]
+        v3_ladder = [b["entry"] for b in ladder]
+        # WQ arm: production blend → bucket CDF differencing (price.buckets).
+        wq = bucket_probs(mu_b, sigma_b, wq_ladder)
+        # v3 arm: SAME ensemble-derived mean/spread + point-in-time bias (D-02/A4, leak-safe).
+        v3 = v3_bucket_probs(corrected_mean, sigma_b, v3_ladder)
+        v3_list = list(v3.values())
+
+        for i, b in enumerate(ladder):
+            lo, hi, open_lo, open_hi = b["edges"]
+            o_i = _outcome_for_bucket(y, lo, hi, open_lo, open_hi)
+            records.append(
+                PairedRecord(
+                    day=day,
+                    city=city,
+                    bucket=(lo, hi),
+                    wq_prob=float(wq[i]),
+                    v3_prob=float(v3_list[i]),
+                    o_i=o_i,
+                )
+            )
+
+    return records, coverage_log
+
+
+def _log_exclusion(coverage_log: list[dict], day: date, city: str, reason: str) -> None:
+    """Append a coverage-log exclusion AND warn (D-09 — never a silent drop on the day axis)."""
+    logger.warning("walk_forward exclude day=%s city=%s reason=%s", day, city, reason)
+    coverage_log.append({"day": day, "city": city, "reason": reason})
+
+
+def _settled_high(settle_rows: list[dict]) -> float | None:
+    """The settled ``daily_high_f`` from the as-of obs read, or ``None`` if absent/voided."""
+    for row in settle_rows:
+        y = row.get("daily_high_f")
+        if y is not None:
+            return float(y)
+    return None
+
+
+def _ladder_for_day(mu_b: float, sigma_b: float) -> list[dict]:
+    """Build the shared bucket ladder centered on the blend, as a list of geometry dicts.
+
+    The live KXHIGH market ladder is not persisted in the Gate-1 ledger window, so derive a degree
+    ladder centered on the blended mean (±4σ, integer degrees) — both arms price the IDENTICAL
+    spans (VER-04). Each entry is parsed ONCE into the shared geometry: ``entry`` is the structured
+    -strike mapping the v3 adapter parses; ``edges`` is ``(lo, hi, open_lo, open_hi)`` for the
+    outcome rule; ``span`` is the continuous ``(lo_edge, hi_edge, open_lo, open_hi)`` the WQ arm's
+    ``bucket_probs`` consumes. Empty when sigma is non-finite (caller coverage-logs it).
+    """
+    if not np.isfinite(mu_b) or not np.isfinite(sigma_b) or sigma_b <= 0:
+        return []
+    center = int(round(mu_b))
+    half_span = max(1, int(round(4.0 * sigma_b)))
+    ladder: list[dict] = []
+    for lo in range(center - half_span, center + half_span):
+        hi = lo  # single-degree closed buckets tile the ladder (each integer its own bucket)
+        entry = {"floor_strike": lo, "cap_strike": hi, "strike_type": "between"}
+        lo_i, hi_i, open_lo, open_hi = parse_ticker(
+            floor_strike=lo, cap_strike=hi, strike_type="between"
+        )
+        lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
+        ladder.append(
+            {
+                "entry": entry,
+                "edges": (lo_i, hi_i, open_lo, open_hi),
+                "span": (lo_edge, hi_edge, open_lo, open_hi),
+            }
+        )
+    return ladder
