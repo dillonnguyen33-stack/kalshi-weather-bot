@@ -189,28 +189,37 @@ def crps_blend(
 def roi_from_fills(
     fills: Sequence[Any],
     settled_yes: Sequence[bool],
+    sides: Sequence[str],
 ) -> float:
     """Realized return-on-investment over paper fills given per-market YES settlement (VER-01).
+
+    SIDE MIRROR (mirrors :func:`weatherquant.market.clv.clv_cents`' D-09 sign orientation): the
+    payoff is oriented by the fill's ``side``. A YES-equivalent BUY (``side`` in ``"yes"``/``"buy"``)
+    wins when the bucket settles YES; a NO-equivalent position (``side`` in ``"no"``/``"sell"``) is
+    the MIRROR — it wins when the bucket settles NO. ``side`` is normalized to buy/sell exactly as
+    ``cli.verify._settle_window_fills`` does (``"yes"``/``"buy"`` → buy, ``"no"``/``"sell"`` → sell);
+    a side-blind ROI would mis-score a NO win as a loss (the 06-09 defect).
 
     D-01 unit discipline (RESEARCH §Pitfall 3): everything in CENTS, dollars only at the return
     edge. Per fill ``i`` with ``count`` contracts and the FLOAT ``detail['avg_price_cents']``
     (never the ±0.5c-rounded ``fills.price``):
 
-        entry_i  = count_i · avg_price_cents_i           # capital deployed, cents
-        payoff_i = 100 · count_i  if settled YES else 0  # 100c per winning YES contract
-        net_i    = payoff_i − entry_i − fee_i            # fee in cents
+        entry_i  = count_i · avg_price_cents_i                       # capital deployed, cents
+        wins_i   = settled_yes_i        if side is YES-equivalent     # else: NOT settled_yes_i
+        payoff_i = 100 · count_i  if wins_i else 0                    # 100c per winning contract
+        net_i    = payoff_i − entry_i − fee_i                        # fee in cents
 
     ``ROI = Σ net / Σ entry`` (a pure ratio — unit-free). Guards ``avg_price_cents ∈ [0, 100]``
     (a price > 100 or < 0 is a unit bug, D-01).
     """
-    if len(fills) != len(settled_yes):
+    if not (len(fills) == len(settled_yes) == len(sides)):
         raise ValueError(
-            f"roi_from_fills: fills/settled_yes length mismatch "
-            f"({len(fills)} vs {len(settled_yes)})."
+            f"roi_from_fills: fills/settled_yes/sides length mismatch "
+            f"({len(fills)}, {len(settled_yes)}, {len(sides)})."
         )
     total_entry = 0.0
     total_net = 0.0
-    for fill, is_yes in zip(fills, settled_yes, strict=True):
+    for fill, is_yes, side in zip(fills, settled_yes, sides, strict=True):
         count = float(_fill_field(fill, "count"))
         avg_price_cents = float(_fill_avg_price_cents(fill))
         fee = float(_fill_field(fill, "fee"))
@@ -219,8 +228,13 @@ def roi_from_fills(
                 f"roi_from_fills: avg_price_cents must be in [0, 100] cents; "
                 f"got {avg_price_cents} (unit bug — dollars vs cents?)."
             )
+        # Normalize to buy/sell exactly as cli.verify._settle_window_fills does, then mirror the
+        # clv_cents orientation: a YES-equivalent BUY wins on a YES settlement, a NO-equivalent
+        # position wins on a NO settlement.
+        is_buy = side in ("yes", "buy")
+        wins = is_yes if is_buy else (not is_yes)
         entry = count * avg_price_cents
-        payoff = 100.0 * count if is_yes else 0.0
+        payoff = 100.0 * count if wins else 0.0
         total_entry += entry
         total_net += payoff - entry - fee
     if total_entry <= 0.0:
