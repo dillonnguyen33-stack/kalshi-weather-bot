@@ -240,59 +240,152 @@ def test_walk_forward_logs_voided_days_with_a_reason(pg_conn):
 # (where CR-02/CR-05 live) was never exercised. THIS test seeds a real two-season ledger and is the
 # standing proof: a green unit suite alone is NOT the evidence.
 
-from datetime import datetime, timezone  # noqa: E402
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+from weatherquant.calibrate.strata import N_MIN  # noqa: E402 - the season-retention floor (30)
+from weatherquant.registry import get_city  # noqa: E402
+from weatherquant.time import settlement_window  # noqa: E402
 
 _F_TO_K = lambda f: (f - 32.0) * 5.0 / 9.0 + 273.15  # noqa: E731 - test-only inverse of the K→°F seam
 
+# --- 06-10: PRODUCTION-PATH stamping (GAP 3 / VER-03 — the no-look-ahead PROOF) ----------------
+#
+# The Gate-1 scored window. D_START is the FIRST replayed July decision day; the window is INSIDE
+# July so day.month == 7 selects the July fit on BOTH arms.
+_GATE1_START = date(2026, 7, 10)
+_GATE1_END = date(2026, 7, 13)  # half-open → scored days 07-10, 07-11, 07-12
+
+# WHY THE EXCLUSION IS WIDER THAN ONE DAY (the feasibility cliff): under realistic stamping a
+# July day d's settled obs is available_at = settlement_window(NYC, d).end_utc ≈ 05:00 UTC on d+1.
+# The decision cutoff for day D is _decision_cutoff(D) = D-1d 00:00 UTC. A July pair survives the
+# as-of training read for D iff settlement_window(NYC, d).end_utc < D-1d 00:00 UTC, i.e. 05:00 UTC
+# on d+1 < 00:00 UTC on D-1 ⟺ d <= D-3. So for D_START = 2026-07-10 the surviving JULY days are
+# 07-01..07-07 (7 pairs) — a contiguous July block alone is NOT >= N_MIN. JJA pools June+July+Aug
+# (season 2), so we seed JUNE 01..30 as well: all 30 June days settle before the 07-10 cutoff, and
+# 30 (June) + 7 (July) = 37 surviving JJA pairs >= N_MIN (30) → the July month-fit is RETAINED and
+# the day SCORES. (Verified arithmetic, NOT "extend if starved" prose.) The July month-fit also
+# requires >= 1 surviving July pair so a July entry exists in by_month — 07-01..07-07 supply 7.
+_SEED_JUNE_DAYS = 30  # June 01..30 — JJA-season fill so >= N_MIN JJA pairs survive the cutoff
+_SEED_JULY_DAYS = 31  # July 01..31 — the scored month; 07-01..07-07 survive the 07-10 cutoff
+
+
+def _decision_cutoff_utc(D: date) -> datetime:
+    """Mirror backtest._decision_cutoff: D - PRIMARY_DECISION_LEAD_DAYS (=1) at 00:00 UTC."""
+    return datetime(D.year, D.month, D.day, tzinfo=timezone.utc) - timedelta(days=1)
+
+
+def _surviving_july_pair_count(D: date) -> int:
+    """The as-of July pair count surviving the cutoff for decision day ``D`` (whitebox check).
+
+    A July day d survives iff settlement_window(NYC, d).end_utc < _decision_cutoff(D). This is the
+    explicit count the seeding arithmetic guarantees is >= 1 (a July month entry exists); the JJA
+    season count (June+July) is what must clear N_MIN — see ``_surviving_jja_pair_count``.
+    """
+    city = get_city("NYC")
+    cutoff = _decision_cutoff_utc(D)
+    return sum(
+        1
+        for i in range(_SEED_JULY_DAYS)
+        if settlement_window(city, date(2026, 7, 1) + timedelta(days=i)).end_utc < cutoff
+    )
+
+
+def _surviving_jja_pair_count(D: date) -> int:
+    """The as-of JJA-season (June+July) pair count surviving the cutoff for decision day ``D``.
+
+    This is the count that must be >= N_MIN for the season parent to be retained (and hence the
+    July month-fit kept). Asserted in the e2e tests so a future seeding regression that starves the
+    fit fails LOUD as an explicit count, not a silent no_month_fit / 0 scored records.
+    """
+    city = get_city("NYC")
+    cutoff = _decision_cutoff_utc(D)
+    jja = [date(2026, 6, 1) + timedelta(days=i) for i in range(_SEED_JUNE_DAYS)] + [
+        date(2026, 7, 1) + timedelta(days=i) for i in range(_SEED_JULY_DAYS)
+    ]
+    return sum(1 for d in jja if settlement_window(city, d).end_utc < cutoff)
+
 
 def _seed_two_season_ledger(conn):
-    """Seed NYC/hrrr forecasts+observations across January (~30°F) and July (~85°F).
+    """Seed NYC/hrrr forecasts+observations on the PRODUCTION no-look-ahead path (GAP 3 / VER-03).
 
-    >= N_MIN (30) distinct target_dates per season so BOTH season parents (and hence both
-    month-fits) are retained. 3 members per day so s2 > 0 (a real ensemble spread). All rows are
-    stamped available_at well before any replayed July decision cutoff (no look-ahead). January's
-    mean (~30°F) and July's mean (~85°F) are far apart so an all-month average would land ~57°F —
-    distinguishable from either month-fit (the CR-02 discriminator).
+    Decision-day settled obs are stamped at ``settlement_window(get_city("NYC"), D).end_utc`` (the
+    realistic LST settlement instant on/after D), NOT back-dated to 2026-01-01. Forecasts are
+    stamped at ``D-2d`` 00:00 UTC — a fixed instant STRICTLY BEFORE the ``D-1d`` 00:00 UTC cutoff,
+    so the decision day's OWN forecast is admitted (d-2 < D-1) yet its settled obs is NOT (settling
+    ≈ 05:00 UTC on D+1, which is >= the cutoff). Result: under ``available_at < cutoff`` the
+    decision-day PAIR is correctly ABSENT (no obs) — the production-normal branch — while the
+    outcome read (``< D+2d``) still sees the obs to score o_i.
+
+    Seeds JUNE 01..30 + JULY 01..31 (JJA season) so >= N_MIN JJA pairs survive the 07-10 cutoff and
+    the July month-fit is retained (see the module-level feasibility arithmetic). JANUARY 01..31 is
+    seeded with the SAME realistic stamping as a cross-season distractor (DJF; its own season is
+    below N_MIN and skipped — it never wins the month-filter, it just proves the v3/WQ month-filters
+    pick July not a cross-season midpoint). All JJA forecasts share members {83, 85, 87} (s2 = 8/3).
     """
     from weatherquant.ingest.writer import insert_forecast, insert_observation
 
-    avail = datetime(2026, 1, 1, tzinfo=timezone.utc)  # before every Jan/Jul decision cutoff
-
-    def _seed_month(year_month_first: date, base_f: float, n_days: int):
+    def _seed_month(year: int, month: int, base_f: float, n_days: int):
         for i in range(n_days):
-            d = date(year_month_first.year, year_month_first.month, 1 + i)
-            members_f = [base_f - 2.0, base_f, base_f + 2.0]  # 3 members → s2 > 0
+            d = date(year, month, 1 + i)
+            members_f = [base_f - 2.0, base_f, base_f + 2.0]  # 3 members → s2 = 8/3 > 0
             cycle = datetime(d.year, d.month, d.day, 0, tzinfo=timezone.utc)
+            # Forecasts: stamped at D-2d 00:00 UTC — STRICTLY before the D-1d 00:00 UTC cutoff so the
+            # decision day's own forecast is NOT dropped (the cycle field stays d 00:00 UTC).
+            fc_avail = datetime(d.year, d.month, d.day, tzinfo=timezone.utc) - timedelta(days=2)
             for member, mf in enumerate(members_f):
                 insert_forecast(
                     conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
                     temp_kelvin=_F_TO_K(mf), cycle=cycle,
                     station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
-                    available_at=avail,
+                    available_at=fc_avail,
                 )
-            # The verifying daily-high obs (tracks the ensemble mean closely).
+            # The verifying daily-high obs: stamped at the realistic LST SETTLEMENT instant on/after
+            # day d (≈ 05:00 UTC on d+1) — excluded from the < D-1d training read (no look-ahead),
+            # included in the < D+2d outcome read (scores o_i).
+            obs_avail = settlement_window(get_city("NYC"), d).end_utc
             insert_observation(
                 conn, city="NYC", target_date=d, source="asos", daily_high_f=base_f + 0.5,
-                available_at=avail,
+                available_at=obs_avail,
             )
 
-    _seed_month(date(2026, 1, 1), base_f=30.0, n_days=31)  # January, DJF season
-    _seed_month(date(2026, 7, 1), base_f=85.0, n_days=31)  # July, JJA season
+    _seed_month(2026, 1, base_f=30.0, n_days=31)  # January, DJF — cross-season distractor
+    _seed_month(2026, 6, base_f=85.0, n_days=_SEED_JUNE_DAYS)  # June, JJA — season-retention fill
+    _seed_month(2026, 7, base_f=85.0, n_days=_SEED_JULY_DAYS)  # July, JJA — the scored month
 
 
 @pytest.mark.integration
 def test_walk_forward_uses_decision_month_fit_not_all_month_average(pg_conn):
-    """CR-02 (seeded e2e): a scored July record's wq_mu tracks the JULY fit, not the all-month mean."""
+    """CR-02 (seeded e2e, PRODUCTION path): a scored July wq_mu tracks the JULY fit, not all-month.
+
+    06-10: now on the REALISTICALLY-stamped ledger (decision-day obs at settlement, forecasts at
+    D-2d). The decision-day pair is ABSENT (no-look-ahead) yet the day STILL scores because >= N_MIN
+    JJA pairs survive the cutoff — the green assertion certifies the invariant, not a back-dated
+    fixture. An explicit surviving-pair-count assertion fails loud on a starved fit.
+    """
     from weatherquant.verify import backtest
+
+    # The seeding arithmetic GUARANTEE, asserted explicitly so a starved fit fails as a count (not a
+    # silent no_month_fit / 0-record suite): >= N_MIN JJA pairs survive the first scored day's cutoff.
+    assert _surviving_jja_pair_count(_GATE1_START) >= N_MIN, (
+        "seeding regression: < N_MIN JJA pairs survive the cutoff → the July fit would be starved"
+    )
+    assert _surviving_july_pair_count(_GATE1_START) >= 1, "no surviving July pair → no July month entry"
 
     _seed_two_season_ledger(pg_conn)
     records, coverage = backtest.walk_forward(
         pg_conn, "KXHIGHNY", "hrrr", lead=0,
-        start=date(2026, 7, 10), end=date(2026, 7, 13),  # a window INSIDE July
+        start=_GATE1_START, end=_GATE1_END,  # a window INSIDE July
         oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),  # disjoint from the Gate-1 window
     )
     scored = [r for r in records if r.excluded_reason is None]
-    assert scored, "the seeded non-empty ledger must produce at least one scored record"
+    assert scored, "the realistically-stamped ledger must STILL produce at least one scored record"
+    # No scored decision day may have been dropped for a starved fit (the retention held on the path).
+    scored_days = {r.day for r in scored}
+    starved = [
+        e for e in coverage
+        if e.get("day") in scored_days and e.get("reason") in ("no_month_fit", "no_v3_ensemble")
+    ]
+    assert not starved, f"a scored day must not also be coverage-logged as starved: {starved}"
     # CR-02: the WQ predictive mean tracks the JULY month (~85°F), NOT the cross-month midpoint
     # (~57.5°F that an equal-weight Jan+Jul average would produce).
     wq_mus = [r.wq_mu for r in scored if r.wq_mu is not None]
@@ -302,7 +395,15 @@ def test_walk_forward_uses_decision_month_fit_not_all_month_average(pg_conn):
 
 @pytest.mark.integration
 def test_v3_arm_priced_from_raw_ensemble_spread_not_wq_sigma(pg_conn):
-    """CR-05 (seeded e2e): v3_sigma == sqrt(s2_asof) of the raw decision-day ensemble, != wq_sigma."""
+    """CR-05 (seeded e2e, PRODUCTION path): v3_sigma == sqrt(month-mean s2), != wq_sigma.
+
+    06-10: the decision-day pair is now ABSENT (realistic stamping), so the v3 arm takes 06-08's
+    MONTH-FILTERED fallback — the mean s2 over the surviving JULY pairs. Each July day's members are
+    {83, 85, 87} → population variance 8/3 per pair, and the mean of identical 8/3 values is still
+    8/3, so the expected v3_sigma is UNCHANGED at sqrt(8/3) ≈ 1.633 by construction. Only the REASON
+    it holds (month-filtered ensemble over absent-decision-day pairs, not a single back-dated
+    decision-day triple) changes — do NOT "fix" the still-correct expected value.
+    """
     import math
 
     from weatherquant.verify import backtest
@@ -310,17 +411,17 @@ def test_v3_arm_priced_from_raw_ensemble_spread_not_wq_sigma(pg_conn):
     _seed_two_season_ledger(pg_conn)
     records, _coverage = backtest.walk_forward(
         pg_conn, "KXHIGHNY", "hrrr", lead=0,
-        start=date(2026, 7, 10), end=date(2026, 7, 13),
+        start=_GATE1_START, end=_GATE1_END,
         oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
     )
     scored = [r for r in records if r.excluded_reason is None]
     assert scored
-    # The raw ensemble for a July day is members {83, 85, 87} → population var = 8/3 → sqrt ≈ 1.633.
+    # Month-filtered mean of s2 over July pairs, each members {83, 85, 87} → mean s2 = 8/3 → sqrt.
     expected_v3_sigma = math.sqrt(np.var([83.0, 85.0, 87.0]))
     v3_sigmas = {round(r.v3_sigma, 6) for r in scored if r.v3_sigma is not None}
     wq_sigmas = {round(r.wq_sigma, 6) for r in scored if r.wq_sigma is not None}
     assert v3_sigmas, "scored records must carry v3_sigma"
-    # CR-05: v3 spread is the raw ensemble sqrt(s2), independent of the EMOS/Vincentized wq_sigma.
+    # CR-05: v3 spread is the raw month-filtered ensemble sqrt(mean s2), independent of wq_sigma.
     assert all(s == pytest.approx(expected_v3_sigma, abs=1e-3) for s in v3_sigmas)
     assert v3_sigmas.isdisjoint(wq_sigmas)  # the two arms' spreads are genuinely different
 
@@ -335,13 +436,14 @@ def test_verify_window_must_be_disjoint_from_phase3_oos(pg_conn):
     with pytest.raises(ValueError):
         backtest.walk_forward(
             pg_conn, "KXHIGHNY", "hrrr", lead=0,
-            start=date(2026, 7, 10), end=date(2026, 7, 13),
+            start=_GATE1_START, end=_GATE1_END,
             oos_slice=(date(2026, 7, 11), date(2026, 7, 20)),
         )
-    # A disjoint slice scores records (the guard passes, the non-empty path runs).
+    # A disjoint slice scores records (the guard passes, the non-empty path runs) — confirm the
+    # realistically-stamped ledger STILL scores under the window-geometry (unaffected) test.
     records, _coverage = backtest.walk_forward(
         pg_conn, "KXHIGHNY", "hrrr", lead=0,
-        start=date(2026, 7, 10), end=date(2026, 7, 13),
+        start=_GATE1_START, end=_GATE1_END,
         oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
     )
     assert [r for r in records if r.excluded_reason is None]
@@ -406,10 +508,9 @@ def test_tail_high_lands_in_open_upper_bucket_not_zero_everywhere():
 # across the ENTIRE as-of training set (all seasons), flattening a July baseline toward the
 # cross-season ~57°F midpoint (verifier probe: v3_mu=56.27 vs wq_mu=85.5 — voiding the
 # apples-to-apples head-to-head). This seeded regression proves the month-filtered v3 arm now
-# prices the July range (v3_mu > 70°F). NOTE: this relies on the current back-dated obs stamping
-# (_seed_two_season_ledger), which makes the decision-day pair PRESENT; plan 06-10 re-stamps to the
-# realistic production path and re-asserts this on the absent-decision-day-pair branch. Its value
-# HERE is asserting the month-filter math, not the back-dating.
+# prices the July range (v3_mu > 70°F). 06-10: re-stamped to the REALISTIC production path — the
+# decision-day pair is now ABSENT (no-look-ahead) and the v3 arm takes 06-08's month-filtered
+# fallback, so this proves the month-filter on the absent-decision-day-pair PRODUCTION branch.
 
 
 @pytest.mark.integration
@@ -420,7 +521,7 @@ def test_v3_arm_month_filtered_not_cross_season(pg_conn):
     _seed_two_season_ledger(pg_conn)
     records, _coverage = backtest.walk_forward(
         pg_conn, "KXHIGHNY", "hrrr", lead=0,
-        start=date(2026, 7, 10), end=date(2026, 7, 13),  # a window INSIDE July
+        start=_GATE1_START, end=_GATE1_END,  # a window INSIDE July
         oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),  # disjoint from the Gate-1 window
     )
     scored = [r for r in records if r.excluded_reason is None]
@@ -430,3 +531,60 @@ def test_v3_arm_month_filtered_not_cross_season(pg_conn):
     # The v3 arm prices the JULY range (~85°F), NOT the ~57°F cross-season Jan+Jul midpoint that the
     # pre-fix all-month average produced. Every scored July record must be firmly above 70°F.
     assert min(v3_mus) > 70.0
+
+
+# --- 06-10: the no-look-ahead PROOF on the PRODUCTION path (GAP 3 / VER-03) --------------------
+#
+# The verifier probe re-stamped decision-day obs realistically and got ZERO scored records — the
+# green suite certified a back-dated FIXTURE, not the invariant. These two tests are the inverse:
+# with decision-day obs at settlement, walk_forward STILL scores, and the v3 arm is month-correct
+# on the PRODUCTION path (the direct closure of the verifier's v3_mu=56.27 probe).
+
+
+@pytest.mark.integration
+def test_no_lookahead_scores_under_realistic_stamping(pg_conn):
+    """VER-03 (seeded e2e): decision-day obs at settlement → walk_forward STILL scores >= 1 record.
+
+    The inverse of the verifier probe's "0 scored records". The July window scores under the realistic
+    no-look-ahead stamping (decision-day obs excluded from training, present in the outcome read), and
+    NO scored day is coverage-logged as a starved fit — the production path ran end-to-end.
+    """
+    from weatherquant.verify import backtest
+
+    _seed_two_season_ledger(pg_conn)
+    records, coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=_GATE1_START, end=_GATE1_END,
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    scored = [r for r in records if r.excluded_reason is None]
+    assert scored, "realistic stamping must STILL score (inverse of the verifier's 0-record probe)"
+    scored_days = {r.day for r in scored}
+    starved = [
+        e for e in coverage
+        if e.get("day") in scored_days and e.get("reason") in ("no_month_fit", "no_v3_ensemble")
+    ]
+    assert not starved, f"no scored day may be coverage-logged as a starved fit: {starved}"
+
+
+@pytest.mark.integration
+def test_v3_arm_month_tracked_under_realistic_stamping(pg_conn):
+    """VER-04 (seeded e2e): every scored July v3_mu > 70°F on the realistically-stamped PRODUCTION path.
+
+    The direct closure of the verifier's v3_mu=56.27 probe: with decision-day obs stamped at
+    settlement (the pair ABSENT), the month-filtered v3 fallback prices July, not the cross-season
+    midpoint.
+    """
+    from weatherquant.verify import backtest
+
+    _seed_two_season_ledger(pg_conn)
+    records, _coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=_GATE1_START, end=_GATE1_END,
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    scored = [r for r in records if r.excluded_reason is None]
+    assert scored
+    v3_mus = [r.v3_mu for r in scored if r.v3_mu is not None]
+    assert v3_mus, "scored records must carry v3_mu"
+    assert min(v3_mus) > 70.0  # month-correct on the PRODUCTION path (closes the v3_mu=56.27 probe)
