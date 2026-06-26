@@ -41,6 +41,30 @@ def test_higher_is_better_metric_direction(name):
     assert gate1.metric_passes(name, -0.05, -0.01) is False  # below zero → worse than v3
 
 
+@pytest.mark.parametrize("name", _HIGHER)
+@pytest.mark.parametrize("x", [0.01, 0.5, 1.0, 42.0])
+def test_higher_is_better_rejects_a_degenerate_zero_width_ci(name, x):
+    """CR-01 (belt-and-suspenders): a zero-width CI (ci_lo == ci_hi) is NOT a pass, any x > 0.
+
+    The BLOCKER hole: ``metric_passes("roi", x, x)`` with ``x > 0`` formerly returned ``True``
+    (``ci_lo > 0`` alone), so a degenerate point CI manufactured a money-gate PASS. A zero-width
+    interval cannot HONESTLY exclude zero — it is a single point, not a confidence interval — so
+    HIGHER_IS_BETTER must require strictly positive width ``ci_hi > ci_lo`` in addition to
+    ``ci_lo > 0``.
+    """
+    from weatherquant.verify import gate1
+
+    assert gate1.metric_passes(name, x, x) is False  # degenerate point at a profit is NOT a pass
+
+
+@pytest.mark.parametrize("name", _HIGHER)
+def test_higher_is_better_rejects_an_inverted_ci(name):
+    """CR-01: an inverted CI (ci_hi < ci_lo) can never pass a HIGHER_IS_BETTER metric."""
+    from weatherquant.verify import gate1
+
+    assert gate1.metric_passes(name, 0.05, 0.01) is False  # hi < lo, both > 0 → not a pass
+
+
 def test_gate1_passes_is_conjunctive_over_the_exact_key_set():
     """All five metrics passing → gate passes; any one failing → gate fails."""
     from weatherquant.verify import gate1

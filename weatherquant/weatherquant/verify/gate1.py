@@ -62,14 +62,25 @@ def metric_passes(name: str, ci_lo: float, ci_hi: float) -> bool:
 
     For ``name`` in :data:`LOWER_IS_BETTER`, passes iff ``ci_hi < 0`` (the WHOLE paired CI lies
     strictly below zero → weatherquant beats v3 on a lower-is-better metric); for ``name`` in
-    :data:`HIGHER_IS_BETTER`, passes iff ``ci_lo > 0`` (the whole CI lies strictly above zero). A
-    CI that touches or straddles zero is NOT a pass. An unknown metric name fails LOUD (a silent
-    default would let an unscored metric pass).
+    :data:`HIGHER_IS_BETTER`, passes iff ``ci_lo > 0`` AND ``ci_hi > ci_lo`` (the whole CI lies
+    strictly above zero AND has strictly positive width). A CI that touches or straddles zero is
+    NOT a pass. An unknown metric name fails LOUD (a silent default would let an unscored metric
+    pass).
+
+    CR-01 (the money-gate BLOCKER, belt-and-suspenders): a DEGENERATE zero-width interval
+    (``ci_lo == ci_hi``) at a profitable point — e.g. two distinct fill-days whose per-day ROI is
+    identical, so every bootstrap resample yields the SAME pooled delta — trivially "excludes
+    zero" while being a single point, not a confidence interval. The ``ci_hi > ci_lo`` positive-width
+    requirement makes such a degenerate (or inverted) interval fail HERE regardless of caller, so a
+    money-go PASS can never be declared off a zero-width "CI" (the exact "CIs EXCLUDING ZERO" abuse
+    PROJECT.md forbids). LOWER_IS_BETTER does not need the mirror: a degenerate point at a profit is
+    ``ci_hi == ci_lo``; for a PASS it would need ``ci_hi < 0``, which a real edge already satisfies,
+    and ``_roi_clv_cis`` additionally maps a degenerate roi/clv CI to the not_scored sentinel.
     """
     if name in LOWER_IS_BETTER:
         return ci_hi < 0.0
     if name in HIGHER_IS_BETTER:
-        return ci_lo > 0.0
+        return ci_lo > 0.0 and ci_hi > ci_lo
     raise ValueError(
         f"unknown gate-1 metric {name!r}; the pre-registered set is {sorted(GATE1_METRICS)}"
     )

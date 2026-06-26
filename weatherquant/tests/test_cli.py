@@ -1209,6 +1209,44 @@ def test_verdict_scores_roi_clv_off_real_fills_real_ci_width(pg_conn):
 
 
 @pytest.mark.integration
+def test_verdict_two_distinct_days_identical_roi_maps_to_not_scored_sentinel(pg_conn):
+    """CR-01 (BLOCKER regression): 2 distinct LST fill-days with IDENTICAL per-day ROI → not_scored.
+
+    The ``_MIN_FILL_DAYS_FOR_CI = 2`` floor is necessary but NOT sufficient. With exactly two
+    distinct days A and B whose per-day ROI is identical (two SAME-price YES buys on the same bucket
+    that both settle YES), every paired day-block resample ({A,A}, {A,B}, {B,B}) yields the SAME
+    pooled ROI — so ``np.percentile(deltas, [2.5, 97.5])`` returns ``roi_lo == roi_hi``: a zero-width
+    "interval" at a profitable point that formerly read as a Gate-1 PASS (``ci_lo > 0``). A
+    degenerate CI cannot honestly exclude zero, so it must map to the PINNED not_scored sentinel and
+    FAIL, never manufacture a money-go PASS on n=2-with-identical-ROI.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import gate1, metrics
+
+    # Two distinct interior July LST days, SAME-price YES buys on the SAME YES-settling bucket →
+    # identical per-day ROI on every block → a zero-width bootstrap CI.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 40.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, (
+        "two distinct fill-days with IDENTICAL per-day ROI yield a zero-width CI — it must map to "
+        "the not_scored sentinel, NEVER a degenerate point PASS (CR-01 BLOCKER)"
+    )
+    assert roi_ci == (0.0, 0.0) == clv_ci
+    # And the full conjunctive gate FAILs cleanly on the pinned sentinel (not an exception).
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": roi_ci, "clv": clv_ci,
+    }
+    assert gate1.gate1_passes(cis) is False
+
+
+@pytest.mark.integration
 def test_verdict_single_fill_day_maps_to_not_scored_sentinel(pg_conn):
     """CR-01 / GAP-2 core regression: a SINGLE profitable fill-day can NEVER flip Gate-1 to PASS.
 
@@ -1228,14 +1266,26 @@ def test_verdict_single_fill_day_maps_to_not_scored_sentinel(pg_conn):
 
 
 @pytest.mark.integration
-def test_verdict_no_fill_side_settles_no_is_credited_end_to_end(pg_conn):
-    """T-06-09-T2 (seeded e2e): side='no' fills that settle NO are credited as wins via threaded sides.
+def test_verdict_no_fill_side_settles_yes_is_scored_as_a_loss_end_to_end(pg_conn):
+    """T-06-09-T2 (seeded e2e): side='no' fills that settle YES are scored as LOSSES via threaded sides.
 
-    The interior high settles YES, so a NO buy LOSES. To prove the NO win is credited end-to-end we
-    instead need NO buys on a NO settlement — but the seeded interior bucket always settles YES.
-    Here we assert the COMPLEMENT proof: side='no' buys on a YES-settling bucket produce a NEGATIVE
-    ROI CI (the NO loss is scored as a loss, not silently a win), proving sides reach roi_from_fills.
-    A side-blind ROI would have scored these NO buys as YES wins (positive). Multi-day for a real CI.
+    The interior high settles YES, so a NO buy LOSES. A side-BLIND ROI would have scored these NO
+    buys as YES WINS (positive); the threaded side must instead score them as losses.
+
+    CR-01 interaction (why this is two assertions, not a "negative CI"): a pure all-NO-loss ledger
+    is DEGENERATE — every losing block has ROI exactly ``-1.0`` (payoff 0 → (0 - entry)/entry = -1
+    for ANY price), so the day-block bootstrap CI is zero-width and CORRECTLY maps to the not_scored
+    sentinel (a zero-width "interval" cannot honestly exclude zero, even on the favorable side). We
+    therefore prove the orientation in two parts:
+
+    1. the verdict path declines to score the degenerate ledger (not_scored is True); and
+    2. at the metric layer, the SETTLED inputs produced by ``_settle_window_fills`` feed
+       ``roi_from_fills`` to a per-block ROI of exactly ``-1.0`` (a LOSS) — never the ``+1.0`` a
+       side-blind reading (NO scored as a YES win on this YES-settling bucket) would yield.
+
+    Part 2 is the real orientation proof (not_scored alone is sign-agnostic: a uniform all-WIN
+    ledger is also degenerate). The NON-degenerate positive complement is covered by
+    ``test_verdict_roi_side_no_fill_settles_no_is_a_win`` (NO wins at varying prices → a real CI).
     """
     from weatherquant.cli import verify as verify_mod
     from weatherquant.verify import metrics
@@ -1249,9 +1299,31 @@ def test_verdict_no_fill_side_settles_no_is_credited_end_to_end(pg_conn):
     (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
         pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
     )
-    assert not_scored is False
-    # YES-settling bucket + NO buys → every block is a loss → the whole ROI CI is below zero.
-    assert roi_ci[1] < 0, "a side='no' buy on a YES settlement must be scored as a loss (sides threaded)"
+    # 1. The all-NO-loss ledger is degenerate (uniform -1.0 per block) → not_scored (CR-01).
+    assert not_scored is True, "a uniform all-loss NO ledger is a zero-width CI → not_scored (CR-01)"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+    # 2. Orientation proof at the metric layer: the SETTLED NO fills score to a LOSS (-1.0), the
+    # exact opposite of the +1.0 a side-blind YES-win reading would produce. This is what reaches
+    # roi_from_fills through the verdict path (same seams _roi_clv_cis uses).
+    from weatherquant.db import queries
+
+    all_fills = list(queries.latest(pg_conn, "fills"))
+    window_fills = [
+        f for f in all_fills
+        if verify_mod._fill_in_window(f, "NYC", date(2026, 7, 1), date(2026, 7, 13))
+    ]
+    assert len(window_fills) == 3, "all three seeded NO fills are in the window"
+    settled_yes, _clv_fills, _snaps, sides = verify_mod._settle_window_fills(
+        pg_conn, window_fills, "NYC"
+    )
+    assert all(s == "sell" for s in sides), "side='no' normalizes to 'sell' (the NO mirror)"
+    assert all(sy is True for sy in settled_yes), "the interior bucket settles YES on every day"
+    roi = metrics.roi_from_fills(window_fills, settled_yes, sides)
+    assert roi == pytest.approx(-1.0), (
+        "side='no' buys on a YES-settling bucket must score a LOSS (-1.0), never the +1.0 a "
+        "side-blind YES-win reading would produce (sides threaded into roi_from_fills)"
+    )
 
 
 @pytest.mark.integration

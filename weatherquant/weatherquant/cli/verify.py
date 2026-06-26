@@ -455,6 +455,23 @@ def _roi_clv_cis(bind, city, model, start, end, metrics):
         lst_fill_day_keys, clv_score_fn, n_resamples=_N_RESAMPLES, seed=_SEED,
         alpha=1.0 - _CI_LEVEL,
     )
+    # CR-01 (the money-gate BLOCKER): the _MIN_FILL_DAYS_FOR_CI = 2 distinct-day floor is necessary
+    # but NOT sufficient — it is the DISTINCT-day count, not the CI WIDTH. Two distinct days whose
+    # per-day ROI/CLV is IDENTICAL (e.g. two same-price YES buys that both settle YES) make every
+    # paired day-block resample ({A,A},{A,B},{B,B}) yield the SAME pooled delta, so the percentile
+    # bounds collapse to roi_lo == roi_hi: a zero-width "interval" at a profitable point that would
+    # trivially exclude zero (ci_lo > 0) and read as a Gate-1 PASS — the exact "CIs EXCLUDING ZERO"
+    # abuse PROJECT.md forbids, merely shifted from n=1 to n=2-with-identical-ROI. The honest test is
+    # positive WIDTH, not distinct-day count: a degenerate (or inverted) CI on EITHER metric maps to
+    # the PINNED not_scored sentinel and FAILs, never a degenerate point pass.
+    if roi_hi <= roi_lo or clv_hi <= clv_lo:
+        logger.info(
+            "verify: degenerate (zero-width) ROI/CLV CI for %s (roi=[%s, %s], clv=[%s, %s]) — "
+            "ROI/CLV NOT SCORED (pinned %s, FAIL); a zero-width interval cannot exclude zero "
+            "honestly (CR-01).",
+            city, roi_lo, roi_hi, clv_lo, clv_hi, _NOT_SCORED_CI,
+        )
+        return (_NOT_SCORED_CI, _NOT_SCORED_CI), True
     return ((roi_lo, roi_hi), (clv_lo, clv_hi)), False
 
 
