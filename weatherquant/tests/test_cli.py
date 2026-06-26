@@ -1247,6 +1247,35 @@ def test_verdict_two_distinct_days_identical_roi_maps_to_not_scored_sentinel(pg_
 
 
 @pytest.mark.integration
+def test_verdict_zero_capital_fill_fails_closed_not_mid_bootstrap_crash(pg_conn):
+    """WR-03: a window with a zero-cost (avg_price_cents == 0) fill fails CLOSED, never crashes.
+
+    ``roi_from_fills`` raises ValueError when the pooled capital deployed is non-positive
+    (``total_entry <= 0``). Inside the day-block bootstrap, a resample drawing only zero-cost fills
+    would make that raise PROPAGATE out of ``paired_day_block_ci``, aborting the entire Gate-1 run
+    mid-bootstrap rather than declining to score. A money gate must fail closed (decline), not
+    crash. With a 0c fill present, ``_roi_clv_cis`` must map ROI/CLV to the pinned not_scored
+    sentinel and return cleanly — NEVER raise.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # Two distinct LST days (so the distinct-day floor is cleared) but one fill deploys ZERO capital
+    # (avg_price_cents == 0). The bootstrap must not be allowed to raise on a zero-capital resample.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 0.0),   # zero-cost fill (no capital deployed)
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    # Must return cleanly (fail closed), never raise out of the bootstrap.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, "a zero-capital fill window must fail closed → not_scored (WR-03)"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+
+@pytest.mark.integration
 def test_verdict_single_fill_day_maps_to_not_scored_sentinel(pg_conn):
     """CR-01 / GAP-2 core regression: a SINGLE profitable fill-day can NEVER flip Gate-1 to PASS.
 

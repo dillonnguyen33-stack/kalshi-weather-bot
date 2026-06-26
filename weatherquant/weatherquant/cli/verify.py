@@ -406,6 +406,29 @@ def _roi_clv_cis(bind, city, model, start, end, metrics):
     settled_yes, clv_fills, snaps_per_fill, sides = _settle_window_fills(
         bind, window_fills, city_key
     )
+
+    # WR-03 (fail closed, never crash mid-bootstrap): pre-validate that EVERY window fill deploys
+    # strictly positive capital (count > 0 AND avg_price_cents > 0). roi_from_fills raises when a
+    # pooled resample's total_entry <= 0 (a zero-cost fill set), and mean_clv raises on an empty CLV
+    # set — either raise INSIDE paired_day_block_ci's resample loop would propagate and abort the
+    # entire Gate-1 verdict rather than degrading to a verdict. A money gate must DECLINE to score
+    # (the pinned not_scored sentinel), not crash. If any fill deploys zero capital we cannot score a
+    # well-defined ROI for every resample, so we map ROI/CLV to not_scored for the whole window.
+    from weatherquant.verify.metrics import _fill_field
+
+    if any(
+        float(_fill_field(fill, "count")) <= 0.0 or cfill.avg_price_cents <= 0.0
+        for fill, cfill in zip(window_fills, clv_fills, strict=True)
+    ):
+        logger.info(
+            "verify: a window fill for %s deploys zero/negative capital (count<=0 or "
+            "avg_price_cents<=0) — ROI/CLV NOT SCORED (pinned %s, FAIL); a zero-capital resample "
+            "cannot define ROI, and the money gate fails closed rather than crashing the bootstrap "
+            "(WR-03).",
+            city, _NOT_SCORED_CI,
+        )
+        return (_NOT_SCORED_CI, _NOT_SCORED_CI), True
+
     settle_city = get_city(city_key)
     by_lst_day: dict = {}
     for fill, syes, cfill, snaps, side in zip(
