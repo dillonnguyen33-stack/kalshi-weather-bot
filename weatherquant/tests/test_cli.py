@@ -1384,6 +1384,58 @@ def test_verdict_roi_side_no_fill_settles_no_is_a_win(pg_conn):
 
 
 @pytest.mark.integration
+def test_verdict_no_fill_clv_magnitude_is_no_denominated(pg_conn):
+    """WR-02 (seeded e2e): a NO fill's CLV is scored NO-denominated (100 - yes_mid) - price.
+
+    The existing NO e2e tests only assert the ROI CI SIGN — never the CLV MAGNITUDE. A NO
+    ('sell'-normalized) fill records its NO-contract price; its closing value is the NO mid
+    ``100 - yes_mid``. The seeded closing snapshot has a YES mid of 50.0c, so the NO mid is 50.0c
+    and a NO buy at 30/35/40c has a per-fill CLV of ``50 - price`` = 20 / 15 / 10c (all POSITIVE —
+    bought the NO cheap relative to its close).
+
+    The OLD (buggy) orientation differenced the NO price against the YES mid and flipped the sign:
+    ``-(50 - 30) = -20`` — a units mismatch that inverted the sign and mis-scaled the magnitude.
+    Asserting the EXACT magnitude pins the NO-denominated CLV so the orientation can't regress.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.db import queries
+    from weatherquant.verify import metrics
+
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "no", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "no", 35.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "no", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec, ticker="KXHIGHNY-50-51")
+
+    # Exact per-fill / mean magnitude via the same settle seams _roi_clv_cis uses.
+    all_fills = list(queries.latest(pg_conn, "fills"))
+    window_fills = [
+        f for f in all_fills
+        if verify_mod._fill_in_window(f, "NYC", date(2026, 7, 1), date(2026, 7, 13))
+    ]
+    assert len(window_fills) == 3
+    _settled, clv_fills, snaps, sides = verify_mod._settle_window_fills(
+        pg_conn, window_fills, "NYC"
+    )
+    assert all(s == "sell" for s in sides), "side='no' normalizes to 'sell'"
+    # YES mid 50.0c → NO mid 50.0c → CLV = 50 - price = {20, 15, 10}; mean = 15.0c (NO-denominated).
+    mean_clv = metrics.mean_clv(clv_fills, snaps, sides)
+    assert mean_clv == pytest.approx(15.0), (
+        "a NO fill's CLV must be NO-denominated (100 - yes_mid) - price = 50 - price; the OLD "
+        "YES-denominated orientation would give -(yes_mid - price), a sign-inverted units bug (WR-02)"
+    )
+
+    # And the bootstrap CLV CI is strictly POSITIVE (bought the NO cheap), never the negative the
+    # old orientation produced.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False
+    assert clv_ci[0] > 0, "the NO-denominated CLV CI is strictly positive (NO bought cheap)"
+
+
+@pytest.mark.integration
 def test_verdict_roi_clv_block_key_is_lst_settlement_day_not_utc_date(pg_conn):
     """T-06-09-T3 / WR-04 (seeded e2e): the bootstrap block key is the LST settlement day, not UTC date.
 
