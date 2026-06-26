@@ -164,6 +164,66 @@ def test_v3_spread_is_sqrt_s2_distinct_from_wq_sigma():
     assert v3_sigma != SIGMA_FLOOR_F
 
 
+def test_point_in_time_bias_is_month_filtered_not_cross_season():
+    """WR-01: the v3 point-in-time bias is measured from the DECISION-MONTH pairs only.
+
+    The v3 mean is already month-filtered (``_v3_arm_raw_ensemble(..., month=day.month)``). The bias
+    added to it MUST mirror that filter — otherwise ``v3_mu = july_mean + cross_season_bias`` re-
+    introduces exactly the cross-season contamination the phase removed from the mean. Here July
+    carries a +1.0 residual and January a -1.0 residual: the JULY-only bias is +1.0, while the
+    cross-season POOLED bias is 0.0 (the two cancel). The month-filtered helper must return the
+    July-only +1.0, never the pooled 0.0.
+    """
+    from weatherquant.calibrate.strata import TrainingPair
+    from weatherquant.verify import backtest
+
+    pairs = [
+        # July (month=7): obs runs WARM of the ensemble by +1.0 (y - m = +1.0).
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 6), m=84.0, s2=9.0, y=85.0),
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 8), m=86.0, s2=9.0, y=87.0),
+        # January (month=1): obs runs COLD of the ensemble by -1.0 (y - m = -1.0).
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 6), m=30.0, s2=4.0, y=29.0),
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 8), m=32.0, s2=4.0, y=31.0),
+    ]
+    # The pooled bias over ALL months is mean(+1, +1, -1, -1) = 0.0 (the WR-01 contamination value).
+    assert backtest._point_in_time_bias(pairs) == pytest.approx(0.0)
+    # The month-filtered bias for July is the July-only mean residual = +1.0 (never the pooled 0.0).
+    assert backtest._point_in_time_bias_for_month(pairs, month=7) == pytest.approx(1.0)
+    # And January's is the January-only residual = -1.0.
+    assert backtest._point_in_time_bias_for_month(pairs, month=1) == pytest.approx(-1.0)
+
+
+def test_point_in_time_bias_for_month_equals_pooled_when_uniform():
+    """WR-01: when every month's residual is uniform, the month-filtered bias == the pooled bias.
+
+    This is the invariance the uniform-bias seeded fixtures relied on (the contamination was hidden
+    BECAUSE every month had the same +0.5 residual). With a uniform +0.5 residual across two
+    seasons, the July-only bias and the pooled bias both equal +0.5 — so the month filter is a no-op
+    here, by construction, and the existing uniform-bias tests stay green.
+    """
+    from weatherquant.calibrate.strata import TrainingPair
+    from weatherquant.verify import backtest
+
+    pairs = [
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 6), m=84.0, s2=9.0, y=84.5),
+        TrainingPair(city="NYC", model="hrrr", lead=7, month=7,
+                     target_date=date(2026, 7, 8), m=86.0, s2=9.0, y=86.5),
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 6), m=30.0, s2=4.0, y=30.5),
+        TrainingPair(city="NYC", model="hrrr", lead=1, month=1,
+                     target_date=date(2026, 1, 8), m=32.0, s2=4.0, y=32.5),
+    ]
+    pooled = backtest._point_in_time_bias(pairs)
+    july = backtest._point_in_time_bias_for_month(pairs, month=7)
+    assert pooled == pytest.approx(0.5)
+    assert july == pytest.approx(pooled)
+
+
 def test_paired_record_carries_predictive_params_for_crps():
     """Task 1/2: PairedRecord exposes wq_mu/wq_sigma/y (and v3_mu/v3_sigma) for Plan 06-07 CRPS."""
     from dataclasses import fields

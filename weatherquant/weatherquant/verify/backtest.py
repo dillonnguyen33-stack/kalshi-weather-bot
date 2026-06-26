@@ -192,11 +192,33 @@ def _point_in_time_bias(pairs) -> float:
     Mirrors v3's ``derive_bias`` intent (``bias = mean(settled - corrected_mean)``) but measured
     ONLY from ``available_at < cutoff`` settled outcomes — NOT v3's live in-memory bias table. An
     empty training set yields a 0.0 bias (no point-in-time signal yet).
+
+    NOTE (WR-01): this pools the residual over EVERY retained month. The walk-forward must NOT add
+    this cross-season pooled bias to the month-filtered v3 mean — use
+    :func:`_point_in_time_bias_for_month` so the bias mirrors the mean's seasonal subset. This
+    pooled form is retained only as the building block (and for the uniform-residual invariance the
+    seeded fixtures exercise).
     """
     if not pairs:
         return 0.0
     residuals = np.array([p.y - p.m for p in pairs], dtype=float)
     return float(residuals.mean())
+
+
+def _point_in_time_bias_for_month(pairs, month: int) -> float:
+    """v3 point-in-time bias for the DECISION MONTH only (WR-01 — mirror the mean's month filter).
+
+    The v3 mean is restricted to the decision day's month (``_v3_arm_raw_ensemble(..., month=...)``)
+    so BOTH arms price the same seasonal subset (CR-02-for-v3). The bias added to that mean MUST be
+    measured over the SAME month — otherwise ``v3_mu = month_mean + cross_season_bias`` re-injects
+    a January cold-residual / July warm-residual average into the July mean, re-introducing exactly
+    the cross-season contamination the phase removed from the mean (WR-01). Filters
+    ``[p for p in pairs if p.month == month]`` then takes the pooled ``mean(y - m)`` over that
+    subset; an empty decision-month subset yields 0.0 (no point-in-time signal yet — absence is
+    absence). With a uniform per-month residual this equals the pooled bias by construction, so the
+    uniform-bias seeded fixtures are unaffected.
+    """
+    return _point_in_time_bias([p for p in pairs if p.month == month])
 
 
 def _v3_arm_raw_ensemble(pairs, day: date, month: int) -> tuple[float, float] | None:
@@ -412,7 +434,11 @@ def walk_forward(
             _log_exclusion(coverage_log, day, city, "no_v3_ensemble")
             continue
         m_asof, s2_asof = v3_ensemble
-        bias = _point_in_time_bias(pairs)
+        # WR-01: the bias mirrors the v3 mean's month filter — measured over the DECISION-MONTH
+        # pairs only, never the cross-season pool. A pooled bias would re-inject a January/July
+        # residual average into the July mean, re-introducing the contamination the month-filtered
+        # mean removed (so methodology stays the only WQ-vs-v3 difference, VER-04).
+        bias = _point_in_time_bias_for_month(pairs, day.month)
         v3_mu = m_asof + bias
         v3_sigma = float(np.sqrt(s2_asof))
         # The shared continuous spans (lo_edge, hi_edge, open_lo, open_hi) — the ONE geometry both
