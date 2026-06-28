@@ -41,16 +41,26 @@ def test_settings_exposes_the_drift_threshold_knob_with_a_principled_default():
 
 
 @pytest.mark.integration
-def test_monitor_drift_nonzero_and_errors_on_breach(pg_conn, caplog):
-    """A trailing ECE above the Settings threshold returns non-zero and logs at ERROR (SYS-02)."""
+def test_monitor_drift_empty_ledger_cannot_fabricate_a_breach(pg_conn, caplog):
+    """An empty ledger returns 0 even under a breach-prone threshold — the SYS-02 fail-safe.
+
+    This proves the absence fail-safe on the REAL ledger-read path: a tiny, breach-prone
+    threshold over an empty trailing window still returns 0 and skip-logs ("no settled
+    records") rather than fabricating a breach (zero settled rows hit the ``if not scored:
+    continue`` branch at drift.py:74-85 — absence is absence, no fabricated reliability
+    number). The actual breach exit-code + ERROR-log contract is pinned DB-free by
+    ``test_monitor_drift_breach_returns_nonzero_and_logs_error`` (which monkeypatches
+    ``walk_forward`` to feed synthetic badly-calibrated records).
+    """
     from weatherquant.verify import drift
 
-    settings = _FakeSettings(drift_reliability_threshold=0.001)  # tiny → guaranteed breach
-    with caplog.at_level(logging.ERROR):
+    settings = _FakeSettings(drift_reliability_threshold=0.001)  # tiny → breach-prone
+    with caplog.at_level(logging.INFO):
         code = drift.monitor_drift(
             pg_conn, settings, window_days=30, cities=["KXHIGHNY"], models=["blend"]
         )
-    assert code != 0
+    assert code == 0
+    assert any("no settled records" in r.message for r in caplog.records)
 
 
 @pytest.mark.integration
@@ -67,11 +77,12 @@ def test_monitor_drift_zero_when_under_threshold(pg_conn):
 
 # --- DB-free unit coverage of the threshold/exit-code logic (Plan 06-05 Task 2) --------------
 #
-# The two integration cases above exercise the ledger read end-to-end but cannot force a breach
-# against the empty ``pg_conn`` test DB (no settled rows ⇒ nothing to score). These unit tests pin
-# the threshold-comparison + ERROR-log + exit-code logic on SYNTHETIC paired records by patching
-# ``verify.backtest.walk_forward`` — the contract the plan's action calls "unit-testable on
-# synthetic reliability values", reusing ``verify.metrics.ece_equal_count`` for the reliability error.
+# The two integration cases above exercise the ledger read end-to-end and assert the empty-window
+# FAIL-SAFE: a breach-prone threshold over a no-settled-rows window still returns 0 (absence cannot
+# fabricate a breach). The breach exit-code + ERROR-log contract itself is pinned DB-free by these
+# unit tests, which monkeypatch ``verify.backtest.walk_forward`` to feed synthetic badly-calibrated
+# paired records — the contract the plan's action calls "unit-testable on synthetic reliability
+# values", reusing ``verify.metrics.ece_equal_count`` for the reliability error.
 
 
 class _Rec:
