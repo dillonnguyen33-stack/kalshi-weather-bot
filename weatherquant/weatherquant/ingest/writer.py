@@ -77,8 +77,11 @@ def insert_forecast(
 ) -> int:
     """Insert one Kelvin forecast row through the single audited path (D-07/D-11).
 
-    Natural key: ``(city, target_date, model, lead, member, cycle)``; content: ``temp_kelvin``
-    + the station snap fields.
+    Natural key: ``(city, target_date, model, lead, member)`` — matches
+    ``NATURAL_KEYS["forecasts"]``, the tuple ``latest()`` / DISTINCT-ON collapse on. ``cycle`` is
+    an ADDITIONAL insert-time idempotency column (it joins the tuple passed to ``_insert_row``, so a
+    new model ``cycle`` appends a distinct row rather than being skipped) — NOT part of the canonical
+    natural key. Content: ``temp_kelvin`` + the station snap fields.
 
     Returns:
         ``1`` if a row was inserted, ``0`` if an identical row already existed (skip).
