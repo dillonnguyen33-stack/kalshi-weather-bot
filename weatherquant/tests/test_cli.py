@@ -579,6 +579,16 @@ def test_run_paper_single_shot_delegates_to_process_book(monkeypatch: pytest.Mon
     assert result["fill"] is not None
 
 
+def test_paper_snapshot_cadence_is_strictly_finer_than_clv_window():
+    """PAP-04: the target snapshot cadence must stay strictly finer than the CLV closing window so a
+    feed-driven loop honouring it never leaves the window silently sparse (moved off the import path).
+    """
+    from weatherquant.cli.paper import PAPER_SNAPSHOT_CADENCE_SECONDS
+    from weatherquant.market.clv import CLV_WINDOW_MINUTES
+
+    assert PAPER_SNAPSHOT_CADENCE_SECONDS < CLV_WINDOW_MINUTES * 60
+
+
 def test_run_paper_cadence_sufficiency_persists_snapshot_in_closing_window(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -797,3 +807,745 @@ def test_run_paper_refuses_live_mode(monkeypatch: pytest.MonkeyPatch):
     )
     with pytest.raises(SystemExit, match="live"):
         cli.run_paper(_paper_args())
+
+
+# --- verify subcommand (06-05 Task 3) — parse parity + non-zero-exit propagation -------------
+#
+# These pin the verify subcommand's CONTRACT (the heavy proof/drift orchestration is exercised in
+# the verify unit/integration suites): the subparser mirrors the calibrate/paper selectors, the
+# validators reject a bad city BEFORE the body (ASVS V5), and cli.main propagates run_verify's int
+# exit code (a drift breach therefore yields a non-zero process exit — SYS-02).
+
+
+def test_verify_subcommand_parses_selectors_and_flags():
+    """A valid `verify` invocation parses the window/lead/monitor/window-days/out-dir + selectors."""
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "verify", "--city", "NYC", "--model", "hrrr",
+            "--start", "2026-06-01", "--end", "2026-06-15",
+            "--lead", "0", "--monitor", "--window-days", "14", "--out-dir", "out",
+        ]
+    )
+    assert args.command == "verify"
+    assert args.city == "NYC"
+    assert args.model == "hrrr"
+    assert args.start == date(2026, 6, 1)
+    assert args.end == date(2026, 6, 15)
+    assert args.monitor is True
+    assert args.window_days == 14
+    assert args.out_dir == "out"
+
+
+def test_verify_unknown_city_rejected_before_body(capsys: pytest.CaptureFixture):
+    """An unknown `verify --city` is rejected by argparse via _city_type — ASVS V5 / T-06-19."""
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["verify", "--city", "ZZZ", "--model", "hrrr"])
+    assert excinfo.value.code != 0
+    assert "ZZZ" in capsys.readouterr().err
+
+
+def test_main_verify_propagates_nonzero_exit(monkeypatch: pytest.MonkeyPatch):
+    """cli.main returns run_verify's int — a non-zero (drift breach) propagates (SYS-02)."""
+    import sys
+
+    cli_main = sys.modules["weatherquant.cli.main"]  # the MODULE (cli.main is the re-exported fn)
+    monkeypatch.setattr(cli_main, "run_verify", lambda args: 3)
+    # --start/--end are now MANDATORY on the verify subparser (CR-04) even for the monitor flag.
+    rc = cli.main(
+        ["verify", "--city", "NYC", "--model", "hrrr",
+         "--start", "2026-06-01", "--end", "2026-06-15", "--monitor"]
+    )
+    assert rc == 3  # propagated unchanged (NOT collapsed to 0 like the count-dict branches)
+
+
+def test_main_verify_returns_zero_on_clean_run(monkeypatch: pytest.MonkeyPatch):
+    """A clean verify run returns 0 through cli.main (the verdict PASS/FAIL lives in the artifact)."""
+    import sys
+
+    cli_main = sys.modules["weatherquant.cli.main"]  # the MODULE (cli.main is the re-exported fn)
+    monkeypatch.setattr(cli_main, "run_verify", lambda args: 0)
+    # --start/--end are now MANDATORY on the verify subparser (CR-04).
+    rc = cli.main(
+        ["verify", "--city", "NYC", "--model", "hrrr", "--start", "2026-06-01", "--end", "2026-06-15"]
+    )
+    assert rc == 0
+
+
+# --- verify verdict-path window + fail-closed OOS-slice guards (06-06 Task 3, CR-04) ----------
+
+
+def _verify_args(**overrides):
+    """A minimal argparse.Namespace for run_verify's verdict path (monitor off)."""
+    import argparse
+
+    base = dict(
+        city="NYC", model="hrrr", all_cities=False, all_models=False,
+        start=date(2026, 6, 1), end=date(2026, 6, 15), lead=0, monitor=False,
+        window_days=30, out_dir="reports",
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _patch_verify_settings(monkeypatch, *, oos_start, oos_end):
+    """Patch cli.verify's get_engine/get_settings seams with a fake Settings carrying the OOS knob."""
+    from weatherquant import cli as _cli
+
+    settings = type(
+        "S", (), {"verify_phase3_oos_start": oos_start, "verify_phase3_oos_end": oos_end}
+    )()
+    monkeypatch.setattr(_cli.verify, "get_engine", lambda: object())
+    monkeypatch.setattr(_cli.verify, "get_settings", lambda: settings)
+    return settings
+
+
+def test_verify_verdict_rejects_inverted_window(monkeypatch: pytest.MonkeyPatch):
+    """The verdict path raises SystemExit when end <= start (CR-04)."""
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=date(2025, 1, 1), oos_end=date(2025, 6, 1))
+    args = _verify_args(start=date(2026, 6, 15), end=date(2026, 6, 1))  # inverted
+    with pytest.raises(SystemExit):
+        run_verify(args)
+
+
+def test_verify_verdict_rejects_unset_oos_slice(monkeypatch: pytest.MonkeyPatch):
+    """The verdict path raises SystemExit when the Phase-3 OOS knob is UNSET (fail-closed, CR-04)."""
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=None, oos_end=None)  # knob unset
+    with pytest.raises(SystemExit):
+        run_verify(_verify_args())
+
+
+def test_verify_verdict_rejects_empty_oos_slice(monkeypatch: pytest.MonkeyPatch):
+    """The verdict path raises SystemExit when the OOS slice is empty/inverted (CR-04)."""
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=date(2025, 6, 1), oos_end=date(2025, 1, 1))
+    with pytest.raises(SystemExit):
+        run_verify(_verify_args())
+
+
+def test_verify_verdict_overlapping_oos_slice_fails_loud(monkeypatch: pytest.MonkeyPatch):
+    """A NON-EMPTY OOS slice overlapping the Gate-1 window raises ValueError on the real path (CR-04).
+
+    The OOS slice is fed into walk_forward, which runs assert_window_disjoint FIRST (before any
+    ledger access, so bind=object() never executes a query) — proving the guard is no longer a no-op.
+    """
+    from weatherquant.cli.verify import run_verify
+
+    # OOS slice [2026-06-10, 2026-06-20) overlaps the Gate-1 window [2026-06-01, 2026-06-15).
+    _patch_verify_settings(monkeypatch, oos_start=date(2026, 6, 10), oos_end=date(2026, 6, 20))
+    with pytest.raises(ValueError):
+        run_verify(_verify_args())
+
+
+def test_verify_verdict_records_oos_slice_in_artifact(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    """The resolved non-empty OOS slice is recorded into the GATE1-VERDICT artifact (CR-04)."""
+    import json
+
+    from weatherquant.cli.verify import run_verify
+
+    _patch_verify_settings(monkeypatch, oos_start=date(2025, 1, 1), oos_end=date(2025, 6, 1))
+    # bind=None so walk_forward returns no records (disjoint slice → guard passes, empty verdict).
+    from weatherquant import cli as _cli
+
+    monkeypatch.setattr(_cli.verify, "get_engine", lambda: None)
+    rc = run_verify(_verify_args(out_dir=str(tmp_path)))
+    assert rc == 0
+    payload = json.loads((tmp_path / "GATE1-VERDICT.json").read_text())
+    assert payload["oos_slice"] == ["2025-01-01", "2025-06-01"]
+
+
+# --- 06-07 Task 2/3: CR-01 real CRPS + ledger ROI/CLV + the pinned not_scored sentinel ---------
+#
+# These prove the verdict scores the PRE-REGISTERED metrics, not the deleted (wq-v3)*(2o-1) proxy:
+# a fast unit proof of the no-fills not_scored sentinel + the crps_blend wiring, then a seeded
+# NON-EMPTY-ledger integration proof (fills + closing snapshots + a tail-high day).
+
+
+def test_roi_clv_not_scored_sentinel_fails_loud_when_no_fills():
+    """CR-01/T-06-20: no fills → roi/clv map to the pinned (0.0,0.0) sentinel, gate1 FAILs cleanly."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import gate1, metrics
+
+    # bind=None → the fills read returns nothing → not_scored. No exception, the pinned sentinel.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        None, "NYC", "hrrr", date(2026, 6, 1), date(2026, 6, 15), metrics
+    )
+    assert roi_ci == (0.0, 0.0) == clv_ci == verify_mod._NOT_SCORED_CI
+    assert not_scored is True
+    # The full five-key dict keeps the exact set so gate1_passes does NOT raise — it returns False.
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": roi_ci, "clv": clv_ci,
+    }
+    assert set(cis) == gate1.GATE1_METRICS  # the key-set assertion will not raise
+    assert gate1.gate1_passes(cis) is False  # a FAIL VERDICT, not an exception (roi/clv 0.0 > 0 fails)
+    # And the not_scored sentinel is NOT an inf/NaN that would break metric_passes' comparisons.
+    assert gate1.metric_passes("roi", *roi_ci) is False
+    assert gate1.metric_passes("clv", *clv_ci) is False
+
+
+def test_not_scored_renders_not_scored_fail_in_verdict_artifact(tmp_path):
+    """CR-01: a not_scored roi/clv renders 'not scored / FAIL' verbatim in GATE1-VERDICT.md."""
+    from weatherquant.verify import report
+
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": (0.0, 0.0), "clv": (0.0, 0.0),
+    }
+    verdict = {"passed": False, "seed": 0, "not_scored": {"roi": True, "clv": True}}
+    report.render_reports([], cis, verdict, out_dir=str(tmp_path), seed=0, coverage=[])
+    md = (tmp_path / "GATE1-VERDICT.md").read_text()
+    assert "not scored / FAIL" in md
+    # The numeric CIs for the not_scored metrics must NOT appear as a real computation.
+    assert "| roi | 0.0 | 0.0 |" not in md
+    assert "| clv | 0.0 | 0.0 |" not in md
+
+
+def test_crps_score_fn_is_real_crps_blend_delta_not_proxy():
+    """CR-01: _crps_score_fn returns crps_blend(wq) - crps_blend(v3), NOT the deleted proxy."""
+    import numpy as np
+
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+    from weatherquant.verify.backtest import PairedRecord
+
+    day = date(2026, 7, 10)
+    # Two records on ONE day, each carrying the per-record predictive Gaussians 06-06 populates.
+    recs = [
+        PairedRecord(
+            day=day, city="KXHIGHNY", bucket=(85, 85), wq_prob=0.6, v3_prob=0.55, o_i=1,
+            wq_mu=85.0, wq_sigma=2.0, v3_mu=84.0, v3_sigma=3.0, y=85.5,
+        ),
+        PairedRecord(
+            day=day, city="KXHIGHNY", bucket=(86, 86), wq_prob=0.3, v3_prob=0.35, o_i=0,
+            wq_mu=85.0, wq_sigma=2.0, v3_mu=84.0, v3_sigma=3.0, y=85.5,
+        ),
+    ]
+    score_fn = verify_mod._crps_score_fn(recs, metrics)
+    got = score_fn([day])
+    # Hand-computed: crps_blend pools BOTH records' (mu, sigma, y) for each arm.
+    wq_mu = np.array([85.0, 85.0])
+    wq_sigma = np.array([2.0, 2.0])
+    y = np.array([85.5, 85.5])
+    v3_mu = np.array([84.0, 84.0])
+    v3_sigma = np.array([3.0, 3.0])
+    expected = metrics.crps_blend(wq_mu, wq_sigma, y) - metrics.crps_blend(v3_mu, v3_sigma, y)
+    assert got == pytest.approx(expected)
+    # The deleted proxy mean((wq-v3)*(2o-1)) would be a DIFFERENT number on these records.
+    proxy = float(np.mean((np.array([0.6, 0.3]) - np.array([0.55, 0.35])) * (2.0 * np.array([1.0, 0.0]) - 1.0)))
+    assert got != pytest.approx(proxy)
+
+
+def test_crps_score_fn_fails_loud_without_predictive_params():
+    """CR-01: a scored record missing the predictive params raises — never silently a proxy."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+    from weatherquant.verify.backtest import PairedRecord
+
+    day = date(2026, 7, 10)
+    rec = PairedRecord(day=day, city="KXHIGHNY", bucket=(85, 85), wq_prob=0.6, v3_prob=0.55, o_i=1)
+    score_fn = verify_mod._crps_score_fn([rec], metrics)
+    with pytest.raises(ValueError):
+        score_fn([day])
+
+
+# --- 06-07 Task 3: seeded NON-EMPTY-ledger end-to-end proof CR-01/CR-03 are closed -------------
+#
+# The verifier flagged that the prior integration tests ran against an EMPTY DB, so the real
+# scoring path (fills/closing-snapshots ROI/CLV + the tail-day coverage) was never exercised
+# end-to-end. THESE seeded tests are the standing proof — a green unit suite alone is NOT evidence.
+
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
+
+_VER_F_TO_K = lambda f: (f - 32.0) * 5.0 / 9.0 + 273.15  # noqa: E731 - test-only inverse K→°F seam
+
+
+def _seed_jja_forecasts_observations(conn, *, tail_high: bool = False, tail_day=None):
+    """Seed June+July NYC/hrrr forecasts+observations on the PRODUCTION no-look-ahead path (06-10).
+
+    Decision-day settled obs are stamped at ``settlement_window(get_city("NYC"), d).end_utc`` (the
+    realistic LST settlement instant on/after day d), NOT back-dated to 2026-01-01; forecasts are
+    stamped at ``d-2d`` 00:00 UTC (strictly before the ``d-1d`` 00:00 UTC cutoff). Seeds JUNE 01..30
+    + JULY 01..31 (the JJA season) so >= N_MIN JJA pairs survive the cutoff for the scored July
+    window and the July month-fit is retained (the same feasibility arithmetic as the backtest
+    seeder — June pairs all settle before a mid-July cutoff). When ``tail_high``, ``tail_day``'s obs
+    is a TAIL high (far above the interior ±4σ range) so CR-03's open-upper bucket + tail_settlement
+    coverage-log is exercised on the production path.
+    """
+    from weatherquant.ingest.writer import insert_forecast, insert_observation
+
+    base_f = 85.0
+
+    def _seed_month(month: int, n_days: int):
+        for i in range(n_days):
+            d = date(2026, month, 1 + i)
+            members_f = [base_f - 2.0, base_f, base_f + 2.0]  # 3 members → s2 = 8/3 > 0
+            cycle = _dt(d.year, d.month, d.day, 0, tzinfo=_tz.utc)
+            # Forecasts at d-2d 00:00 UTC — strictly before the d-1d cutoff (own forecast survives).
+            fc_avail = _dt(d.year, d.month, d.day, tzinfo=_tz.utc) - _td(days=2)
+            for member, mf in enumerate(members_f):
+                insert_forecast(
+                    conn, city="NYC", target_date=d, model="hrrr", lead=0, member=member,
+                    temp_kelvin=_VER_F_TO_K(mf), cycle=cycle,
+                    station_lat=40.779, station_lon=-73.969, grid_distance_m=1000.0,
+                    available_at=fc_avail,
+                )
+            high = (base_f + 100.0) if (tail_high and d == tail_day) else (base_f + 0.5)
+            # Decision-day obs at the realistic LST SETTLEMENT instant (excluded from the < d-1d
+            # training read, present in the < d+2d outcome read).
+            obs_avail = settlement_window(get_city("NYC"), d).end_utc
+            insert_observation(
+                conn, city="NYC", target_date=d, source="asos", daily_high_f=high,
+                available_at=obs_avail,
+            )
+
+    _seed_month(6, 30)  # June, JJA — season-retention fill so >= N_MIN JJA pairs survive the cutoff
+    _seed_month(7, 31)  # July, JJA — the scored month
+
+
+def _seed_verdict_ledger(conn, *, tail_high: bool):
+    """Seed a NON-EMPTY July ledger: forecasts+observations, fills, closing snapshots, a tail day.
+
+    06-10: re-stamped to the PRODUCTION no-look-ahead path — decision-day obs at settlement, forecasts
+    at d-2d, with June+July (JJA) seeded so >= N_MIN JJA pairs survive the cutoff and the July
+    month-fit is retained for the scored window (the verdict path scores rather than no_month_fit).
+    The last replayed day's observation is a TAIL high when ``tail_high`` so CR-03's open-upper bucket
+    + tail_settlement coverage-log is exercised. Returns the (ticker, day, avg_price_cents,
+    closing_mid_cents) for the seeded fill so the caller can hand-compute ROI/CLV.
+    """
+    from weatherquant.ingest.writer import insert_fill, insert_market_snapshot
+
+    _seed_jja_forecasts_observations(conn, tail_high=tail_high, tail_day=date(2026, 7, 12))
+
+    # Seed ONE fill on 2026-07-10 (in the Gate-1 window) on the 85°F bucket + its closing snapshots.
+    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)  # fills/snapshots back-stamp is fine (not a settled obs)
+    fill_day = date(2026, 7, 10)
+    ticker = "KXHIGHNY-85-86"  # the [85,86] bucket → span [84.5, 86.5) (settled high 85.5 → YES)
+    fill_event = _dt(2026, 7, 10, 12, tzinfo=_tz.utc)
+    insert_fill(
+        conn, ticker=ticker, trade_id="t1", side="yes", price=40, count=2, fee=1,
+        is_maker=False, event_time=fill_event,
+        detail={"avg_price_cents": 40.0}, available_at=avail,
+    )
+    # Closing-window snapshots inside [end - CLV_WINDOW_MINUTES, end) for the fill's settlement day.
+    from weatherquant.market.clv import CLV_WINDOW_MINUTES
+
+    win = settlement_window(get_city("NYC"), fill_day)
+    closing_mid_cents = 50.0  # a single in-window snapshot → vol-weighted mid = 50.0c
+    t_in = win.end_utc - _td(minutes=CLV_WINDOW_MINUTES - 5)
+    insert_market_snapshot(
+        conn, ticker=ticker, snapshot_for=t_in.isoformat(),
+        best_yes_bid=49, best_no_bid=49, mid=closing_mid_cents, volume=100, seq=None,
+        detail={"raw": "book"}, available_at=t_in,
+    )
+    return ticker, fill_day, 40.0, closing_mid_cents
+
+
+def _seed_multiday_fills(conn, *, fills_spec, ticker="KXHIGHNY-85-86", snapless_lst_days=frozenset()):
+    """Seed forecasts/observations for July + one fill per spec entry on its own LST settlement day.
+
+    ``fills_spec`` is a list of ``(event_time_utc, side, avg_price_cents)`` tuples. The default
+    ``ticker`` is the ``KXHIGHNY-85-86`` bucket; the interior observation high (85.5°F) settles YES,
+    so a YES buy is a win and a NO buy is a loss — letting the side="no" e2e tests assert the NO
+    orientation. Pass a NON-containing bucket (e.g. ``KXHIGHNY-50-51``, span [49.5, 51.5)) so the
+    settled high 85.5 is OUTSIDE it → the bucket settles NO → a NO buy WINS. Closing snapshots are
+    seeded per distinct LST settlement day (a single 50c in-window snap → mid 50c). Returns the list
+    of resolved LST settlement days (one per fill).
+
+    06-10: forecasts/observations are seeded via the shared PRODUCTION-path seeder (decision-day obs
+    at settlement, forecasts at d-2d) — the fills are settled by ``_settle_window_fills`` via a plain
+    ``queries.latest`` obs read (no as-of cutoff), so realistic obs stamping is correct here.
+    """
+    from weatherquant.ingest.writer import insert_fill, insert_market_snapshot
+    from weatherquant.market.clv import CLV_WINDOW_MINUTES
+
+    _seed_jja_forecasts_observations(conn)
+
+    avail = _dt(2026, 1, 1, tzinfo=_tz.utc)  # fills/snapshots back-stamp (not a settled obs)
+    city = get_city("NYC")
+    seeded_snap_days: set = set()
+    lst_days: list = []
+    for n, (event_time, side, avg_price) in enumerate(fills_spec):
+        insert_fill(
+            conn, ticker=ticker, trade_id=f"m{n}", side=side, price=int(round(avg_price)),
+            count=1, fee=0, is_maker=False, event_time=event_time,
+            detail={"avg_price_cents": float(avg_price)}, available_at=avail,
+        )
+        # LST settlement day = (event_time + offset).date() (offset = -5h for NYC) — the WR-04 key.
+        lst_day = (event_time + _td(hours=city.std_offset_hours)).date()
+        lst_days.append(lst_day)
+        # ``snapless_lst_days`` leaves a day's closing window EMPTY (no snapshot) — the WR-1 case.
+        if lst_day not in seeded_snap_days and lst_day not in snapless_lst_days:
+            win = settlement_window(city, lst_day)
+            t_in = win.end_utc - _td(minutes=CLV_WINDOW_MINUTES - 5)
+            insert_market_snapshot(
+                conn, ticker=ticker, snapshot_for=t_in.isoformat(),
+                best_yes_bid=49, best_no_bid=49, mid=50.0, volume=100, seq=None,
+                detail={"raw": "book"}, available_at=t_in,
+            )
+            seeded_snap_days.add(lst_day)
+    return lst_days
+
+
+@pytest.mark.integration
+def test_verdict_scores_roi_clv_off_real_fills_real_ci_width(pg_conn):
+    """CR-01 / GAP-2 (seeded e2e): multi-LST-day window → a REAL bootstrap CI with positive width.
+
+    With >= _MIN_FILL_DAYS_FOR_CI distinct LST fill-days of VARYING profitability, ROI/CLV are real
+    day-block bootstrap intervals — never a zero-width point. A degenerate point CI is the GAP-2
+    defect this regression locks shut.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # Three distinct interior July LST days, YES buys at varying prices → varying ROI per block.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "yes", 50.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 70.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False, "multi-LST-day ledger must be scored, not the sentinel"
+    assert roi_ci[1] > roi_ci[0], "ROI CI must have strictly positive width (never a zero-width point)"
+    assert clv_ci[1] > clv_ci[0], "CLV CI must have strictly positive width (never a zero-width point)"
+
+
+@pytest.mark.integration
+def test_verdict_two_distinct_days_identical_roi_maps_to_not_scored_sentinel(pg_conn):
+    """CR-01 (BLOCKER regression): 2 distinct LST fill-days with IDENTICAL per-day ROI → not_scored.
+
+    The ``_MIN_FILL_DAYS_FOR_CI = 2`` floor is necessary but NOT sufficient. With exactly two
+    distinct days A and B whose per-day ROI is identical (two SAME-price YES buys on the same bucket
+    that both settle YES), every paired day-block resample ({A,A}, {A,B}, {B,B}) yields the SAME
+    pooled ROI — so ``np.percentile(deltas, [2.5, 97.5])`` returns ``roi_lo == roi_hi``: a zero-width
+    "interval" at a profitable point that formerly read as a Gate-1 PASS (``ci_lo > 0``). A
+    degenerate CI cannot honestly exclude zero, so it must map to the PINNED not_scored sentinel and
+    FAIL, never manufacture a money-go PASS on n=2-with-identical-ROI.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import gate1, metrics
+
+    # Two distinct interior July LST days, SAME-price YES buys on the SAME YES-settling bucket →
+    # identical per-day ROI on every block → a zero-width bootstrap CI.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 40.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, (
+        "two distinct fill-days with IDENTICAL per-day ROI yield a zero-width CI — it must map to "
+        "the not_scored sentinel, NEVER a degenerate point PASS (CR-01 BLOCKER)"
+    )
+    assert roi_ci == (0.0, 0.0) == clv_ci
+    # And the full conjunctive gate FAILs cleanly on the pinned sentinel (not an exception).
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": roi_ci, "clv": clv_ci,
+    }
+    assert gate1.gate1_passes(cis) is False
+
+
+@pytest.mark.integration
+def test_verdict_zero_capital_fill_fails_closed_not_mid_bootstrap_crash(pg_conn):
+    """WR-03: a window with a zero-cost (avg_price_cents == 0) fill fails CLOSED, never crashes.
+
+    ``roi_from_fills`` raises ValueError when the pooled capital deployed is non-positive
+    (``total_entry <= 0``). Inside the day-block bootstrap, a resample drawing only zero-cost fills
+    would make that raise PROPAGATE out of ``paired_day_block_ci``, aborting the entire Gate-1 run
+    mid-bootstrap rather than declining to score. A money gate must fail closed (decline), not
+    crash. With a 0c fill present, ``_roi_clv_cis`` must map ROI/CLV to the pinned not_scored
+    sentinel and return cleanly — NEVER raise.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # Two distinct LST days (so the distinct-day floor is cleared) but one fill deploys ZERO capital
+    # (avg_price_cents == 0). The bootstrap must not be allowed to raise on a zero-capital resample.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 0.0),   # zero-cost fill (no capital deployed)
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    # Must return cleanly (fail closed), never raise out of the bootstrap.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, "a zero-capital fill window must fail closed → not_scored (WR-03)"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+
+@pytest.mark.integration
+def test_verdict_empty_closing_window_fails_closed_not_mid_bootstrap_crash(pg_conn):
+    """WR-1 (the WR-03 twin): a positive-capital fill whose closing window has NO snapshot fails
+    CLOSED, never crashes. ``mean_clv`` → ``clv_cents`` → ``vol_weighted_mid([])`` raises on an empty
+    closing window; inside the day-block bootstrap that raise would PROPAGATE out of
+    ``paired_day_block_ci`` and abort the entire Gate-1 verdict. The WR-03 capital guard does not
+    cover this (capital is positive), so ``_roi_clv_cis`` must map ROI/CLV to the pinned not_scored
+    sentinel and return cleanly — NEVER raise.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # Two distinct LST days, both positive capital (clears WR-03 + the distinct-day floor), but the
+    # 2026-07-09 day's closing window is left EMPTY (no snapshot persisted in the final CLV minutes).
+    snapless_lst_day = (
+        _dt(2026, 7, 9, 12, tzinfo=_tz.utc) + _td(hours=get_city("NYC").std_offset_hours)
+    ).date()
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 40.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 40.0),  # closing window left empty
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec, snapless_lst_days={snapless_lst_day})
+    # Must return cleanly (fail closed), never raise out of the bootstrap.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, "an empty closing window must fail closed → not_scored (WR-1)"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+
+@pytest.mark.integration
+def test_verdict_single_fill_day_maps_to_not_scored_sentinel(pg_conn):
+    """CR-01 / GAP-2 core regression: a SINGLE profitable fill-day can NEVER flip Gate-1 to PASS.
+
+    Below _MIN_FILL_DAYS_FOR_CI distinct LST fill-days, ROI/CLV map to the pinned (0.0, 0.0)
+    not_scored sentinel — a lone profitable fill is not a passing CI.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    spec = [(_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 40.0)]  # exactly ONE LST fill-day
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, "a single fill-day must map to the not_scored sentinel, never a pass"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+
+@pytest.mark.integration
+def test_verdict_no_fill_side_settles_yes_is_scored_as_a_loss_end_to_end(pg_conn):
+    """T-06-09-T2 (seeded e2e): side='no' fills that settle YES are scored as LOSSES via threaded sides.
+
+    The interior high settles YES, so a NO buy LOSES. A side-BLIND ROI would have scored these NO
+    buys as YES WINS (positive); the threaded side must instead score them as losses.
+
+    CR-01 interaction (why this is two assertions, not a "negative CI"): a pure all-NO-loss ledger
+    is DEGENERATE — every losing block has ROI exactly ``-1.0`` (payoff 0 → (0 - entry)/entry = -1
+    for ANY price), so the day-block bootstrap CI is zero-width and CORRECTLY maps to the not_scored
+    sentinel (a zero-width "interval" cannot honestly exclude zero, even on the favorable side). We
+    therefore prove the orientation in two parts:
+
+    1. the verdict path declines to score the degenerate ledger (not_scored is True); and
+    2. at the metric layer, the SETTLED inputs produced by ``_settle_window_fills`` feed
+       ``roi_from_fills`` to a per-block ROI of exactly ``-1.0`` (a LOSS) — never the ``+1.0`` a
+       side-blind reading (NO scored as a YES win on this YES-settling bucket) would yield.
+
+    Part 2 is the real orientation proof (not_scored alone is sign-agnostic: a uniform all-WIN
+    ledger is also degenerate). The NON-degenerate positive complement is covered by
+    ``test_verdict_roi_side_no_fill_settles_no_is_a_win`` (NO wins at varying prices → a real CI).
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "no", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "no", 50.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "no", 70.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec)
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    # 1. The all-NO-loss ledger is degenerate (uniform -1.0 per block) → not_scored (CR-01).
+    assert not_scored is True, "a uniform all-loss NO ledger is a zero-width CI → not_scored (CR-01)"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+    # 2. Orientation proof at the metric layer: the SETTLED NO fills score to a LOSS (-1.0), the
+    # exact opposite of the +1.0 a side-blind YES-win reading would produce. This is what reaches
+    # roi_from_fills through the verdict path (same seams _roi_clv_cis uses).
+    from weatherquant.db import queries
+
+    all_fills = list(queries.latest(pg_conn, "fills"))
+    window_fills = [
+        f for f in all_fills
+        if verify_mod._fill_in_window(f, "NYC", date(2026, 7, 1), date(2026, 7, 13))
+    ]
+    assert len(window_fills) == 3, "all three seeded NO fills are in the window"
+    settled_yes, _clv_fills, _snaps, sides = verify_mod._settle_window_fills(
+        pg_conn, window_fills, "NYC"
+    )
+    assert all(s == "sell" for s in sides), "side='no' normalizes to 'sell' (the NO mirror)"
+    assert all(sy is True for sy in settled_yes), "the interior bucket settles YES on every day"
+    roi = metrics.roi_from_fills(window_fills, settled_yes, sides)
+    assert roi == pytest.approx(-1.0), (
+        "side='no' buys on a YES-settling bucket must score a LOSS (-1.0), never the +1.0 a "
+        "side-blind YES-win reading would produce (sides threaded into roi_from_fills)"
+    )
+
+
+@pytest.mark.integration
+def test_verdict_roi_side_no_fill_settles_no_is_a_win(pg_conn):
+    """T-06-09-T2 (seeded e2e, 06-10): a side='no' fill on a NO-settling bucket is CREDITED as a win.
+
+    The complement of the loss test: here the fills sit on a NON-containing bucket (KXHIGHNY-50-51,
+    span [49.5, 51.5)) — the settled interior high (85.5°F) is OUTSIDE it, so the bucket settles NO
+    and a NO buy WINS. The positive ROI CI proves the NO win is credited end-to-end through
+    ``_settle_window_fills`` → ``roi_from_fills(sides=...)`` (a side-blind ROI would have scored these
+    NO buys on a non-containing bucket as YES losses → a negative CI).
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # NO buys (cheap) on a bucket the settled high does NOT land in → each NO position wins.
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "no", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "no", 35.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "no", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec, ticker="KXHIGHNY-50-51")
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False
+    # NO-settling bucket + NO buys → every block wins → the whole ROI CI is above zero.
+    assert roi_ci[0] > 0, "a side='no' buy that settles NO must be credited as a win (sides threaded)"
+
+
+@pytest.mark.integration
+def test_verdict_no_fill_clv_magnitude_is_no_denominated(pg_conn):
+    """WR-02 (seeded e2e): a NO fill's CLV is scored NO-denominated (100 - yes_mid) - price.
+
+    The existing NO e2e tests only assert the ROI CI SIGN — never the CLV MAGNITUDE. A NO
+    ('sell'-normalized) fill records its NO-contract price; its closing value is the NO mid
+    ``100 - yes_mid``. The seeded closing snapshot has a YES mid of 50.0c, so the NO mid is 50.0c
+    and a NO buy at 30/35/40c has a per-fill CLV of ``50 - price`` = 20 / 15 / 10c (all POSITIVE —
+    bought the NO cheap relative to its close).
+
+    The OLD (buggy) orientation differenced the NO price against the YES mid and flipped the sign:
+    ``-(50 - 30) = -20`` — a units mismatch that inverted the sign and mis-scaled the magnitude.
+    Asserting the EXACT magnitude pins the NO-denominated CLV so the orientation can't regress.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.db import queries
+    from weatherquant.verify import metrics
+
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "no", 30.0),
+        (_dt(2026, 7, 7, 12, tzinfo=_tz.utc), "no", 35.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "no", 40.0),
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec, ticker="KXHIGHNY-50-51")
+
+    # Exact per-fill / mean magnitude via the same settle seams _roi_clv_cis uses.
+    all_fills = list(queries.latest(pg_conn, "fills"))
+    window_fills = [
+        f for f in all_fills
+        if verify_mod._fill_in_window(f, "NYC", date(2026, 7, 1), date(2026, 7, 13))
+    ]
+    assert len(window_fills) == 3
+    _settled, clv_fills, snaps, sides = verify_mod._settle_window_fills(
+        pg_conn, window_fills, "NYC"
+    )
+    assert all(s == "sell" for s in sides), "side='no' normalizes to 'sell'"
+    # YES mid 50.0c → NO mid 50.0c → CLV = 50 - price = {20, 15, 10}; mean = 15.0c (NO-denominated).
+    mean_clv = metrics.mean_clv(clv_fills, snaps, sides)
+    assert mean_clv == pytest.approx(15.0), (
+        "a NO fill's CLV must be NO-denominated (100 - yes_mid) - price = 50 - price; the OLD "
+        "YES-denominated orientation would give -(yes_mid - price), a sign-inverted units bug (WR-02)"
+    )
+
+    # And the bootstrap CLV CI is strictly POSITIVE (bought the NO cheap), never the negative the
+    # old orientation produced.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is False
+    assert clv_ci[0] > 0, "the NO-denominated CLV CI is strictly positive (NO bought cheap)"
+
+
+@pytest.mark.integration
+def test_verdict_roi_clv_block_key_is_lst_settlement_day_not_utc_date(pg_conn):
+    """T-06-09-T3 / WR-04 (seeded e2e): the bootstrap block key is the LST settlement day, not UTC date.
+
+    A near-boundary fill at 2026-07-11 02:00 UTC belongs to LST day 2026-07-10 (NYC offset -5h:
+    02:00 - 5h = 21:00 on 07-10). Paired with TWO other fills clearly inside 07-10 and 07-08, the
+    distinct LST-day count is 2 (07-08, 07-10) → SCORED. If the block key were the raw UTC date, the
+    boundary fill would key on 07-11, giving 3 distinct UTC dates — a DIFFERENT grouping. We assert
+    the near-boundary fill JOINS the 07-10 block (same as the clearly-in-07-10 fill), proven by the
+    scored verdict landing on 2 LST blocks (not 3 UTC dates).
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    boundary = _dt(2026, 7, 11, 2, 0, tzinfo=_tz.utc)  # UTC date 07-11, LST settlement day 07-10
+    in_0710 = _dt(2026, 7, 10, 12, tzinfo=_tz.utc)      # clearly inside LST day 07-10
+    in_0708 = _dt(2026, 7, 8, 12, tzinfo=_tz.utc)       # a second distinct LST day
+    spec = [
+        (in_0708, "yes", 30.0),
+        (in_0710, "yes", 50.0),
+        (boundary, "yes", 70.0),
+    ]
+    lst_days = _seed_multiday_fills(pg_conn, fills_spec=spec)
+    # The boundary fill resolves to the SAME LST day as in_0710 (07-10), NOT its UTC date (07-11).
+    assert lst_days == [date(2026, 7, 8), date(2026, 7, 10), date(2026, 7, 10)]
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    # Two distinct LST blocks (07-08, 07-10) >= _MIN_FILL_DAYS_FOR_CI → scored with a real CI.
+    assert not_scored is False, "two distinct LST fill-days must score (boundary fill joins 07-10)"
+    assert roi_ci[1] >= roi_ci[0]
+
+
+@pytest.mark.integration
+def test_verdict_roi_clv_not_scored_sentinel_fails_loud_when_no_fills(pg_conn):
+    """CR-01 (seeded e2e): with NO fills for the window, roi/clv map to (0.0,0.0) → gate1 FAIL."""
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import gate1, metrics
+
+    _seed_verdict_ledger(pg_conn, tail_high=False)  # seeds a fill on 2026-07-10 ...
+    # ... but score a DIFFERENT (later, fill-free) window so the fills ledger is empty for it.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 20), date(2026, 7, 25), metrics
+    )
+    assert not_scored is True
+    assert roi_ci == (0.0, 0.0) == clv_ci
+    cis = {
+        "brier": (-0.1, -0.05), "crps": (-0.1, -0.05), "ece": (-0.1, -0.05),
+        "roi": roi_ci, "clv": clv_ci,
+    }
+    assert gate1.gate1_passes(cis) is False  # FAIL verdict, not an exception
+
+
+@pytest.mark.integration
+def test_tail_high_day_is_scored_and_coverage_logged(pg_conn):
+    """CR-03 (seeded e2e): a tail-high day is o_i=1 in the open-upper bucket + coverage-logged."""
+    from weatherquant.verify import backtest
+
+    _seed_verdict_ledger(pg_conn, tail_high=True)  # 2026-07-12 settles at a tail high (185°F)
+    records, coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=date(2026, 7, 10), end=date(2026, 7, 13),
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    tail_day = date(2026, 7, 12)
+    # The tail day is coverage-logged tail_settlement (auditable, never a silent o_i=0 drop).
+    assert any(
+        e.get("day") == tail_day and e.get("reason") == "tail_settlement" for e in coverage
+    ), "the tail-high day must be coverage-logged tail_settlement (CR-03/D-09)"
+    # The tail day's records are STILL scored, and exactly ONE bucket (the open-upper) is its YES.
+    tail_records = [r for r in records if r.day == tail_day and r.excluded_reason is None]
+    assert tail_records, "the tail day must still be scored (not dropped)"
+    assert sum(r.o_i for r in tail_records) == 1, "exactly one YES bucket for the tail high"

@@ -12,17 +12,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Sequence
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 
 import httpx
 
+from weatherquant.db.types import Bind
 from weatherquant.ingest import afd as afd_mod
 from weatherquant.ingest import grib, obs
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import CorrectnessError, TargetDateError
 from weatherquant.ingest.sources import nws, openmeteo, wethr
-from weatherquant.ingest.writer import Bind, insert_forecast
+from weatherquant.ingest.writer import insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import coerce_utc, settlement_window
 
@@ -391,8 +392,8 @@ async def ingest_range(
     hours = list(cycle_hours) if cycle_hours is not None else [0]
     totals: dict[str, int] = {m: 0 for m in models}
     if include_obs:
-        totals.setdefault("asos", 0)
-        totals.setdefault("afd", 0)
+        totals.setdefault(obs.SOURCE, 0)
+        totals.setdefault(afd_mod.SOURCE, 0)
 
     day = start_date
     while day <= end_date:
@@ -412,8 +413,8 @@ async def ingest_range(
             for city in cities:
                 # ASOS has an IEM historical archive and runs in backfill; AFD skips in backfill
                 # absent a recoverable issuance time (CR-01).
-                totals["asos"] += await ingest_obs(bind, city, day)
-                totals["afd"] += await ingest_afd(bind, city, day, mode=mode)
+                totals[obs.SOURCE] += await ingest_obs(bind, city, day)
+                totals[afd_mod.SOURCE] += await ingest_afd(bind, city, day, mode=mode)
         day += timedelta(days=1)
 
     logger.info(

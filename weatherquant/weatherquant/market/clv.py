@@ -10,7 +10,10 @@ Correctness landmines (see docs/DECISIONS.md):
   ``[end_utc - CLV_WINDOW_MINUTES, end_utc)`` off :mod:`weatherquant.time`, never a re-derived
   civil-time clock.
 * Volume-weighted mid (D-09): ``Σ(mid_i·vol_i)/Σvol_i`` in cents; empty/zero-volume fails loud.
-* Sign orientation (D-09): ``closing_mid - fill_price`` for a ``"buy"``, flipped for a ``"sell"``.
+* Side orientation (D-09 / WR-02): each contract is valued against its OWN side's closing mid —
+  ``yes_mid - price`` for a ``"buy"`` (YES), ``(100 - yes_mid) - price`` for a ``"sell"`` (a NO
+  buy whose ``avg_price_cents`` is NO-denominated, mirroring ``metrics.roi_from_fills``). NOT a
+  bare sign flip against the YES mid (that differenced a NO price against a YES mid — a units bug).
 
 PURE: imports only :func:`weatherquant.time.settlement_window`.
 """
@@ -127,27 +130,43 @@ def clv_cents(
     closing_snapshots: Sequence[Mapping[str, Any]],
     side: str,
 ) -> float:
-    """Per-trade CLV in cents: a fill better than the close is POSITIVE (D-09).
+    """Per-trade CLV in cents: a fill better than its OWN-side close is POSITIVE (D-09 / WR-02).
 
     Both operands are CENTS. The fill price is the un-rounded float ``avg_price_cents``, NEVER
     the rounded integer ``fills.price`` column (which re-introduces the +/-0.5c rounding bias,
-    WR-05). ``edge = closing_mid - fill.avg_price_cents``; returns ``edge`` for a ``"buy"`` and
-    ``-edge`` for a ``"sell"``. The closing mid comes from :func:`vol_weighted_mid`.
+    WR-05). :func:`vol_weighted_mid` returns the YES-side closing mid.
+
+    SIDE ORIENTATION (WR-02 — the units fix). ``avg_price_cents`` is the price of the contract the
+    fill actually BOUGHT, denominated on that side:
+
+    * ``"buy"`` is a YES-contract buy; its closing value is the YES mid → ``edge = yes_mid - price``.
+    * ``"sell"`` is a NO-contract buy (the ``side='no'`` ledger fill, normalized to ``"sell"`` by
+      ``cli.verify._settle_window_fills``); its ``avg_price_cents`` is the NO contract's OWN price
+      (mirroring ``metrics.roi_from_fills``, which buys NO at that price and pays 100c on a NO
+      settlement). Its closing value is therefore the NO closing mid ``100 - yes_mid``, NOT the YES
+      mid → ``edge = (100 - yes_mid) - price``. Bought the NO cheap relative to its close → POSITIVE.
+
+    The previous orientation returned ``-(yes_mid - price)`` for a sell, differencing a NO price
+    against a YES mid — a units mismatch that inflated/deflated the NO CLV by roughly the full
+    0–100 span and inverted its sign. CLV is a Gate-1 money metric, so each contract is valued
+    against its OWN side's closing mid.
 
     Args:
-        fill: the executed fill (carries the size-weighted ``avg_price_cents``).
+        fill: the executed fill (carries the size-weighted ``avg_price_cents`` on the bought side).
         closing_snapshots: the closing-window snapshots (typically the output of
             :func:`closing_window_snapshots`).
-        side: ``"buy"`` or ``"sell"`` — orients the sign.
+        side: ``"buy"`` (a YES buy) or ``"sell"`` (a NO buy) — selects the side's closing mid.
 
     Raises:
         ValueError: on an unknown ``side`` or an empty/zero-volume closing window.
     """
     if side not in ("buy", "sell"):
         raise ValueError(f"side must be 'buy' or 'sell'; got {side!r}")
-    closing_mid = vol_weighted_mid(closing_snapshots)
-    edge = closing_mid - fill.avg_price_cents
-    return edge if side == "buy" else -edge
+    yes_mid = vol_weighted_mid(closing_snapshots)
+    # Value each contract against its OWN side's closing mid: YES buy vs the YES mid, NO buy (the
+    # "sell" alias) vs the NO mid (100 - yes_mid). avg_price_cents is already that side's own price.
+    side_mid = yes_mid if side == "buy" else 100.0 - yes_mid
+    return side_mid - fill.avg_price_cents
 
 
 __all__ = [

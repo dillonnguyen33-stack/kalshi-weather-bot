@@ -10,16 +10,19 @@ flagged but the ASOS label is still stored, never overwritten (D-16; see docs/DE
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import httpx
 
+from weatherquant.db.types import Bind
+from weatherquant.ingest.errors import ObsFetchError
 from weatherquant.ingest.sources._client import KELVIN_OFFSET, managed_client
-from weatherquant.ingest.writer import Bind, insert_observation
+from weatherquant.ingest.writer import insert_observation
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, coerce_utc, parse_utc, settlement_window
 
@@ -34,6 +37,15 @@ _AWC_METAR_BASE = "https://aviationweather.gov/api/data/metar"
 _AWC_FALLBACK_HOURS = 14
 # v3 NWS_UA (L77) — a descriptive User-Agent is required/courteous for these feeds.
 _USER_AGENT = "weatherquant/0.1 (kalshi daily-high paper-trading)"
+
+# IEM 429 retry/backoff (the asos-rate-limit-empty-obs fix). Bulk backfill trips mesonet's rate
+# limiter; without a retry a 429 silently degrades to an empty label. We retry a bounded number
+# of times with exponential backoff (honoring a ``Retry-After`` header when present, else the
+# capped exponential), then — if still rate-limited and the live AWC fallback cannot serve the
+# window — raise ObsFetchError so the day is SKIPPED, never persisted as a fabricated empty row.
+_IEM_429_MAX_RETRIES = 4
+_IEM_429_BACKOFF_BASE_SECONDS = 2.0
+_IEM_429_BACKOFF_CAP_SECONDS = 30.0
 
 # CLI-vs-ASOS agreement tolerance in °F. The CLI report rounds to whole degrees and the
 # ASOS max may differ by sub-degree sampling, so a 1.5°F band is a reasonable
@@ -175,16 +187,6 @@ def daily_high(
     )
 
 
-def daily_high_from_obs(
-    city: str,
-    target_date: date,
-    readings: Iterable[object],
-    cli_max_f: float | None = None,
-) -> DailyHigh:
-    """Arg-reordered alias of :func:`daily_high` matching the 02-01 RED-stub ``(city, target_date, readings)``."""
-    return daily_high(readings, city, target_date, cli_max_f=cli_max_f)
-
-
 def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
     """Parse the IEM ``onlycomma`` CSV (``station,valid,tmpf``, tz=UTC) into ``(ts_utc, tmpf)`` rows.
 
@@ -212,6 +214,22 @@ def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
     return rows
 
 
+def _retry_after_seconds(resp: httpx.Response, attempt: int) -> float:
+    """Backoff before the next IEM retry — honor ``Retry-After`` (seconds), else capped exponential.
+
+    ``Retry-After`` may be an integer seconds count (the common mesonet/HTTP form). A malformed or
+    absent header falls back to ``base * 2**attempt`` capped at :data:`_IEM_429_BACKOFF_CAP_SECONDS`,
+    so a misbehaving server can never push the backoff unbounded.
+    """
+    header = resp.headers.get("Retry-After")
+    if header:
+        try:
+            return min(float(header.strip()), _IEM_429_BACKOFF_CAP_SECONDS)
+        except ValueError:
+            pass  # HTTP-date form (rare here) — fall through to exponential backoff.
+    return min(_IEM_429_BACKOFF_BASE_SECONDS * (2.0**attempt), _IEM_429_BACKOFF_CAP_SECONDS)
+
+
 async def fetch_asos_obs(
     city: str,
     win: SettlementWindow,
@@ -222,33 +240,73 @@ async def fetch_asos_obs(
     Primary feed is the IEM ASOS CGI keyed by the registry ``cli_station``; on failure it
     degrades to the aviationweather.gov METAR endpoint (°C → °F). Fixed endpoints (SSRF guard
     T-02-11). Returns raw rows; :func:`daily_high` does the bucket (D-11).
+
+    HTTP 429 (rate limited, common under bulk backfill) is retried up to
+    :data:`_IEM_429_MAX_RETRIES` times with exponential backoff (honoring ``Retry-After``). If
+    still rate-limited after the retries AND the live AWC fallback cannot serve the window (a
+    historical backfill day), this RAISES :class:`ObsFetchError` rather than returning ``[]`` —
+    so a rate-limited day is skipped by the orchestrator, never persisted as a fabricated empty
+    label. A genuine HTTP-200 empty response is unchanged: it is a real "no obs" answer.
     """
     station = get_city(city).cli_station
     # IEM strips the leading 'K' from the 4-letter ICAO for its 3-letter network ids.
     iem_station = station[1:] if station.startswith("K") and len(station) == 4 else station
+    params = {
+        "station": iem_station,
+        "data": "tmpf",
+        "sts": win.start_utc.strftime("%Y-%m-%dT%H:%MZ"),
+        "ets": win.end_utc.strftime("%Y-%m-%dT%H:%MZ"),
+        "tz": "UTC",
+        "report_type": ["3", "4"],  # routine (3) + special (4) METAR
+        "format": "onlycomma",
+        "missing": "M",
+    }
 
     async with managed_client(client) as client:
-        try:
-            resp = await client.get(
-                _IEM_ASOS_CGI,
-                params={
-                    "station": iem_station,
-                    "data": "tmpf",
-                    "sts": win.start_utc.strftime("%Y-%m-%dT%H:%MZ"),
-                    "ets": win.end_utc.strftime("%Y-%m-%dT%H:%MZ"),
-                    "tz": "UTC",
-                    "report_type": ["3", "4"],  # routine (3) + special (4) METAR
-                    "format": "onlycomma",
-                    "missing": "M",
-                },
-            )
-            resp.raise_for_status()
-            # A successful response is authoritative — empty rows mean "no obs for this window"
-            # (a real answer), NOT a failure. Only a genuine fetch error falls back to AWC.
-            return _parse_iem_csv(resp.text)
-        except (httpx.HTTPError, ValueError) as exc:
-            logger.warning("IEM ASOS fetch failed for %s (%s); trying AWC fallback", city, exc)
-            return await _fetch_awc_fallback(station, client, win)
+        for attempt in range(_IEM_429_MAX_RETRIES + 1):
+            try:
+                resp = await client.get(_IEM_ASOS_CGI, params=params)
+                if resp.status_code == 429:
+                    # Rate limited — back off and retry, unless we are out of attempts.
+                    if attempt < _IEM_429_MAX_RETRIES:
+                        delay = _retry_after_seconds(resp, attempt)
+                        logger.warning(
+                            "IEM ASOS 429 for %s (attempt %d/%d) — backing off %.1fs",
+                            city,
+                            attempt + 1,
+                            _IEM_429_MAX_RETRIES,
+                            delay,
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                    # Retries exhausted on a 429: try the live fallback; if it cannot serve this
+                    # window (a backfill day), FAIL LOUD rather than fabricate an empty label.
+                    logger.warning(
+                        "IEM ASOS still 429 for %s after %d retries; trying AWC fallback",
+                        city,
+                        _IEM_429_MAX_RETRIES,
+                    )
+                    fallback = await _fetch_awc_fallback(station, client, win)
+                    if fallback:
+                        return fallback
+                    raise ObsFetchError(
+                        f"IEM ASOS rate-limited (429) for {city} after "
+                        f"{_IEM_429_MAX_RETRIES} retries and AWC fallback unavailable for "
+                        f"window ending {win.end_utc.isoformat()} — skipping (no empty label)"
+                    )
+                resp.raise_for_status()
+                # A successful response is authoritative — empty rows mean "no obs for this
+                # window" (a real answer), NOT a failure. Only a genuine error falls back.
+                return _parse_iem_csv(resp.text)
+            except (httpx.HTTPError, ValueError) as exc:
+                # Non-429 transport/parse failure: degrade to the live AWC fallback as before
+                # (recovers a live window; a backfill window correctly yields []).
+                logger.warning(
+                    "IEM ASOS fetch failed for %s (%s); trying AWC fallback", city, exc
+                )
+                return await _fetch_awc_fallback(station, client, win)
+        # Unreachable: the loop either returns or raises on every path. Defensive only.
+        raise ObsFetchError(f"IEM ASOS fetch exhausted retries for {city}")
 
 
 async def _fetch_awc_fallback(
@@ -307,9 +365,19 @@ async def asos_lead0_kelvin(
     Reuses the same settlement-window ASOS fetch the daily-high uses, returns the in-window
     reading closest to ``instant`` converted °F → Kelvin (the obs-path °F→K seam). ``None`` when
     no obs cover the window so the caller can skip the probe rather than fabricate a comparison.
+
+    A transient :class:`ObsFetchError` (rate-limited fetch) is treated as "ASOS unavailable" →
+    return ``None`` to SKIP the probe, never let a rate-limit abort the lead-0 GRIB ingest (D-04
+    only fails loud on a *real* sanity breach, not on a missing observation).
     """
     win = settlement_window(get_city(city), target_date)
-    rows = await fetch_asos_obs(city, win, client=client)
+    try:
+        rows = await fetch_asos_obs(city, win, client=client)
+    except ObsFetchError as exc:
+        logger.info(
+            "lead-0 ASOS probe skipped for %s: obs fetch unavailable (%s)", city, exc
+        )
+        return None
     nearest_f: float | None = None
     nearest_gap: float | None = None
     for raw in rows:
@@ -367,7 +435,6 @@ __all__ = [
     "asos_lead0_kelvin",
     "celsius_to_fahrenheit",
     "daily_high",
-    "daily_high_from_obs",
     "fetch_asos_obs",
     "store_daily_high",
 ]

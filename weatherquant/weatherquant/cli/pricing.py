@@ -40,6 +40,7 @@ def _blend_distribution(
     from weatherquant import price as pricing
     from weatherquant.calibrate import link, strata
     from weatherquant.db import queries
+    from weatherquant.ingest.afd import SOURCE as AFD_SOURCE
 
     cap = get_settings().max_position_fraction
     month = target.month
@@ -99,7 +100,7 @@ def _blend_distribution(
     )
 
     afd_rows = queries.latest(
-        bind, "observations", where={"city": city, "target_date": target, "source": "afd"}
+        bind, "observations", where={"city": city, "target_date": target, "source": AFD_SOURCE}
     )
     afd_flag = bool(afd_rows)
 

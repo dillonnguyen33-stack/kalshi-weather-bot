@@ -12,11 +12,12 @@ the namespaced label ``nws`` (D-12; see docs/DECISIONS.md).
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, UTC
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
 
+from weatherquant.db.types import Bind
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.errors import UnitError
 from weatherquant.ingest.sources._client import (
@@ -24,7 +25,7 @@ from weatherquant.ingest.sources._client import (
     managed_client,
     request_with_retry,
 )
-from weatherquant.ingest.writer import Bind, insert_forecast
+from weatherquant.ingest.writer import insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 

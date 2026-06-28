@@ -25,7 +25,7 @@ import email.utils
 import json
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -33,10 +33,10 @@ import websockets
 
 from weatherquant.ingest.errors import CorrectnessError
 from weatherquant.market.book import (
+    _TICKER_KEYS,
     CONTROL_FRAME_TYPES,
     OrderBook,
     SeqGap,
-    _TICKER_KEYS,
     apply,
     parse_dollar_fp_side,
 )

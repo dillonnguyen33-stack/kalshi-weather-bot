@@ -21,6 +21,7 @@ from .ingest import run_ingest
 from .main import main
 from .paper import PAPER_SNAPSHOT_CADENCE_SECONDS, run_paper
 from .pricing import run_price
+from .verify import run_verify
 
 __all__ = [
     "ALL_MODELS",
@@ -31,4 +32,5 @@ __all__ = [
     "run_ingest",
     "run_paper",
     "run_price",
+    "run_verify",
 ]

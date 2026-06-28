@@ -12,10 +12,11 @@ import argparse
 import asyncio
 import logging
 from collections.abc import Mapping
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from weatherquant.db.engine import get_engine, get_settings
+from weatherquant.db.types import Bind
 from weatherquant.market import clv
 from weatherquant.market.auth import KalshiSigner
 from weatherquant.market.client import fetch_snapshot, run_feed
@@ -39,20 +40,12 @@ PAPER_SNAPSHOT_CADENCE_SECONDS = 60
 # is "no edge worth the spread", not a churned micro-order.
 PAPER_MIN_STAKE_FRACTION = 1e-4
 
-# Design-time invariant on the two cadence constants (PAP-04 cadence sufficiency, T-05-20):
-# the TARGET snapshot cadence must stay strictly finer than the CLV closing window so a
-# future feed-driven loop honouring PAPER_SNAPSHOT_CADENCE_SECONDS keeps the window dense.
-# This single-shot command persists ONE snapshot per invocation and runs no cadence loop, so
-# actual window density is the operator's per-invocation responsibility (WR-02) — but the
-# constant relationship still must hold for the loop this targets. Raise (not assert) so the
-# check survives `python -O`/PYTHONOPTIMIZE, mirroring the writer's documented discipline
-# (IN-05).
-if PAPER_SNAPSHOT_CADENCE_SECONDS >= clv.CLV_WINDOW_MINUTES * 60:
-    raise RuntimeError(
-        "PAPER_SNAPSHOT_CADENCE_SECONDS must be strictly finer than the CLV closing window "
-        "(clv.CLV_WINDOW_MINUTES * 60) so a feed-driven cadence loop never leaves the window "
-        "silently sparse (PAP-04, T-05-20)."
-    )
+# PAP-04 cadence-sufficiency invariant (enforced by tests/test_cli.py): the TARGET snapshot
+# cadence must stay strictly finer than the CLV closing window so a feed-driven loop honouring
+# PAPER_SNAPSHOT_CADENCE_SECONDS keeps the window dense. Both are compile-time module constants
+# that cannot drift at runtime, so the relationship is checked once in the suite, not re-asserted
+# on every import of this single-shot command (which runs no cadence loop — window density is the
+# operator's WR-02 responsibility).
 
 
 def _reflection_midpoint_cents(book: object) -> float:
@@ -122,7 +115,7 @@ def _best_price_size(levels: list[Any]) -> int | None:
 
 
 def _process_book(
-    bind: object,
+    bind: Bind,
     *,
     book: object,
     event_time: datetime,
@@ -331,7 +324,7 @@ class _WatchSink:
 
     def __init__(
         self,
-        bind: object,
+        bind: Bind,
         *,
         ticker: str,
         blend: dict[str, Any],
@@ -410,7 +403,7 @@ class _WatchSink:
 
 
 async def _run_watch_loop(
-    bind: object,
+    bind: Bind,
     *,
     ticker: str,
     blend: dict[str, Any],

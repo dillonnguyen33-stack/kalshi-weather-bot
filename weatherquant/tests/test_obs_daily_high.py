@@ -16,11 +16,12 @@ from datetime import UTC, date, datetime, timedelta
 import httpx
 import pytest
 
+from weatherquant.ingest import obs as obs_mod
+from weatherquant.ingest.errors import ObsFetchError
 from weatherquant.ingest.obs import (
     DailyHigh,
     celsius_to_fahrenheit,
     daily_high,
-    daily_high_from_obs,
     fetch_asos_obs,
 )
 from weatherquant.registry import get_city
@@ -28,8 +29,8 @@ from weatherquant.time import settlement_window
 
 
 def test_stub_contract_result_shape():
-    # RED-stub contract: daily_high_from_obs(city, target_date, readings) -> has the attrs.
-    result = daily_high_from_obs(city="NYC", target_date=date(2025, 1, 15), readings=[])
+    # daily_high(readings, city, target_date) -> the DailyHigh result shape, no readings → no label.
+    result = daily_high([], "NYC", date(2025, 1, 15))
     assert hasattr(result, "daily_high_f")
     assert hasattr(result, "obs_count")
     assert isinstance(result, DailyHigh)
@@ -211,6 +212,113 @@ async def test_awc_fallback_skipped_for_historical_backfill_window():
         await client.aclose()
     assert rows == []
     assert calls["awc"] == 0  # gated out before any HTTP call — no wrong-date obs fetched
+
+
+# --- IEM 429 retry/backoff + no-fabricated-empty-label (asos-rate-limit-empty-obs fix) -------
+
+
+@pytest.fixture
+def no_sleep(monkeypatch):
+    """Patch the obs module's asyncio.sleep so backoff retries don't actually wait."""
+
+    async def _instant(_seconds):
+        return None
+
+    monkeypatch.setattr(obs_mod.asyncio, "sleep", _instant)
+
+
+async def test_iem_429_then_success_retries_and_returns_rows(no_sleep):
+    """A 429 on the first attempt is retried with backoff; a subsequent 200 yields the rows."""
+    win = settlement_window(get_city("NYC"), datetime.now(UTC).date())
+    valid = (win.start_utc + timedelta(hours=6)).strftime("%Y-%m-%d %H:%M")
+    state = {"iem": 0, "awc": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mesonet" in request.url.host:
+            state["iem"] += 1
+            if state["iem"] == 1:
+                return httpx.Response(429, headers={"Retry-After": "1"}, text="rate limited")
+            return httpx.Response(200, text=f"station,valid,tmpf\nNYC,{valid},55.0\n")
+        state["awc"] += 1
+        return httpx.Response(200, json=[])
+
+    client = _routing_client(handler)
+    try:
+        rows = await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    assert state["iem"] == 2  # one 429 + one success
+    assert state["awc"] == 0  # success on retry → fallback never touched
+    assert rows == [(datetime.fromisoformat(valid).replace(tzinfo=UTC), 55.0)]
+
+
+async def test_persistent_429_backfill_raises_not_empty_label(no_sleep):
+    """Retries exhausted on a 429 over a backfill window must RAISE, never return [] (no empty row)."""
+    win = settlement_window(get_city("NYC"), date(2025, 1, 15))  # historical → AWC gated out
+    state = {"iem": 0, "awc": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mesonet" in request.url.host:
+            state["iem"] += 1
+            return httpx.Response(429, text="rate limited")
+        state["awc"] += 1
+        return httpx.Response(200, json=[{"temp": 5.0, "reportTime": "2026-06-21T12:00:00Z"}])
+
+    client = _routing_client(handler)
+    try:
+        with pytest.raises(ObsFetchError):
+            await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    # Every attempt 429'd: initial + _IEM_429_MAX_RETRIES retries.
+    assert state["iem"] == obs_mod._IEM_429_MAX_RETRIES + 1
+    assert state["awc"] == 0  # backfill window gates the live fallback out before any HTTP call
+
+
+async def test_persistent_429_live_window_recovers_via_awc(no_sleep):
+    """Retries exhausted on a 429 over a LIVE window recover through the AWC fallback (no raise)."""
+    win = settlement_window(get_city("NYC"), datetime.now(UTC).date())
+    in_window_ts = (win.start_utc + timedelta(hours=2)).isoformat()
+    state = {"awc": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "mesonet" in request.url.host:
+            return httpx.Response(429, text="rate limited")
+        state["awc"] += 1
+        return httpx.Response(200, json=[{"temp": 10.0, "reportTime": in_window_ts}])
+
+    client = _routing_client(handler)
+    try:
+        rows = await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    assert state["awc"] == 1
+    assert rows == [(datetime.fromisoformat(in_window_ts), celsius_to_fahrenheit(10.0))]
+
+
+async def test_retry_after_header_honored_for_backoff(no_sleep, monkeypatch):
+    """The backoff delay honors a numeric Retry-After header (capped)."""
+    delays: list[float] = []
+
+    async def _record(seconds):
+        delays.append(seconds)
+
+    monkeypatch.setattr(obs_mod.asyncio, "sleep", _record)
+    win = settlement_window(get_city("NYC"), datetime.now(UTC).date())
+    state = {"iem": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["iem"] += 1
+        if state["iem"] == 1:
+            return httpx.Response(429, headers={"Retry-After": "7"}, text="rate limited")
+        return httpx.Response(200, text="station,valid,tmpf\n")
+
+    client = _routing_client(handler)
+    try:
+        await fetch_asos_obs("NYC", win, client=client)
+    finally:
+        await client.aclose()
+    assert delays == [7.0]  # the Retry-After value, not the exponential default
 
 
 def test_cli_fixture_parity_window_max(cli_fixture):

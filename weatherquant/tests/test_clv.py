@@ -48,12 +48,51 @@ def test_clv_sign_negative_when_fill_worse_than_close(closing_window_snapshots):
     assert result < 0.0
 
 
-def test_clv_sign_flips_for_sell(closing_window_snapshots):
-    """A SELL at 55¢ vs the 51.4¢ close is POSITIVE (sold dear); the sign flips from buy."""
-    sell = clv.clv_cents(_Fill(55.0), closing_window_snapshots, "sell")
-    buy = clv.clv_cents(_Fill(55.0), closing_window_snapshots, "buy")
-    assert sell == pytest.approx(-buy)
-    assert sell > 0.0
+def test_clv_sell_is_no_denominated_against_the_no_closing_mid(closing_window_snapshots):
+    """WR-02: a 'sell' (a NO-contract buy) is scored NO-denominated against ``100 - yes_mid``.
+
+    A ``side='no'`` fill records ``avg_price_cents`` as the NO contract's OWN price (mirroring
+    ``roi_from_fills``, which buys NO at that price and pays 100c on a NO settlement). Its closing
+    value is the NO closing mid ``100 - closing_yes_mid``, NOT the YES mid. So a NO buy at 30c vs a
+    51.4c YES close (NO close 48.6c) bought the NO CHEAP → POSITIVE CLV of ``48.6 - 30 = 18.6``.
+
+    The OLD code differenced the NO price (30) against the YES mid (51.4) and flipped the sign
+    (``-(51.4 - 30) = -21.4``) — a units mismatch that inflated/deflated the NO CLV by roughly the
+    full 0–100 span and inverted its sign. CLV is a Gate-1 money metric, so the orientation must be
+    correct.
+    """
+    yes_mid = clv.vol_weighted_mid(closing_window_snapshots)  # 51.4¢
+    no_mid = 100.0 - yes_mid  # 48.6¢ — the NO contract's closing value
+    no_buy = clv.clv_cents(_Fill(30.0), closing_window_snapshots, "sell")
+    assert no_buy == pytest.approx(no_mid - 30.0)  # 18.6¢ — bought the NO cheap → positive
+    assert no_buy > 0.0
+
+
+def test_clv_sell_no_buy_above_its_close_is_negative(closing_window_snapshots):
+    """WR-02: a NO buy ABOVE its NO closing mid is NEGATIVE (overpaid for the NO contract)."""
+    yes_mid = clv.vol_weighted_mid(closing_window_snapshots)  # 51.4¢
+    no_mid = 100.0 - yes_mid  # 48.6¢
+    no_buy = clv.clv_cents(_Fill(60.0), closing_window_snapshots, "sell")  # 60 > 48.6 → overpaid
+    assert no_buy == pytest.approx(no_mid - 60.0)  # -11.4¢ — overpaid for the NO → negative
+    assert no_buy < 0.0
+
+
+def test_clv_buy_and_sell_are_symmetric_about_their_own_side_mids(closing_window_snapshots):
+    """WR-02: a YES buy and a NO buy at the SAME numeric price are each scored vs their OWN side mid.
+
+    The buy (YES) edge is ``yes_mid - price``; the sell (NO) edge is ``(100 - yes_mid) - price``.
+    They are NOT negatives of each other (the OLD ``sell == -buy`` identity was the YES-denominated
+    bug) — each contract is valued against its own side's closing mid.
+    """
+    yes_mid = clv.vol_weighted_mid(closing_window_snapshots)  # 51.4¢
+    price = 45.0
+    yes_buy = clv.clv_cents(_Fill(price), closing_window_snapshots, "buy")
+    no_buy = clv.clv_cents(_Fill(price), closing_window_snapshots, "sell")
+    assert yes_buy == pytest.approx(yes_mid - price)
+    assert no_buy == pytest.approx((100.0 - yes_mid) - price)
+    # The two edges sum to (100 - 2*price): a structural identity of two opposite-side buys, NOT
+    # the old sign-flip sell == -buy.
+    assert (yes_buy + no_buy) == pytest.approx(100.0 - 2.0 * price)
 
 
 def test_empty_closing_window_fails_loud():

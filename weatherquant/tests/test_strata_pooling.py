@@ -168,7 +168,9 @@ def test_forecasts_read_requires_full_natural_key(monkeypatch) -> None:
     ``queries.latest`` validation path (no DB access — the ValueError is raised before any
     query executes).
     """
-    from weatherquant.db.models import metadata  # noqa: F401 — ensures tables registered
+    from weatherquant.db.models import (
+        metadata,  # noqa: F401 — ensures tables registered
+    )
 
     with pytest.raises(ValueError, match="missing key column"):
         # Omitting 'member' is exactly the WR-02 ensemble-collapse trap.

@@ -1,6 +1,11 @@
 # Planning docs kept local-only
 .planning/
 
+# Phase-6 Gate-1 report output: reliability/PIT PNGs + GATE1-VERDICT.{json,md} +
+# gate1_preregistration.json are written to a project-relative reports/ dir (D-11). Generated
+# artifacts, never vendored.
+reports/
+
 # cfgrib regenerates a per-file .idx cache sidecar on first open of a GRIB2 file.
 # The vendored *.grib2 fixtures are committed; their .idx caches are recreated on demand
 # and must NOT be vendored (they embed an absolute-path/mtime cache key).

@@ -13,7 +13,12 @@ import logging
 from weatherquant.db.engine import get_engine
 from weatherquant.ingest import orchestrator
 
-from ._args import _resolve_cities, _resolve_cycle_hours, _resolve_models, _resolve_range
+from ._args import (
+    _resolve_cities,
+    _resolve_cycle_hours,
+    _resolve_models,
+    _resolve_range,
+)
 
 logger = logging.getLogger(__name__)
 

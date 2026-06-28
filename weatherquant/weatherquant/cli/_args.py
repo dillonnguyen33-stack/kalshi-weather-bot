@@ -275,6 +275,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="Safety cap in SECONDS bounding the --watch loop so a missing/garbled settlement "
         "boundary cannot run forever (default 14400 = 4h; must be strictly positive).",
     )
+
+    # --- verify: the terminal Gate-1 paired proof + the --monitor drift alarm (D-12 / SYS-02) ----
+    # Mirrors the calibrate/paper selectors (the same _city_type / ALL_MODELS validators reject an
+    # unknown city/model BEFORE any DB read — ASVS V5 / T-06-19). The DEFAULT path runs the Gate-1
+    # verdict (walk-forward → metrics → bootstrap → gate1 → render_reports); --monitor (a flag, not
+    # a subcommand — D-10 discretion) runs the rolling drift monitor and propagates its non-zero
+    # exit (SYS-02 — unlike the count-dict subcommands, main.py returns run_verify's int directly).
+    verify = sub.add_parser(
+        "verify",
+        help="Run the Gate-1 paired proof (verdict PNGs + GATE1-VERDICT.{json,md}) or, with "
+        "--monitor, the rolling reliability-error drift alarm (non-zero exit on a breach).",
+    )
+
+    _add_model_selector(verify, verb="verify")
+    _add_city_selector(verify, verb="verify")
+
+    verify.add_argument(
+        "--start",
+        type=_parse_date,
+        required=True,
+        help="Start of the Gate-1 verdict window (YYYY-MM-DD, inclusive). MANDATORY: the "
+        "verdict must be scored on a frozen, disjoint window (CR-04, D-10/D-12 anti-p-hacking).",
+    )
+    verify.add_argument(
+        "--end",
+        type=_parse_date,
+        required=True,
+        help="End of the Gate-1 verdict window (YYYY-MM-DD, half-open). MANDATORY alongside "
+        "--start; run_verify rejects end<=start before any ledger access (CR-04).",
+    )
+    verify.add_argument(
+        "--lead",
+        type=int,
+        default=0,
+        help="Forecast lead hours for the proof (default 0).",
+    )
+    verify.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Run the rolling reliability-error drift monitor instead of the Gate-1 verdict; "
+        "exits non-zero on a Settings-threshold breach (SYS-02). Off by default.",
+    )
+    verify.add_argument(
+        "--window-days",
+        type=int,
+        default=30,
+        help="Trailing window (days) the --monitor drift alarm scores over (default 30).",
+    )
+    verify.add_argument(
+        "--out-dir",
+        type=str,
+        default="reports",
+        help="Output directory for the Gate-1 PNGs + verdict artifacts (default reports/).",
+    )
     return parser
 
 

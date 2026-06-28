@@ -1,0 +1,83 @@
+"""Paired day-block bootstrap (VER-05): CIs that respect day-pairing.
+
+D-04 (verify subtree-local): the Gate-1 confidence intervals come from a PAIRED DAY-BLOCK
+bootstrap — resample whole DAYS (with replacement), not individual contracts, so the per-day
+correlation structure (many buckets share a day's weather outcome) is preserved and the CI is not
+falsely narrowed. ``paired_day_block_ci`` is deterministic under a fixed ``seed``
+(``np.random.default_rng``) so a verdict is reproducible.
+
+Block = calendar DAY (we resample day-keys with replacement directly), NOT a moving/circular
+block over a time-ordered metric series. This is the locked D-08 reading: the day is the
+independence unit, each resampled day carries BOTH arms' raw per-market records (so the delta is
+always paired on the same markets), and resampling day labels is the simplest design that
+preserves pairing + serial structure. The moving-block bootstrap (Künsch 1989) is the reference
+alternative for intra-window autocorrelation beyond the day — it is explicitly NOT chosen here and
+must not be substituted (it would change the pre-registered CI width, D-08).
+
+The five PRIMARY Gate-1 metrics need no multiplicity correction: D-13 is a *conjunctive* rule (ALL
+five CIs must individually exclude zero), which is conservative by construction (requiring more
+tests to all pass makes the gate harder, not easier — RESEARCH Pattern 7/8).
+
+Pure NumPy + stdlib — no scipy/sklearn (AST-guarded).
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+
+import numpy as np
+from numpy.typing import NDArray
+
+__all__ = ["paired_day_block_ci"]
+
+# Bootstrap defaults: resamples, RNG seed, and the two-sided alpha (95% CI).
+_DEFAULT_N_RESAMPLES = 10_000
+_DEFAULT_SEED = 0
+_DEFAULT_ALPHA = 0.05
+
+
+def paired_day_block_ci(
+    day_keys: Sequence,
+    score_fn: Callable[[NDArray], float],
+    *,
+    n_resamples: int = _DEFAULT_N_RESAMPLES,
+    seed: int = _DEFAULT_SEED,
+    alpha: float = _DEFAULT_ALPHA,
+) -> tuple[float, float, NDArray[np.float64]]:
+    """Paired day-block bootstrap CI for a paired score (VER-05, D-04).
+
+    Resamples ``|unique-days|`` day-keys WITH REPLACEMENT (block = one calendar day) via
+    ``np.random.default_rng(seed)``, calls ``score_fn(sampled_days) -> float`` (the pooled
+    ``wq - v3`` delta over those days), repeats ``n_resamples`` times, and returns
+    ``(ci_lo, ci_hi, deltas)`` at the two-sided ``1 - alpha`` percentiles (2.5 / 97.5 for the
+    default 95% CI).
+
+    Pairing is preserved by the caller's ``score_fn``: each resampled day carries BOTH arms' raw
+    per-market records (the score pools raw records, never pre-averaged per-day deltas), so the
+    delta is always computed on the same markets. Block = day, so the within-day serial-correlation
+    structure (many buckets share a day's weather outcome) is respected and the CI is not falsely
+    narrowed (RESEARCH §Pitfall 2).
+
+    Deterministic under ``seed``: two calls with the same seed return a byte-identical CI, so the
+    Gate-1 verdict is reproducible (the seed is recorded in the pre-registration / verdict).
+
+    Args:
+        day_keys: the settlement-day keys in the test window (duplicates are de-duplicated;
+            ``|unique-days|`` keys are resampled per replicate).
+        score_fn: ``score_fn(sampled_day_keys) -> float`` returning the pooled paired delta for
+            those resampled days.
+        n_resamples: bootstrap replicate count ``R`` (default 10,000).
+        seed: RNG seed for ``np.random.default_rng`` (reproducibility — same seed → same CI).
+        alpha: two-sided miscoverage (default 0.05 → 95% CI).
+
+    Returns:
+        ``(ci_lo, ci_hi, deltas)`` — the percentile CI bounds and the full resample distribution.
+    """
+    rng = np.random.default_rng(seed)
+    uniq = np.asarray(sorted(set(day_keys)))
+    deltas = np.empty(n_resamples, dtype=np.float64)
+    for r in range(n_resamples):
+        sampled = rng.choice(uniq, size=uniq.size, replace=True)
+        deltas[r] = score_fn(sampled)
+    lo, hi = np.percentile(deltas, [100.0 * alpha / 2.0, 100.0 * (1.0 - alpha / 2.0)])
+    return float(lo), float(hi), deltas

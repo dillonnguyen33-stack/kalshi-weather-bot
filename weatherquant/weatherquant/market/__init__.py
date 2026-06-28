@@ -34,8 +34,8 @@ from weatherquant.market.book import OrderBook, SeqGap, apply
 from weatherquant.market.client import fetch_snapshot, run_feed
 from weatherquant.market.clv import (
     CLV_WINDOW_MINUTES,
-    clv_cents,
     closing_window_snapshots,
+    clv_cents,
     vol_weighted_mid,
 )
 from weatherquant.market.persist import latest_snapshots, persist_fill, persist_snapshot

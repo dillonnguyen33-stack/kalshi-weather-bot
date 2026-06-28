@@ -34,6 +34,12 @@ dependencies = [
     # httpx + this one manual signer (RESEARCH State-of-the-Art deprecation note A6).
     "websockets==16.0",
     "cryptography==49.0.0",
+    # Phase-6 reporting edge (D-11): matplotlib renders the Gate-1 reliability/PIT PNGs. Allowed
+    # here because the no-scipy/sklearn AST guard governs the verify METRIC CORE only (metrics/
+    # bootstrap/gate1), NOT report.py — the sole matplotlib importer, kept lazy in the render body.
+    # Pre-audited APPROVED (06-RESEARCH §Package Legitimacy Audit; the SUS verdict is a documented
+    # false positive — ~15yr NumFOCUS lib, already a transitive xarray dep). Exact-pinned (T-06-SC).
+    "matplotlib==3.11.0",
 ]
 
 [project.scripts]

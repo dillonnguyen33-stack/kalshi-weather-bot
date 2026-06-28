@@ -44,8 +44,8 @@ from weatherquant.price.buckets import (
     bucket_probs,
     integers_in_bucket,
 )
-from weatherquant.price.ticker import TICKER_CITY_SUFFIX_TO_KEY, parse_ticker
 from weatherquant.price.fee import FEE_COEFF, exact_fee
+from weatherquant.price.ticker import TICKER_CITY_SUFFIX_TO_KEY, parse_ticker
 from weatherquant.registry import CITIES
 
 # --- Credential gate (no creds -> skip the live half, keep the default-sanity half) --------
