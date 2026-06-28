@@ -8,8 +8,8 @@ scipy/sklearn out of the core while explicitly EXCLUDING this reporting edge.
 
 ``render_reports`` writes per-stratum (per city, NOT just pooled — RESEARCH §Pitfall 4: pooling
 hides per-city errors) reliability + PIT-histogram PNGs and the ``GATE1-VERDICT.{json,md}`` (the
-five pooled CIs + PASS/FAIL up top, the per-stratum secondaries below, the RNG seed, the test
-window/lead, and excluded-day coverage — fragility made visible, RESEARCH §State of the Art) plus
+five pooled CIs + PASS/FAIL up top, the RNG seed, the test window/lead, and excluded-day coverage
+— fragility made visible, RESEARCH §State of the Art) plus
 the frozen pre-registration into a project-relative, gitignored ``reports/`` dir. The MD mirror
 carries the D-03 v3-exclusion note (RESEARCH §Pitfall 6). Output filenames are built from VALIDATED
 city codes only (V12 path-safety) — no untrusted path segment is interpolated into a path.
@@ -66,9 +66,9 @@ def render_reports(
     this writes ``reliability_<city>.png`` (equal-width predicted-prob bins on ``[0, 1]`` vs observed
     YES frequency, the 45° reference line + a bin-count histogram beneath) and ``pit_<city>.png``
     (the PIT histogram — flat = calibrated). It then writes ``GATE1-VERDICT.json`` (the five pooled
-    CIs + PASS/FAIL + per-stratum secondaries + RNG seed + test window/lead + excluded-day coverage)
-    and its human-readable ``GATE1-VERDICT.md`` mirror (pooled PASS/FAIL up top, secondaries below,
-    coverage logged, the D-03 v3-exclusion note), plus the frozen ``gate1_preregistration.json`` if a
+    CIs + PASS/FAIL + RNG seed + test window/lead + excluded-day coverage) and its human-readable
+    ``GATE1-VERDICT.md`` mirror (pooled PASS/FAIL up top, coverage logged, the D-03 v3-exclusion
+    note), plus the frozen ``gate1_preregistration.json`` if a
     pre-registration spec rides on the verdict. Returns a mapping of artifact name → written path.
 
     Filenames are built from validated city codes ONLY (V12 path-safety): an unsafe code fails loud
@@ -126,7 +126,7 @@ def render_reports(
         _render_pit(plt, np, np.asarray(pooled_pit), "pooled", pooled_pit_path)
         written["pit_pooled"] = str(pooled_pit_path)
 
-    # --- Verdict artifacts (fragility visible: pooled PASS/FAIL up top, secondaries below) -----
+    # --- Verdict artifacts (fragility visible: pooled PASS/FAIL up top, coverage logged) --------
     passed = bool(verdict.get("passed")) if isinstance(verdict, dict) else bool(verdict)
     cis_payload = {k: list(cis[k]) for k in cis}
     payload: dict[str, Any] = {
@@ -135,11 +135,11 @@ def render_reports(
         "seed": int(seed),
         "excluded_days": list(coverage),
     }
-    # Carry through the optional provenance the caller front-loads onto the verdict (window/lead/
-    # secondaries) so the JSON is self-describing — without inventing keys the caller did not pass.
+    # Carry through the optional provenance the caller front-loads onto the verdict (window/lead) so
+    # the JSON is self-describing — without inventing keys the caller did not pass.
     if isinstance(verdict, dict):
         for key in (
-            "test_window", "oos_slice", "primary_lead", "secondaries",
+            "test_window", "oos_slice", "primary_lead",
             "not_scored", "roi_clv_caveat", "preregistration",
         ):
             if key in verdict:
@@ -238,7 +238,7 @@ def _render_pit(plt, np, pit, city: str, path: Path) -> None:
 
 
 def _render_verdict_md(payload: dict[str, Any]) -> str:
-    """Human-readable verdict mirror: pooled PASS/FAIL up top, secondaries below, coverage logged."""
+    """Human-readable verdict mirror: pooled PASS/FAIL up top, coverage logged."""
     verdict_word = "PASS" if payload["passed"] else "FAIL"
     lines = [
         "# Gate-1 Verdict",
@@ -272,11 +272,6 @@ def _render_verdict_md(payload: dict[str, Any]) -> str:
         lines.append(f"- Test window: `{payload['test_window']}`")
     if payload.get("oos_slice") is not None:
         lines.append(f"- Phase-3 OOS slice (disjoint, CR-04): `{payload['oos_slice']}`")
-
-    secondaries = payload.get("secondaries")
-    if secondaries:
-        lines += ["", "## Per-stratum secondaries (Holm-adjusted)", "", "```json",
-                   json.dumps(secondaries, indent=2, sort_keys=True, default=str), "```"]
 
     excluded = payload.get("excluded_days", [])
     lines += [

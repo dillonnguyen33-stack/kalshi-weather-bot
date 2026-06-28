@@ -1,15 +1,14 @@
-"""Gate-1 metric core (VER-01): Brier (+ Murphy decomposition), ECE, PIT, CRPS, ROI, CLV.
+"""Gate-1 metric core (VER-01): Brier, ECE, CRPS, ROI, CLV.
 
 D-07 (verify subtree-local): the proof metrics are hand-rolled NumPy + stdlib — no scipy/sklearn
 (fenced by ``tests/test_no_forbidden_verify_deps.py``). The Gaussian CRPS and the erf-based normal
 CDF are REUSED from :mod:`weatherquant.calibrate.crps` (the one source of truth, D-04) — never
 re-derived here — so ``crps_blend`` agrees with the calibration core by construction.
 
-D-06 (verify subtree-local): one scalar per Gate-1 metric. Two distinct binning schemes live here
-and MUST stay distinct (RESEARCH §Pitfall 4): the Murphy reliability/resolution split uses
-EQUAL-WIDTH bins (the reliability-diagram x-axis grid), while the ECE *scalar* uses EQUAL-COUNT
+D-06 (verify subtree-local): one scalar per Gate-1 metric. The ECE *scalar* uses EQUAL-COUNT
 (equal-mass) bins so sparse high-confidence regions are weighted by their actual population, not
-their (empty) width.
+their (empty) width — kept distinct from the EQUAL-WIDTH reliability-diagram grid in ``report.py``
+(RESEARCH §Pitfall 4).
 
 D-01 (verify subtree-local): pure-NumPy metric core — fail-loud at every cents/probability/dollars
 boundary (RESEARCH §Pitfall 3): probabilities ∈ [0, 1], σ > 0, prices ∈ [0, 100] cents. Never
@@ -27,20 +26,18 @@ from numpy.typing import NDArray
 # D-04 single source of truth: reuse the one closed-form Gaussian CRPS + erf-based CDF rather than
 # re-deriving them here (re-deriving would change the weatherquant arm and void the pre-registered
 # comparison — RESEARCH §Don't Hand-Roll).
-from weatherquant.calibrate.crps import crps_norm, normal_cdf
+from weatherquant.calibrate.crps import crps_norm
 from weatherquant.market.clv import clv_cents
 
 __all__ = [
     "brier",
-    "brier_murphy",
     "ece_equal_count",
-    "pit_values",
     "crps_blend",
     "roi_from_fills",
     "mean_clv",
 ]
 
-# Default bin count for the Murphy decomposition / equal-count ECE (overridable per call).
+# Default bin count for the equal-count ECE (overridable per call).
 _DEFAULT_N_BINS = 10
 
 
@@ -74,47 +71,6 @@ def brier(f: NDArray[np.float64], o: NDArray[np.float64]) -> float:
     return float(np.mean((f - o) ** 2))
 
 
-def brier_murphy(
-    f: NDArray[np.float64], o: NDArray[np.float64], n_bins: int = _DEFAULT_N_BINS
-) -> dict[str, float]:
-    """Murphy 3-component decomposition of the Brier score (VER-01, D-06).
-
-    Returns ``{"reliability", "resolution", "uncertainty"}`` with ``n_bins`` EQUAL-WIDTH bins over
-    ``f`` (the reliability-diagram grid, kept distinct from the equal-count ECE scalar). In the
-    bin-mean form the identity ``reliability - resolution + uncertainty == binned Brier`` holds
-    exactly (RESEARCH Pattern 2); against the raw mean Brier it agrees within a small within-bin
-    residual. ``reliability`` ↓ better (calibration), ``resolution`` ↑ better (discrimination),
-    ``uncertainty`` = base-rate variance ``ō·(1 - ō)``.
-    """
-    f = np.asarray(f, dtype=np.float64)
-    o = np.asarray(o, dtype=np.float64)
-    _require_prob_array("brier_murphy f", f)
-    _require_binary("brier_murphy o", o)
-
-    n = len(f)
-    # Equal-WIDTH bins on [0, 1] (the reliability-diagram x-axis — D-06 / RESEARCH §Pitfall 4):
-    # interior edges only, so f == 1.0 lands in the last bin rather than overflowing.
-    edges = np.linspace(0.0, 1.0, n_bins + 1)
-    idx = np.clip(np.digitize(f, edges[1:-1]), 0, n_bins - 1)
-    o_bar = float(o.mean())
-    rel = 0.0
-    res = 0.0
-    for k in range(n_bins):
-        m = idx == k
-        n_k = int(m.sum())
-        if n_k == 0:
-            continue
-        f_k = float(f[m].mean())
-        o_k = float(o[m].mean())
-        rel += n_k * (f_k - o_k) ** 2
-        res += n_k * (o_k - o_bar) ** 2
-    return {
-        "reliability": rel / n,
-        "resolution": res / n,
-        "uncertainty": float(o_bar * (1.0 - o_bar)),
-    }
-
-
 def ece_equal_count(
     f: NDArray[np.float64], o: NDArray[np.float64], n_bins: int = _DEFAULT_N_BINS
 ) -> float:
@@ -144,23 +100,6 @@ def ece_equal_count(
         acc = float(o_sorted[b].mean())
         ece += (b.size / n) * abs(acc - conf)
     return float(ece)
-
-
-def pit_values(
-    y: NDArray[np.float64], mu: NDArray[np.float64], sigma: NDArray[np.float64]
-) -> NDArray[np.float64]:
-    """Probability Integral Transform values ``Phi((y - mu)/sigma)`` (VER-01).
-
-    Reuses the erf-based ``normal_cdf`` (D-04, the SAME Φ the weatherquant arm prices with) — never
-    a re-derived CDF. For a correctly specified Gaussian forecast the PIT sample is ~Uniform(0, 1)
-    (a flat histogram); U-shaped = overdispersed, dome = overconfident. Guards ``sigma > 0`` (D-01).
-    """
-    y = np.asarray(y, dtype=np.float64)
-    mu = np.asarray(mu, dtype=np.float64)
-    sigma = np.asarray(sigma, dtype=np.float64)
-    if not np.all(np.isfinite(sigma)) or np.any(sigma <= 0.0):
-        raise ValueError("pit_values sigma must be finite and > 0 elementwise.")
-    return np.asarray(normal_cdf((y - mu) / sigma), dtype=np.float64)
 
 
 def crps_blend(

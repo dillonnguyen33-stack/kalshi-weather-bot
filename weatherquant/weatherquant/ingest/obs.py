@@ -14,14 +14,15 @@ import asyncio
 import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, cast
 
 import httpx
 
+from weatherquant.db.types import Bind
 from weatherquant.ingest.errors import ObsFetchError
 from weatherquant.ingest.sources._client import KELVIN_OFFSET, managed_client
-from weatherquant.ingest.writer import Bind, insert_observation
+from weatherquant.ingest.writer import insert_observation
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, coerce_utc, parse_utc, settlement_window
 
@@ -184,16 +185,6 @@ def daily_high(
         cli_disagreement=disagreement,
         cli_max_f=cli_max_f,
     )
-
-
-def daily_high_from_obs(
-    city: str,
-    target_date: date,
-    readings: Iterable[object],
-    cli_max_f: float | None = None,
-) -> DailyHigh:
-    """Arg-reordered alias of :func:`daily_high` matching the 02-01 RED-stub ``(city, target_date, readings)``."""
-    return daily_high(readings, city, target_date, cli_max_f=cli_max_f)
 
 
 def _parse_iem_csv(body: str) -> list[tuple[datetime, float]]:
@@ -444,7 +435,6 @@ __all__ = [
     "asos_lead0_kelvin",
     "celsius_to_fahrenheit",
     "daily_high",
-    "daily_high_from_obs",
     "fetch_asos_obs",
     "store_daily_high",
 ]
