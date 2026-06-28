@@ -13,7 +13,7 @@ branch — those v3 paths are excluded from the apples-to-apples Gate-1 comparis
 deliberately no ``obs`` argument in any signature here.
 
 ``math`` only for the numerics; ``parse_ticker`` / ``integers_in_bucket`` are reused for shared
-bucket geometry (never re-implemented). Bodies land Wave 2; ``tests/test_v3_reference.py`` (RED).
+bucket geometry (never re-implemented).
 """
 
 from __future__ import annotations

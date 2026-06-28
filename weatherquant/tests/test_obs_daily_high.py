@@ -22,7 +22,6 @@ from weatherquant.ingest.obs import (
     DailyHigh,
     celsius_to_fahrenheit,
     daily_high,
-    daily_high_from_obs,
     fetch_asos_obs,
 )
 from weatherquant.registry import get_city
@@ -30,8 +29,8 @@ from weatherquant.time import settlement_window
 
 
 def test_stub_contract_result_shape():
-    # RED-stub contract: daily_high_from_obs(city, target_date, readings) -> has the attrs.
-    result = daily_high_from_obs(city="NYC", target_date=date(2025, 1, 15), readings=[])
+    # daily_high(readings, city, target_date) -> the DailyHigh result shape, no readings → no label.
+    result = daily_high([], "NYC", date(2025, 1, 15))
     assert hasattr(result, "daily_high_f")
     assert hasattr(result, "obs_count")
     assert isinstance(result, DailyHigh)

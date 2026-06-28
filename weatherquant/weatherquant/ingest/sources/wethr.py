@@ -11,18 +11,19 @@ is read from ``Settings`` (redacted, never logged) and sent only to the fixed en
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, UTC
+from datetime import UTC, date, datetime
 
 import httpx
 
 from weatherquant.db.engine import get_settings
+from weatherquant.db.types import Bind
 from weatherquant.ingest.available_at import available_at
 from weatherquant.ingest.sources._client import (
     KELVIN_OFFSET,
     managed_client,
     request_with_retry,
 )
-from weatherquant.ingest.writer import Bind, insert_forecast
+from weatherquant.ingest.writer import insert_forecast
 from weatherquant.registry import get_city
 from weatherquant.time import SettlementWindow, parse_utc, settlement_window
 

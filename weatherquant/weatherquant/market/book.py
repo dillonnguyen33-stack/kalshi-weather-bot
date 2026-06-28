@@ -29,7 +29,7 @@ coerced into a fabricated level. The ticker key is ``market_ticker`` / ``market_
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 from typing import Any
 
 from weatherquant.ingest.errors import CorrectnessError

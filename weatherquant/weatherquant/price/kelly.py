@@ -22,9 +22,15 @@ from __future__ import annotations
 
 import math
 
-from weatherquant.db.engine import DEFAULT_POSITION_FRACTION  # single source for the cap default (WR-A1)
-from weatherquant.price.ev import _require_prob  # one prob/price validator for the whole money path
-from weatherquant.price.fee import exact_fee  # fee-aware Kelly reuses the exact integer-cent fee
+from weatherquant.db.engine import (
+    DEFAULT_POSITION_FRACTION,  # single source for the cap default (WR-A1)
+)
+from weatherquant.price.ev import (
+    _require_prob,  # one prob/price validator for the whole money path
+)
+from weatherquant.price.fee import (
+    exact_fee,  # fee-aware Kelly reuses the exact integer-cent fee
+)
 
 __all__ = [
     "AFD_HAIRCUT",

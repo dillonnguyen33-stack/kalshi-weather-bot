@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 import types
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 import pytest
 

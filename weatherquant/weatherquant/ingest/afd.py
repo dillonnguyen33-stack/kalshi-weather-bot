@@ -12,15 +12,16 @@ docs/DECISIONS.md).
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, UTC
+from datetime import UTC, date, datetime
 from typing import Any
 
 import httpx
 
 from weatherquant.db.engine import get_settings
+from weatherquant.db.types import Bind
 from weatherquant.ingest.errors import AvailabilityError
 from weatherquant.ingest.sources._client import managed_client
-from weatherquant.ingest.writer import Bind, insert_observation
+from weatherquant.ingest.writer import insert_observation
 from weatherquant.registry import CITIES
 
 logger = logging.getLogger(__name__)

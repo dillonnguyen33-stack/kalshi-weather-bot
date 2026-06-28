@@ -26,10 +26,14 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from weatherquant import cli
-from weatherquant.market import clv
-from weatherquant.registry import get_city
-from weatherquant.time import settlement_window
+from tests.test_cli import (
+    _PAPER_DATE,
+    _PAPER_TICKER,
+    _cal_row,
+    _forecast_rows,
+    _paper_args,
+    _patch_paper,
+)
 
 # Reuse the verified mock-WS harness + enveloped builders rather than re-deriving them — the
 # watch loop consumes run_feed exactly as test_market_client.py exercises it.
@@ -39,14 +43,10 @@ from tests.test_market_client import (
     _ws_delta,
     _ws_snapshot,
 )
-from tests.test_cli import (
-    _PAPER_DATE,
-    _PAPER_TICKER,
-    _cal_row,
-    _forecast_rows,
-    _paper_args,
-    _patch_paper,
-)
+from weatherquant import cli
+from weatherquant.market import clv
+from weatherquant.registry import get_city
+from weatherquant.time import settlement_window
 
 # These tests call the SYNC ``run_paper`` (which runs its own ``asyncio.run`` for the watch
 # loop) — so they are NOT asyncio tests; an outer running loop would clash with that inner

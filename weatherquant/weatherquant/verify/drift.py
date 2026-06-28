@@ -19,7 +19,7 @@ ledger-backed breach/clear cases are ``integration``-marked).
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 

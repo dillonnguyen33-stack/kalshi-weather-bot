@@ -18,12 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, UTC
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-
-from collections.abc import Awaitable, Callable
 
 from weatherquant.db.engine import get_engine
 from weatherquant.ingest import orchestrator

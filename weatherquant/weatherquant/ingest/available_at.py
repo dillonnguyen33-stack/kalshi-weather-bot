@@ -11,7 +11,7 @@ feed's own report time (see docs/DECISIONS.md).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, UTC
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 # Per-model publish latency after cycle init (RESEARCH Pitfall 5). Each value is

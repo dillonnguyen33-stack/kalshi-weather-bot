@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
 from weatherquant.db.engine import get_engine
 
