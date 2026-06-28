@@ -365,8 +365,12 @@ def _surviving_jja_pair_count(D: date) -> int:
     return sum(1 for d in jja if settlement_window(city, d).end_utc < cutoff)
 
 
-def _seed_two_season_ledger(conn):
+def _seed_two_season_ledger(conn, member_offsets=(-2.0, 0.0, 2.0)):
     """Seed NYC/hrrr forecasts+observations on the PRODUCTION no-look-ahead path (GAP 3 / VER-03).
+
+    ``member_offsets`` sets each day's ensemble members as ``base_f + offset``; the default
+    ``(-2, 0, +2)`` gives the s2=8/3 JJA ensemble. Pass a single offset (e.g. ``(0.0,)``) for a
+    DETERMINISTIC single-member ensemble (s2=0) — the CR-1 floor regression.
 
     Decision-day settled obs are stamped at ``settlement_window(get_city("NYC"), D).end_utc`` (the
     realistic LST settlement instant on/after D), NOT back-dated to 2026-01-01. Forecasts are
@@ -387,7 +391,7 @@ def _seed_two_season_ledger(conn):
     def _seed_month(year: int, month: int, base_f: float, n_days: int):
         for i in range(n_days):
             d = date(year, month, 1 + i)
-            members_f = [base_f - 2.0, base_f, base_f + 2.0]  # 3 members → s2 = 8/3 > 0
+            members_f = [base_f + off for off in member_offsets]  # default {-2,0,+2} → s2 = 8/3
             cycle = datetime(d.year, d.month, d.day, 0, tzinfo=timezone.utc)
             # Forecasts: stamped at D-2d 00:00 UTC — STRICTLY before the D-1d 00:00 UTC cutoff so the
             # decision day's own forecast is NOT dropped (the cycle field stays d 00:00 UTC).
@@ -484,6 +488,35 @@ def test_v3_arm_priced_from_raw_ensemble_spread_not_wq_sigma(pg_conn):
     # CR-05: v3 spread is the raw month-filtered ensemble sqrt(mean s2), independent of wq_sigma.
     assert all(s == pytest.approx(expected_v3_sigma, abs=1e-3) for s in v3_sigmas)
     assert v3_sigmas.isdisjoint(wq_sigmas)  # the two arms' spreads are genuinely different
+
+
+@pytest.mark.integration
+def test_v3_deterministic_ensemble_floors_sigma_so_crps_never_crashes(pg_conn):
+    """CR-1: a single-member (deterministic) ensemble has s2==0 → sqrt(s2)==0. The per-record v3
+    spread MUST be floored (``_V3_SPREAD_FLOOR``) at the record source, because the CRPS arm
+    (``crps_blend``) raises on ``sigma<=0`` with no fallback — an un-floored 0 would abort the whole
+    Gate-1 verdict inside the bootstrap resample loop. Before the fix every scored record carried
+    ``v3_sigma==0.0`` and ``_crps_score_fn`` raised.
+    """
+    from weatherquant.cli.verify import _crps_score_fn
+    from weatherquant.verify import backtest, metrics
+    from weatherquant.verify.v3_reference import _V3_SPREAD_FLOOR
+
+    _seed_two_season_ledger(pg_conn, member_offsets=(0.0,))  # 1 member → s2 = 0 everywhere
+    records, _coverage = backtest.walk_forward(
+        pg_conn, "KXHIGHNY", "hrrr", lead=0,
+        start=_GATE1_START, end=_GATE1_END,
+        oos_slice=(date(2025, 1, 1), date(2025, 6, 1)),
+    )
+    scored = [r for r in records if r.excluded_reason is None]
+    assert scored
+    v3_sigmas = [r.v3_sigma for r in scored if r.v3_sigma is not None]
+    assert v3_sigmas
+    # Floored to the v3 floor, NOT the un-floored 0.0 that would crash crps_blend.
+    assert all(s == pytest.approx(_V3_SPREAD_FLOOR) for s in v3_sigmas)
+    # The REAL scoring path must not raise on the deterministic ensemble (the actual crash site).
+    score_fn = _crps_score_fn(scored, metrics)
+    score_fn(sorted({r.day for r in scored}))
 
 
 @pytest.mark.integration

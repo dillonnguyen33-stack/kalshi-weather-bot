@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, UTC
+from datetime import UTC, date, datetime, timedelta
 
 import numpy as np
 import sqlalchemy as sa
@@ -46,6 +46,7 @@ from weatherquant.calibrate.link import predict
 from weatherquant.calibrate.strata import (
     OBS_SOURCE,
     SIGMA_FLOOR_F,
+    TrainingPair,
     assemble_pairs_from_rows,
     fit_pooled_month_strata,
 )
@@ -55,7 +56,7 @@ from weatherquant.price.blend import accuracy_weights, blend_gaussians
 from weatherquant.price.buckets import bucket_probs, integers_in_bucket
 from weatherquant.price.ticker import TICKER_CITY_SUFFIX_TO_KEY, parse_ticker
 from weatherquant.registry import get_city
-from weatherquant.verify.v3_reference import v3_bucket_probs
+from weatherquant.verify.v3_reference import _V3_SPREAD_FLOOR, v3_bucket_probs
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ def _outcome_for_bucket(
     return 1 if (lo_edge <= y < hi_edge) else 0
 
 
-def _point_in_time_bias(pairs) -> float:
+def _point_in_time_bias(pairs: list[TrainingPair]) -> float:
     """v3 point-in-time bias ``mean(y - m)`` over the as-of training pairs (D-02/A4, leak-safe).
 
     Mirrors v3's ``derive_bias`` intent (``bias = mean(settled - corrected_mean)``) but measured
@@ -205,7 +206,7 @@ def _point_in_time_bias(pairs) -> float:
     return float(residuals.mean())
 
 
-def _point_in_time_bias_for_month(pairs, month: int) -> float:
+def _point_in_time_bias_for_month(pairs: list[TrainingPair], month: int) -> float:
     """v3 point-in-time bias for the DECISION MONTH only (WR-01 — mirror the mean's month filter).
 
     The v3 mean is restricted to the decision day's month (``_v3_arm_raw_ensemble(..., month=...)``)
@@ -221,7 +222,7 @@ def _point_in_time_bias_for_month(pairs, month: int) -> float:
     return _point_in_time_bias([p for p in pairs if p.month == month])
 
 
-def _v3_arm_raw_ensemble(pairs, day: date, month: int) -> tuple[float, float] | None:
+def _v3_arm_raw_ensemble(pairs: list[TrainingPair], day: date, month: int) -> tuple[float, float] | None:
     """The RAW decision-month ensemble pair ``(m_asof, s2_asof)`` for the v3 arm (CR-02-for-v3/D-02).
 
     verify-subtree D-02 (raw-ensemble v3): the v3 baseline must be priced from the SAME ledger
@@ -249,7 +250,8 @@ def _v3_arm_raw_ensemble(pairs, day: date, month: int) -> tuple[float, float] | 
     coverage-logs ``no_v3_ensemble``, mirroring the WQ arm's ``None`` contract in
     :func:`_blend_arm_for_day`). The v3 spread floor ``max(spread, 0.5)`` is applied INSIDE
     ``v3_bucket_probs`` (the legacy contract), so this returns the un-floored raw ``s2``; the
-    caller takes ``sqrt(s2)`` as the v3 spread.
+    caller takes ``sqrt(s2)`` and floors it with the same ``_V3_SPREAD_FLOOR`` (CR-1) so the CRPS
+    arm never sees a zero sigma.
     """
     month_pairs = [p for p in pairs if p.month == month]
     if not month_pairs:
@@ -264,7 +266,9 @@ def _v3_arm_raw_ensemble(pairs, day: date, month: int) -> tuple[float, float] | 
     return m_asof, s2_asof
 
 
-def _blend_arm_for_day(pairs, *, city_key: str, model: str, lead: int, month: int):
+def _blend_arm_for_day(
+    pairs: list[TrainingPair], *, city_key: str, model: str, lead: int, month: int
+) -> tuple[float, float] | None:
     """Refit EMOS and return the DECISION DAY'S month-fit WQ blend ``(mu_b, sigma_b)`` (D-04/CR-02).
 
     PURE REUSE (no new calibration math, verify-subtree D-04): ``fit_pooled_month_strata`` (the
@@ -338,7 +342,7 @@ def walk_forward(
     start: date | None,
     end: date | None,
     oos_slice: tuple[date, date] | None,
-):
+) -> tuple[list[PairedRecord], list[dict[str, object]]]:
     """Replay the ledger as-of-correctly and assemble paired WQ-vs-v3 records (VER-03, D-08).
 
     For each LST settlement day D in ``[start, end)`` (or every ledger-present obs day when the
@@ -425,8 +429,8 @@ def walk_forward(
         # (m_asof, sqrt(s2_asof)) plus the point-in-time bias — INDEPENDENT of WQ's EMOS mu_b /
         # Vincentized sigma_b — so methodology is the only difference (VER-04). day.month is passed
         # (matching the WQ arm's _blend_arm_for_day(..., month=day.month)) so the v3 mean is the
-        # decision month's seasonal subset, never the cross-season midpoint. The v3 spread floor
-        # max(spread, 0.5) is applied inside v3_bucket_probs; do NOT pre-floor with SIGMA_FLOOR_F.
+        # decision month's seasonal subset, never the cross-season midpoint. The v3 spread is
+        # floored with the legacy v3 floor (_V3_SPREAD_FLOOR=0.5), NOT the WQ SIGMA_FLOOR_F.
         v3_ensemble = _v3_arm_raw_ensemble(pairs, day, month=day.month)
         if v3_ensemble is None:
             # CR-02-for-v3/D-09: the decision month has no v3 ensemble — coverage-log it and skip
@@ -440,7 +444,12 @@ def walk_forward(
         # mean removed (so methodology stays the only WQ-vs-v3 difference, VER-04).
         bias = _point_in_time_bias_for_month(pairs, day.month)
         v3_mu = m_asof + bias
-        v3_sigma = float(np.sqrt(s2_asof))
+        # CR-1: floor the v3 spread with the legacy v3 floor (0.5°F) at the record source. A
+        # single-member deterministic ensemble has s2==0 → sqrt==0; the CRPS arm (crps_blend) raises
+        # on sigma<=0 with no fallback, which would abort the whole Gate-1 verdict inside the
+        # bootstrap. v3_bucket_probs floors internally too, so this pre-floor is idempotent there but
+        # is the ONLY floor the CRPS record param ever gets.
+        v3_sigma = max(float(np.sqrt(s2_asof)), _V3_SPREAD_FLOOR)
         # The shared continuous spans (lo_edge, hi_edge, open_lo, open_hi) — the ONE geometry both
         # arms price; never re-derived per arm (VER-04 — methodology is the only difference).
         wq_ladder = [b["span"] for b in ladder]
