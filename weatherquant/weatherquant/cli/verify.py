@@ -429,6 +429,21 @@ def _roi_clv_cis(bind, city, model, start, end, metrics):
         )
         return (_NOT_SCORED_CI, _NOT_SCORED_CI), True
 
+    # WR-1 (the WR-03 twin, same fail-closed rule): a fill can deploy positive capital yet have an
+    # EMPTY closing window (clv.closing_window_snapshots may return [] — no persisted snapshot in the
+    # final CLV minutes). mean_clv → clv_cents → vol_weighted_mid([]) raises INSIDE the bootstrap
+    # resample loop, which would abort the entire Gate-1 verdict. The money gate must DECLINE to
+    # score (pinned not_scored sentinel), never crash, so an empty closing window maps ROI/CLV to
+    # not_scored for the whole window.
+    if any(len(snaps) == 0 for snaps in snaps_per_fill):
+        logger.info(
+            "verify: a window fill for %s has an empty closing window (no closing-mid snapshot) — "
+            "ROI/CLV NOT SCORED (pinned %s, FAIL); cannot derive a closing mid, and the money gate "
+            "fails closed rather than crashing the bootstrap (WR-1).",
+            city, _NOT_SCORED_CI,
+        )
+        return (_NOT_SCORED_CI, _NOT_SCORED_CI), True
+
     settle_city = get_city(city_key)
     by_lst_day: dict = {}
     for fill, syes, cfill, snaps, side in zip(
@@ -533,7 +548,7 @@ def _fill_in_window(fill, city_key, start, end) -> bool:
     if event_time is None:
         return False
     d = _lst_settlement_day(event_time, get_city(city_key))
-    return start <= d < end
+    return bool(start <= d < end)
 
 
 def _settle_window_fills(bind, window_fills, city_key):
@@ -548,6 +563,7 @@ def _settle_window_fills(bind, window_fills, city_key):
     ``price``); ``snaps_per_fill[i]`` the closing-window snapshots; ``sides[i]`` the fill side. Fails
     loud (RESEARCH Code Example 2) on a malformed fill.
     """
+    from weatherquant.calibrate.strata import OBS_SOURCE
     from weatherquant.db import queries
     from weatherquant.market import clv as clv_mod
     from weatherquant.price.buckets import integers_in_bucket
@@ -570,7 +586,7 @@ def _settle_window_fills(bind, window_fills, city_key):
         lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
         obs = queries.latest(
             bind, "observations",
-            where={"city": city_key, "target_date": day, "source": "asos"},
+            where={"city": city_key, "target_date": day, "source": OBS_SOURCE},
         )
         y = next((row["daily_high_f"] for row in obs if row["daily_high_f"] is not None), None)
         if y is None:

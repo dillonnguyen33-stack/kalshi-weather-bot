@@ -1061,7 +1061,7 @@ def test_crps_score_fn_fails_loud_without_predictive_params():
 # scoring path (fills/closing-snapshots ROI/CLV + the tail-day coverage) was never exercised
 # end-to-end. THESE seeded tests are the standing proof — a green unit suite alone is NOT evidence.
 
-from datetime import datetime as _dt, timezone as _tz, timedelta as _td  # noqa: E402
+from datetime import datetime as _dt, timedelta as _td, timezone as _tz  # noqa: E402
 
 _VER_F_TO_K = lambda f: (f - 32.0) * 5.0 / 9.0 + 273.15  # noqa: E731 - test-only inverse K→°F seam
 
@@ -1147,7 +1147,7 @@ def _seed_verdict_ledger(conn, *, tail_high: bool):
     return ticker, fill_day, 40.0, closing_mid_cents
 
 
-def _seed_multiday_fills(conn, *, fills_spec, ticker="KXHIGHNY-85-86"):
+def _seed_multiday_fills(conn, *, fills_spec, ticker="KXHIGHNY-85-86", snapless_lst_days=frozenset()):
     """Seed forecasts/observations for July + one fill per spec entry on its own LST settlement day.
 
     ``fills_spec`` is a list of ``(event_time_utc, side, avg_price_cents)`` tuples. The default
@@ -1180,7 +1180,8 @@ def _seed_multiday_fills(conn, *, fills_spec, ticker="KXHIGHNY-85-86"):
         # LST settlement day = (event_time + offset).date() (offset = -5h for NYC) — the WR-04 key.
         lst_day = (event_time + _td(hours=city.std_offset_hours)).date()
         lst_days.append(lst_day)
-        if lst_day not in seeded_snap_days:
+        # ``snapless_lst_days`` leaves a day's closing window EMPTY (no snapshot) — the WR-1 case.
+        if lst_day not in seeded_snap_days and lst_day not in snapless_lst_days:
             win = settlement_window(city, lst_day)
             t_in = win.end_utc - _td(minutes=CLV_WINDOW_MINUTES - 5)
             insert_market_snapshot(
@@ -1282,6 +1283,36 @@ def test_verdict_zero_capital_fill_fails_closed_not_mid_bootstrap_crash(pg_conn)
         pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
     )
     assert not_scored is True, "a zero-capital fill window must fail closed → not_scored (WR-03)"
+    assert roi_ci == (0.0, 0.0) == clv_ci
+
+
+@pytest.mark.integration
+def test_verdict_empty_closing_window_fails_closed_not_mid_bootstrap_crash(pg_conn):
+    """WR-1 (the WR-03 twin): a positive-capital fill whose closing window has NO snapshot fails
+    CLOSED, never crashes. ``mean_clv`` → ``clv_cents`` → ``vol_weighted_mid([])`` raises on an empty
+    closing window; inside the day-block bootstrap that raise would PROPAGATE out of
+    ``paired_day_block_ci`` and abort the entire Gate-1 verdict. The WR-03 capital guard does not
+    cover this (capital is positive), so ``_roi_clv_cis`` must map ROI/CLV to the pinned not_scored
+    sentinel and return cleanly — NEVER raise.
+    """
+    from weatherquant.cli import verify as verify_mod
+    from weatherquant.verify import metrics
+
+    # Two distinct LST days, both positive capital (clears WR-03 + the distinct-day floor), but the
+    # 2026-07-09 day's closing window is left EMPTY (no snapshot persisted in the final CLV minutes).
+    snapless_lst_day = (
+        _dt(2026, 7, 9, 12, tzinfo=_tz.utc) + _td(hours=get_city("NYC").std_offset_hours)
+    ).date()
+    spec = [
+        (_dt(2026, 7, 5, 12, tzinfo=_tz.utc), "yes", 40.0),
+        (_dt(2026, 7, 9, 12, tzinfo=_tz.utc), "yes", 40.0),  # closing window left empty
+    ]
+    _seed_multiday_fills(pg_conn, fills_spec=spec, snapless_lst_days={snapless_lst_day})
+    # Must return cleanly (fail closed), never raise out of the bootstrap.
+    (roi_ci, clv_ci), not_scored = verify_mod._roi_clv_cis(
+        pg_conn, "KXHIGHNY", "hrrr", date(2026, 7, 1), date(2026, 7, 13), metrics
+    )
+    assert not_scored is True, "an empty closing window must fail closed → not_scored (WR-1)"
     assert roi_ci == (0.0, 0.0) == clv_ci
 
 
