@@ -579,6 +579,16 @@ def test_run_paper_single_shot_delegates_to_process_book(monkeypatch: pytest.Mon
     assert result["fill"] is not None
 
 
+def test_paper_snapshot_cadence_is_strictly_finer_than_clv_window():
+    """PAP-04: the target snapshot cadence must stay strictly finer than the CLV closing window so a
+    feed-driven loop honouring it never leaves the window silently sparse (moved off the import path).
+    """
+    from weatherquant.cli.paper import PAPER_SNAPSHOT_CADENCE_SECONDS
+    from weatherquant.market.clv import CLV_WINDOW_MINUTES
+
+    assert PAPER_SNAPSHOT_CADENCE_SECONDS < CLV_WINDOW_MINUTES * 60
+
+
 def test_run_paper_cadence_sufficiency_persists_snapshot_in_closing_window(
     monkeypatch: pytest.MonkeyPatch,
 ):
