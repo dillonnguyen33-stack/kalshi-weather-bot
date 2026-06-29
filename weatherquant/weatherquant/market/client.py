@@ -358,7 +358,15 @@ async def run_feed(
                         continue
                     # A control frame is feed-level — skip it BEFORE keying a book (W1).
                     if isinstance(msg, Mapping) and msg.get("type") in CONTROL_FRAME_TYPES:
-                        logger.debug("[ws] skipping control frame: %s", msg.get("type"))
+                        if msg.get("type") == "error":
+                            # A Kalshi `error` control frame is how a REJECTED SUBSCRIPTION
+                            # arrives — log it LOUD at ERROR with the FULL body so the reason
+                            # is impossible to miss in a live `--watch` run (05-WR-01). The feed
+                            # still survives the frame (continue, no raise/break — the loud log
+                            # is the alarm, not a crash).
+                            logger.error("[ws error] kalshi rejected subscription: %s", msg)
+                        else:
+                            logger.debug("[ws] skipping control frame: %s", msg.get("type"))
                         continue
                     ticker = _msg_ticker(msg, tickers)
                     book = books[ticker]
