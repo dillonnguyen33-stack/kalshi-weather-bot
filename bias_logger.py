@@ -21,6 +21,14 @@ v3.38: Fixed calibration_report date filter — the ::date cast on market_date
        Added a 'cal' subcommand: a quoting-free calibration dump (overall,
        prob-bucket calibration, by-side, by-category) that runs cleanly as a
        Railway start command with no multi-line / nested-quote issues.
+v3.39: (1) log_prediction now UPSERTS instead of ON CONFLICT DO NOTHING, so a
+       later same-day scan (e.g. afternoon pace-confirmed) overwrites the
+       earlier row instead of being silently dropped. Only overwrites while the
+       row is unsettled, so it never clobbers a scored result.
+       (2) Added orderbook depth columns (book_best_price, book_liq_at_best,
+       book_total_liq, book_levels) + log_orderbook() so the bot can record the
+       live book at alert time. This lets the slippage/maker analysis use real
+       depth instead of a flat haircut.
 
 Usage:
   python3 bias_logger.py score             # score yesterday's markets
@@ -72,6 +80,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     hrrr_high       REAL,
     icon_high       REAL,
     bet_category    TEXT DEFAULT 'morning',
+    book_best_price   INTEGER,
+    book_liq_at_best  REAL,
+    book_total_liq    REAL,
+    book_levels       TEXT,
     settled         INTEGER DEFAULT 0,
     actual_high_f   REAL,
     yes_result      INTEGER,
@@ -88,6 +100,10 @@ CREATE INDEX IF NOT EXISTS idx_settled     ON predictions(settled);
 MIGRATIONS = [
     "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS bet_category TEXT DEFAULT 'morning';",
     "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS actual_high_f REAL;",
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS book_best_price INTEGER;",
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS book_liq_at_best REAL;",
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS book_total_liq REAL;",
+    "ALTER TABLE predictions ADD COLUMN IF NOT EXISTS book_levels TEXT;",
 ]
 
 def ensure_schema():
@@ -123,7 +139,29 @@ def log_prediction(
                 bias_applied, asos_obs_high, ecmwf_high, nbm_high, hrrr_high,
                 icon_high, bet_category
             ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (ticker) DO NOTHING
+            ON CONFLICT (ticker) DO UPDATE SET
+                logged_at      = EXCLUDED.logged_at,
+                market_date    = EXCLUDED.market_date,
+                city_code      = EXCLUDED.city_code,
+                city_name      = EXCLUDED.city_name,
+                threshold_f    = EXCLUDED.threshold_f,
+                threshold_kind = EXCLUDED.threshold_kind,
+                model_prob     = EXCLUDED.model_prob,
+                yes_price      = EXCLUDED.yes_price,
+                no_price       = EXCLUDED.no_price,
+                best_side      = EXCLUDED.best_side,
+                taker_ev       = EXCLUDED.taker_ev,
+                ensemble_mean  = EXCLUDED.ensemble_mean,
+                spread         = EXCLUDED.spread,
+                confidence     = EXCLUDED.confidence,
+                bias_applied   = EXCLUDED.bias_applied,
+                asos_obs_high  = EXCLUDED.asos_obs_high,
+                ecmwf_high     = EXCLUDED.ecmwf_high,
+                nbm_high       = EXCLUDED.nbm_high,
+                hrrr_high      = EXCLUDED.hrrr_high,
+                icon_high      = EXCLUDED.icon_high,
+                bet_category   = EXCLUDED.bet_category
+            WHERE predictions.settled = 0
         """, (
             datetime.now(ET_TZ).isoformat(),
             str(market_date), city_code, city_name, ticker,
@@ -139,6 +177,38 @@ def log_prediction(
         conn.commit()
     except Exception as e:
         print(f"[bias_logger] log error: {e}")
+    finally:
+        conn.close()
+
+# ── LOG ORDERBOOK DEPTH ───────────────────────────────────────────────────────
+def log_orderbook(ticker, liq, levels=None):
+    """Attach orderbook depth (captured at alert time) to an existing row.
+    Never creates rows; updates by ticker only while the row is unsettled.
+    `liq` is the dict from fetch_orderbook_liquidity; `levels` is the take
+    ladder for our side: [[take_price_cents, qty], ...]."""
+    if not ticker or liq is None:
+        return
+    import json
+    conn = get_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE predictions
+            SET book_best_price  = %s,
+                book_liq_at_best = %s,
+                book_total_liq   = %s,
+                book_levels      = %s
+            WHERE ticker = %s AND settled = 0
+        """, (
+            liq.get("best_price_cents"),
+            liq.get("liq_at_best"),
+            liq.get("total_liq"),
+            json.dumps(levels) if levels is not None else None,
+            ticker,
+        ))
+        conn.commit()
+    except Exception as e:
+        print(f"[bias_logger] orderbook log error: {e}")
     finally:
         conn.close()
 
