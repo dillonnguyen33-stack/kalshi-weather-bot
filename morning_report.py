@@ -7,13 +7,18 @@ Run via Railway cron: 0 23 * * * (23:00 UTC = 3:00 PM PT)
 v3.27: Detailed scoreboard — lists each settled bet with the final
        temperature, the bucket/threshold, win/loss, and bet category
        (overnight/morning/pacing). Adds a category accuracy breakdown.
+v3.39: Idempotency guard — the daily (and weekly) report now claims a
+       (report_date, kind) slot in a small report_log table BEFORE posting.
+       If the slot is already claimed, it skips. This guarantees at most one
+       post per day even if the scorer is triggered more than once (duplicate
+       Railway cron / start command both running morning_report).
 
 Usage:
   python3 morning_report.py        # run manually
 """
 
 import os, requests
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 DATABASE_URL        = os.environ.get("DATABASE_URL", "")
@@ -45,6 +50,31 @@ def post_discord(content, embeds=None):
                       timeout=10)
     except Exception as e:
         print(f"[discord] {e}")
+
+# ── IDEMPOTENCY GUARD ─────────────────────────────────────────────────────────
+def _ensure_report_log(cur, conn):
+    """Small table that records which reports have already been posted."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS report_log (
+            report_date TEXT NOT NULL,
+            kind        TEXT NOT NULL,
+            posted_at   TEXT NOT NULL,
+            PRIMARY KEY (report_date, kind)
+        )
+    """)
+    conn.commit()
+
+def _claim_report(cur, conn, report_date, kind):
+    """Atomically claim the (report_date, kind) slot. Returns True if WE are the
+    first to claim it (so we should post), False if it was already claimed (so
+    we skip). This makes posting safe even if the script runs twice in a day."""
+    cur.execute("""
+        INSERT INTO report_log (report_date, kind, posted_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (report_date, kind) DO NOTHING
+    """, (str(report_date), kind, datetime.now(ET_TZ).isoformat()))
+    conn.commit()
+    return cur.rowcount == 1
 
 def run_daily_report(cur, yesterday):
     """Daily report — yesterday's results only."""
@@ -311,17 +341,27 @@ def run_report():
     today     = date.today()
     yesterday = today - timedelta(days=1)
 
-    # Daily report — always runs
-    daily_embeds = run_daily_report(cur, yesterday)
-    post_discord("", embeds=daily_embeds)
-    print(f"[morning_report] Daily report posted for {yesterday}")
+    # Idempotency guard table (created once, harmless if it already exists)
+    _ensure_report_log(cur, conn)
 
-    # Weekly report — only on Mondays (weekday 0)
+    # Daily report — always runs, but only once per yesterday-date. If another
+    # trigger already posted today's report, _claim_report returns False.
+    if _claim_report(cur, conn, yesterday, "daily"):
+        daily_embeds = run_daily_report(cur, yesterday)
+        post_discord("", embeds=daily_embeds)
+        print(f"[morning_report] Daily report posted for {yesterday}")
+    else:
+        print(f"[morning_report] Daily report for {yesterday} already posted — skipping")
+
+    # Weekly report — only on Mondays (weekday 0), and only once per week
     if today.weekday() == 0:
-        weekly_embeds = run_weekly_report(cur, today)
-        if weekly_embeds:
-            post_discord("", embeds=weekly_embeds)
-            print(f"[morning_report] Weekly report posted")
+        if _claim_report(cur, conn, today, "weekly"):
+            weekly_embeds = run_weekly_report(cur, today)
+            if weekly_embeds:
+                post_discord("", embeds=weekly_embeds)
+                print(f"[morning_report] Weekly report posted")
+        else:
+            print(f"[morning_report] Weekly report for {today} already posted — skipping")
 
     conn.close()
 
