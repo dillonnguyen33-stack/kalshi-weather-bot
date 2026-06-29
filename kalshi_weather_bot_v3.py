@@ -1,5 +1,15 @@
 """
-Kalshi Weather Temperature Bot — v3.37
+Kalshi Weather Temperature Bot — v3.39
+
+Changes from v3.37:
+  v3.39 — Orderbook depth logging:
+           1. Import log_orderbook from bias_logger.
+           2. fetch_orderbook_liquidity now also returns the full take-ladder
+              ("levels": [[take_price_cents, qty], ...]) so the slippage/maker
+              analysis can model real fills instead of a flat haircut.
+           3. After fetching the orderbook in the posting loop, the depth is
+              written to the prediction row via _log_orderbook.
+           (Pairs with bias_logger v3.39: upsert + book_* columns.)
 
 Changes from v3.36:
   v3.37 — Bias table re-derived from logged outcomes + dead-key fix:
@@ -26,6 +36,7 @@ import os, asyncio, aiohttp, math, json, time, threading, requests, re
 
 try:
     from bias_logger import log_prediction as _log_prediction
+    from bias_logger import log_orderbook as _log_orderbook
     BIAS_LOGGING = True
 except ImportError as e:
     print(f"[startup] bias_logger import FAILED: {e}")
@@ -1404,7 +1415,7 @@ def post_discord(webhook, content, embeds=None):
     except Exception as e:
         print(f"[discord] {e}")
 
-# ── ORDERBOOK / LIQUIDITY (v3.30, fixed format v3.31) ─────────────────────────
+# ── ORDERBOOK / LIQUIDITY (v3.30, fixed format v3.31, levels v3.39) ───────────
 def fetch_orderbook_liquidity(ticker: str, side: str) -> dict | None:
     """
     Fetch the Kalshi orderbook and compute, for the given side (YES or NO),
@@ -1447,6 +1458,11 @@ def fetch_orderbook_liquidity(ticker: str, side: str) -> dict | None:
         parsed.sort(key=lambda x: -x[0])  # best (highest) bid first
         best_opp_price, best_opp_qty = parsed[0]
 
+        # Take ladder for OUR side, cheapest fill first: crossing each opposing
+        # bid costs (1 - bid). This is exactly what a real order walks through,
+        # so the slippage/maker analysis can compute the true average fill.
+        levels = [[round((1.0 - p) * 100), c] for p, c in parsed]
+
         take_price_cents = round((1.0 - best_opp_price) * 100)
         liq_at_best      = best_opp_qty
         total_liq        = sum(c for _, c in parsed)
@@ -1460,6 +1476,7 @@ def fetch_orderbook_liquidity(ticker: str, side: str) -> dict | None:
             "total_liq":        total_liq,
             "dollars_at_best":  dollars_at_best,
             "dollars_total":    dollars_total,
+            "levels":           levels,
         }
     except Exception as e:
         print(f"[orderbook] {ticker}: {e}")
@@ -1569,7 +1586,7 @@ def build_embed(market, forecast, ev_data, obs_high, afd_hit,
             sources.append(f"{label} {forecast[key]}°F")
     if afd_hit: sources.append("AFD signal")
     if sources:
-        fields.append({"name":"\u200b","value":" | ".join(sources),"inline":False})
+        fields.append({"name":"​","value":" | ".join(sources),"inline":False})
 
     return {"color":color,"fields":fields,
             "footer":{"text":f"{market['ticker']} | {datetime.now(ET_TZ).strftime('%H:%M ET')}"}}
@@ -2094,8 +2111,15 @@ async def run_scan_async(force_codes=None):
                      f"{emoji} **{city} — {market['subtitle']}** {day_label}", [embed])
 
         # v3.30: follow-up message with live price + liquidity from orderbook
+        # v3.39: also log the orderbook depth (best/total + full take-ladder)
+        # to the prediction row so slippage/maker analysis uses real fills.
         try:
             liq = fetch_orderbook_liquidity(market["ticker"], best)
+            if BIAS_LOGGING and liq is not None:
+                try:
+                    _log_orderbook(market["ticker"], liq, liq.get("levels"))
+                except Exception as _e:
+                    print(f"[orderbook] depth log failed for {market['ticker']}: {_e}")
             liq_msg = format_liquidity_message(city, market["subtitle"], best, liq)
             post_discord(DISCORD_WEBHOOK_URL, liq_msg)
         except Exception as _e:
@@ -2192,7 +2216,8 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.37")
+    print("🌡️  Kalshi Weather Bot v3.39")
+    print(f"   v3.39: Orderbook depth logging (levels + log_orderbook)")
     print(f"   v3.37: Bias table re-derived from logs + dead-key fix")
     print(f"          (AT/DA/HO/SE keys never matched ATL/DAL/HOU/SEA — now fixed)")
     print(f"          (June bias +1 to +2.4F on hot cities — model was running cold)")
