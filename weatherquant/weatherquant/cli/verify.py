@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 # Imported INTO the module namespace as the test seam (the run body resolves
 # ``cli.verify.get_engine`` / ``cli.verify.get_settings``).
@@ -551,6 +553,42 @@ def _fill_in_window(fill, city_key, start, end) -> bool:
     return bool(start <= d < end)
 
 
+def _fill_bucket_edges(
+    fill: Any,
+    ticker: str,
+    parse_ticker: Callable[..., tuple[int | None, int | None, bool, bool]],
+) -> tuple[int | None, int | None, bool, bool]:
+    """Resolve a fill's bucket edges from its PERSISTED ``detail['bucket']``, else a parseable ticker.
+
+    The kxhigh-ticker money-path fix persists the resolved ``(lo, hi, open_lo, open_hi)`` edges into
+    each fill's ``detail['bucket']`` at fill time (``cli.paper._process_book``), so settlement reads
+    them OFFLINE — a REAL date-coded ticker (``KXHIGH{CITY}-{DATE}-{B/T...}``) the positional regex
+    can never re-parse still settles reproducibly. Falls back to the positional
+    ``parse_ticker(ticker)`` for a legacy synthetic-form fill that carries no persisted bucket; fails
+    loud when neither a persisted bucket nor a parseable ticker is present — never a fabricated bucket
+    (the B/T grammar is NOT guessed on the money path).
+    """
+    detail = fill.get("detail") if hasattr(fill, "get") else getattr(fill, "detail", None)
+    if isinstance(detail, Mapping):
+        persisted = detail.get("bucket")
+        if isinstance(persisted, Mapping):
+            try:
+                return (
+                    persisted["lo"],
+                    persisted["hi"],
+                    bool(persisted["open_lo"]),
+                    bool(persisted["open_hi"]),
+                )
+            except KeyError as exc:
+                raise ValueError(
+                    f"_settle_window_fills: persisted detail['bucket'] for {ticker!r} is missing "
+                    f"{exc} — a persisted bucket must carry lo/hi/open_lo/open_hi (never fabricate)."
+                ) from exc
+    # No persisted edges: fall back to the positional ticker parse (the synthetic closed-range
+    # form). A real date-coded ticker raises here — fail loud rather than fabricate a bucket.
+    return parse_ticker(ticker)
+
+
 def _settle_window_fills(bind, window_fills, city_key):
     """Settle each window fill against the observed daily high; build the ROI/CLV scoring inputs.
 
@@ -582,7 +620,7 @@ def _settle_window_fills(bind, window_fills, city_key):
         # UTC event_time.date()), consistent with the LST block key — a near-boundary fill settles
         # against the day Kalshi actually resolves it on, and its closing window is that LST day.
         day = _lst_settlement_day(event_time, get_city(city_key))
-        lo_i, hi_i, open_lo, open_hi = parse_ticker(ticker)
+        lo_i, hi_i, open_lo, open_hi = _fill_bucket_edges(fill, ticker, parse_ticker)
         lo_edge, hi_edge = integers_in_bucket(lo_i, hi_i, open_lo=open_lo, open_hi=open_hi)
         obs = queries.latest(
             bind, "observations",

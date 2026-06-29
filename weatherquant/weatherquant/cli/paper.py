@@ -24,7 +24,7 @@ from weatherquant.market.persist import persist_fill, persist_snapshot
 from weatherquant.registry import get_city
 from weatherquant.time import settlement_window
 
-from .pricing import _blend_distribution, _price_bucket
+from .pricing import _blend_distribution, _price_bucket, _resolve_bucket_for_run
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +121,7 @@ def _process_book(
     event_time: datetime,
     seq: int | None,
     ticker: str,
+    bucket: tuple[int | None, int | None, bool, bool],
     blend: dict[str, Any],
     pricing_mod: Any,
     fills_mod: Any,
@@ -153,7 +154,9 @@ def _process_book(
     # Feed the REAL [0,1] mid_unit into the SAME money tail run_price mocks (D-08/D-16 loop
     # closed): _price_bucket shrinks the model prob toward the real mid (p_used), and EV + Kelly
     # size on that shrunk belief. mid_unit (NOT mid_cents) feeds pricing — the path is in [0,1].
-    prob, pu, ev, stake = _price_bucket(blend, ticker, mid_unit)
+    # The bucket edges were RESOLVED ONCE at run_paper startup (structured GetMarket strikes for a
+    # real date-coded ticker; the positional parse for the synthetic form) — never re-parsed here.
+    prob, pu, ev, stake = _price_bucket(blend, bucket, mid_unit)
 
     # best_*_bid are the PRICE columns: the best (highest) bid price on each side (cents), read via
     # the ONE bid accessor (reflect.best_bid, IN-03) so the max(prices) reflection is never
@@ -273,6 +276,15 @@ def _process_book(
                     "partial": fill.partial,
                     "mid_cents": mid_cents,
                     "slippage_cents": fill.avg_price_cents - mid_cents,
+                    # Persist the RESOLVED bucket edges at fill time so settlement
+                    # (cli.verify._settle_window_fills) reads them offline — a real date-coded
+                    # ticker the positional regex cannot re-parse still settles reproducibly.
+                    "bucket": {
+                        "lo": bucket[0],
+                        "hi": bucket[1],
+                        "open_lo": bucket[2],
+                        "open_hi": bucket[3],
+                    },
                 },
                 available_at=fill.event_time,
             )
@@ -327,6 +339,7 @@ class _WatchSink:
         bind: Bind,
         *,
         ticker: str,
+        bucket: tuple[int | None, int | None, bool, bool],
         blend: dict[str, Any],
         pricing_mod: Any,
         fills_mod: Any,
@@ -334,6 +347,7 @@ class _WatchSink:
     ) -> None:
         self._bind = bind
         self._ticker = ticker
+        self._bucket = bucket
         self._blend = blend
         self._pricing = pricing_mod
         self._fills = fills_mod
@@ -385,6 +399,7 @@ class _WatchSink:
                 event_time=event_time,
                 seq=getattr(book, "seq", None),
                 ticker=self._ticker,
+                bucket=self._bucket,
                 blend=self._blend,
                 pricing_mod=self._pricing,
                 fills_mod=self._fills,
@@ -406,6 +421,7 @@ async def _run_watch_loop(
     bind: Bind,
     *,
     ticker: str,
+    bucket: tuple[int | None, int | None, bool, bool],
     blend: dict[str, Any],
     deadline_seconds: float,
     demo: bool,
@@ -432,6 +448,7 @@ async def _run_watch_loop(
     sink = _WatchSink(
         bind,
         ticker=ticker,
+        bucket=bucket,
         blend=blend,
         pricing_mod=pricing_mod,
         fills_mod=fills_mod,
@@ -540,6 +557,13 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     # compute it ONCE before either path (recomputing it per book under --watch would be wasteful).
     blend = _blend_distribution(bind, city, target, lead)
 
+    # Resolve the bucket edges ONCE at startup, BEFORE the feed loop (the bucket is per-ticker, not
+    # per-book). A REAL date-coded ticker (KXHIGH{CITY}-{DATE}-{B/T...}) the positional regex cannot
+    # match is resolved from the structured GetMarket strikes (signed fetch_market); the synthetic
+    # positional form resolves offline with no network. The resolved edges are threaded into the
+    # money tail AND persisted into each fill's detail['bucket'] so settlement reads them offline.
+    bucket = _resolve_bucket_for_run(ticker, sign=signer.sign, rest_host=rest_host)
+
     # --watch: the feed-driven loop (WATCH-01/WATCH-02, un-defers Phase-5's B2). When set, drive
     # market.client.run_feed against the LIVE book instead of the single-shot REST read; the
     # single-shot path below is unchanged when --watch is off.
@@ -565,6 +589,7 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
             _run_watch_loop(
                 bind,
                 ticker=ticker,
+                bucket=bucket,
                 blend=blend,
                 deadline_seconds=deadline_seconds,
                 demo=demo,
@@ -618,6 +643,7 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
         event_time=event_time,
         seq=seq,
         ticker=ticker,
+        bucket=bucket,
         blend=blend,
         pricing_mod=pricing,
         fills_mod=fills,
