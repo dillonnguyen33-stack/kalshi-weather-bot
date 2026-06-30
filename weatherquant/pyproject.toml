@@ -23,7 +23,6 @@ dependencies = [
     "xarray==2026.4.0",
     "eccodes==2.47.0",
     "httpx==0.28.1",
-    "anthropic>=0.109,<0.110",
     "apscheduler==3.11.2",
     "numpy==2.4.6",
     # Phase-5 I/O edge (D-01): the live Kalshi orderbook WS feed + the manual RSA-PSS
@@ -40,6 +39,12 @@ dependencies = [
     # Pre-audited APPROVED (06-RESEARCH §Package Legitimacy Audit; the SUS verdict is a documented
     # false positive — ~15yr NumFOCUS lib, already a transitive xarray dep). Exact-pinned (T-06-SC).
     "matplotlib==3.11.0",
+    # AFD classifier LLM (ING-07, D-13): the official OpenAI Python SDK (publisher OpenAI,
+    # pypi.org/project/openai — identity verified, T-260630-SC). classify_afd forces a
+    # function tool on gpt-5.4-nano (cheapest current-gen tier matching the $3-8/day budget);
+    # the pre-filter gates before any paid call and an unset key degrades gracefully (D-11).
+    # Exact-pinned for house-style reproducibility.
+    "openai==2.44.0",
 ]
 
 [project.scripts]

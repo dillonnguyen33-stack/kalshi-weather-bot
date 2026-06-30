@@ -70,13 +70,13 @@ The same underlying model from two providers (NOAA `hrrr` vs `wethr:hrrr`) stays
 distinct blend inputs — never deduped or merged.
 
 ### D-13 — AFD pre-filter + forced tool-use
-A v3 keyword pre-filter gates any paid Anthropic call (budget). When it fires, a forced
-`record_afd_signal` tool with a strict `input_schema` returns a guaranteed-shape dict
-(vs v3's fragile JSON-text parse) and contains injected free-text (ASVS V5). Key unset →
+A v3 keyword pre-filter gates any paid OpenAI call (budget). When it fires, a forced
+`record_afd_signal` function tool with a strict `parameters` schema returns a guaranteed-shape
+dict (vs v3's fragile JSON-text parse) and contains injected free-text (ASVS V5). Key unset →
 structured skip, no-signal. The signal is a soft sizing modifier, never a hard trade gate.
 
 ### D-14 — Off-loop decode
-The sync Herbie+cfgrib GRIB decode and the blocking Anthropic classify both run in a
+The sync Herbie+cfgrib GRIB decode and the blocking OpenAI classify both run in a
 thread executor so they never block the async loop shared by the HTTP sources.
 
 ### D-15 — One ingestion code path

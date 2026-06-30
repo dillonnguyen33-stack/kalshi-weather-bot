@@ -314,7 +314,7 @@ async def ingest_afd(
 ) -> int:
     """AFD forecaster-disagreement signal for ``city``/``target_date`` via the audited writer (D-13).
 
-    Fetches the latest AFD product, pre-filters before any paid call, forces the Anthropic
+    Fetches the latest AFD product, pre-filters before any paid call, forces the OpenAI
     ``record_afd_signal`` tool, and stores ``source='afd'``; failures degrade to 0 (D-11).
     Backfill skips unless an explicit ``available`` issuance time is supplied, since ``now()``
     on a historical row leaks (CR-01/D-09); classify runs off-loop (WR-03/D-14). See
@@ -331,7 +331,7 @@ async def ingest_afd(
         if not text:
             _log_fallback("afd", city, target_date_to_dt(target_date), "no AFD product text")
             return 0
-        # WR-03/D-14: run the possibly-blocking Anthropic classify call off the event loop.
+        # WR-03/D-14: run the possibly-blocking OpenAI classify call off the event loop.
         loop = asyncio.get_running_loop()
         signal = await loop.run_in_executor(None, afd_mod.classify_afd, text, wfo)
         return afd_mod.store_afd_signal(

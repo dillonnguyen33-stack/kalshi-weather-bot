@@ -1,6 +1,6 @@
 """WR-03 / WR-05: off-loop AFD classify + correctness alarms are not swallowed (D-14/D-11).
 
-* WR-03 (D-14) — ``classify_afd`` may issue a BLOCKING Anthropic SDK call; ``ingest_afd`` must
+* WR-03 (D-14) — ``classify_afd`` may issue a BLOCKING OpenAI SDK call; ``ingest_afd`` must
   run it in a thread executor (like the GRIB decode) so it never blocks the async loop. We
   assert classify runs on a DIFFERENT thread than the event loop.
 * WR-05 (D-11) — the per-source ``except`` is graceful degradation for EXPECTED transient
