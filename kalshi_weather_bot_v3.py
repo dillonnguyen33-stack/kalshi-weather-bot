@@ -1,5 +1,12 @@
 """
-Kalshi Weather Temperature Bot — v3.39
+Kalshi Weather Temperature Bot — v3.40
+
+Changes from v3.39:
+  v3.40 — June bias recalibrated from bias_audit.py. The model was running
+           ~2.7F COLD on EVERY city (it predicts a central temp, but settlement
+           is the realized daily high, which runs hotter in summer). June
+           CITY_BIAS_F raised to match the measured error. Also added DC, which
+           was missing from the table entirely and so ran on zero bias.
 
 Changes from v3.37:
   v3.39 — Orderbook depth logging:
@@ -366,29 +373,29 @@ CITY_COORDS = {
 
 # ── BIAS CORRECTIONS ──────────────────────────────────────────────────────────
 # Keys MUST match the city codes used in CITY_COORDS (long forms like ATL/DAL/
-# HOU/SEA/SFO/AUS/OKC). Earlier versions used short codes (AT/DA/HO/SE) that
-# never matched at runtime, so those cities silently ran on DEFAULT_BIAS (zeros).
-# June values derived from logged outcomes via derive_bias.py (damped). Other
-# months carry the prior hand-tuned values until enough data accrues to replace
-# them. Index 0 = January ... index 11 = December.
+# HOU/SEA/SFO/AUS/OKC/DC). June values recalibrated from bias_audit.py (v3.40):
+# the model ran ~2.7F COLD on every city because it predicts a central temp but
+# settlement is the realized daily high. Other months carry prior hand-tuned
+# values until enough data accrues. Index 0 = January ... index 11 = December.
 CITY_BIAS_F = {
-    "NY":  [ 0.8,  0.7,  0.5,  0.3,  0.2,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.7],
-    "CHI": [ 1.2,  1.0,  0.8,  0.4,  0.2,  0.0, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
-    "LAX": [-0.5, -0.4, -0.3, -0.2, -0.2, -0.3, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
-    "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  2.5,  2.5,  2.5,  0.0,  0.1,  0.2,  0.3],
+    "NY":  [ 0.8,  0.7,  0.5,  0.3,  0.2,  0.30, -0.3, -0.2,  0.0,  0.3,  0.5,  0.7],
+    "CHI": [ 1.2,  1.0,  0.8,  0.4,  0.2,  2.70, -0.5, -0.4,  0.0,  0.5,  0.8,  1.1],
+    "LAX": [-0.5, -0.4, -0.3, -0.2, -0.2,  1.00, -0.4, -0.4, -0.3, -0.2, -0.3, -0.4],
+    "MIA": [ 0.3,  0.3,  0.2,  0.1,  0.0,  2.50,  2.5,  2.5,  0.0,  0.1,  0.2,  0.3],
     "PHI": [ 0.7,  0.6,  0.5,  0.3,  0.1,  0.0, -0.3, -0.2,  0.0,  0.3,  0.5,  0.6],
-    "ATL": [ 0.5,  0.4,  0.3,  0.2,  0.1,  1.41, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
+    "ATL": [ 0.5,  0.4,  0.3,  0.2,  0.1,  2.20, -0.3, -0.3, -0.1,  0.2,  0.3,  0.4],
     "MN":  [ 1.5,  1.3,  1.0,  0.5,  0.2,  0.0, -0.5, -0.4,  0.0,  0.6,  1.0,  1.4],
-    "SFO": [-0.8, -0.7, -0.6, -0.5, -0.5, -0.6, -0.7, -0.7, -0.6, -0.5, -0.6, -0.7],
-    "DAL": [ 0.3,  0.2,  0.1,  0.0, -0.1,  1.25, -0.6, -0.5, -0.2,  0.0,  0.2,  0.3],
-    "BOS": [ 0.9,  0.8,  0.6,  0.4,  0.2,  0.0, -0.3, -0.2,  0.0,  0.4,  0.6,  0.8],
-    "PHX": [-0.4, -0.3, -0.2, -0.1,  0.0,  1.02, -0.8, -0.7, -0.3, -0.1, -0.2, -0.3],
+    "SFO": [-0.8, -0.7, -0.6, -0.5, -0.5,  1.60, -0.7, -0.7, -0.6, -0.5, -0.6, -0.7],
+    "DAL": [ 0.3,  0.2,  0.1,  0.0, -0.1,  1.40, -0.6, -0.5, -0.2,  0.0,  0.2,  0.3],
+    "BOS": [ 0.9,  0.8,  0.6,  0.4,  0.2,  1.20, -0.3, -0.2,  0.0,  0.4,  0.6,  0.8],
+    "PHX": [-0.4, -0.3, -0.2, -0.1,  0.0,  1.90, -0.8, -0.7, -0.3, -0.1, -0.2, -0.3],
     "DEN": [ 0.6,  0.5,  0.4,  0.2,  0.1,  0.0, -0.4, -0.3,  0.0,  0.3,  0.5,  0.6],
-    "SEA": [-0.3, -0.3, -0.2, -0.1,  0.0,  2.43, -0.2, -0.2, -0.1,  0.0, -0.2, -0.3],
-    "HOU": [ 0.2,  0.1,  0.0, -0.1, -0.2,  1.25, -0.6, -0.6, -0.3, -0.1,  0.1,  0.2],
-    "LV":  [-0.5, -0.4, -0.2,  0.0,  0.1,  1.53, -0.8, -0.7, -0.2,  0.0, -0.2, -0.4],
-    "AUS": [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.47,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
-    "OKC": [ 0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
+    "SEA": [-0.3, -0.3, -0.2, -0.1,  0.0,  3.35, -0.2, -0.2, -0.1,  0.0, -0.2, -0.3],
+    "HOU": [ 0.2,  0.1,  0.0, -0.1, -0.2,  2.40, -0.6, -0.6, -0.3, -0.1,  0.1,  0.2],
+    "LV":  [-0.5, -0.4, -0.2,  0.0,  0.1,  2.20, -0.8, -0.7, -0.2,  0.0, -0.2, -0.4],
+    "AUS": [ 0.0,  0.0,  0.0,  0.0,  0.0,  2.35,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
+    "OKC": [ 0.0,  0.0,  0.0,  0.0,  0.0,  1.70,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
+    "DC":  [ 0.0,  0.0,  0.0,  0.0,  0.0,  2.05,  0.0,  0.0,  0.0,  0.0,  0.0,  0.0],
 }
 DEFAULT_BIAS = [0.0] * 12
 
@@ -1586,7 +1593,7 @@ def build_embed(market, forecast, ev_data, obs_high, afd_hit,
             sources.append(f"{label} {forecast[key]}°F")
     if afd_hit: sources.append("AFD signal")
     if sources:
-        fields.append({"name":"​","value":" | ".join(sources),"inline":False})
+        fields.append({"name":"\u200b","value":" | ".join(sources),"inline":False})
 
     return {"color":color,"fields":fields,
             "footer":{"text":f"{market['ticker']} | {datetime.now(ET_TZ).strftime('%H:%M ET')}"}}
@@ -2024,9 +2031,6 @@ async def run_scan_async(force_codes=None):
         afd_cities = set(afd_flagged_cities)
 
     # ── PRE-FETCH WETHR FORECASTS (sequential, into cache) ────────────────────
-    # This prevents 40 concurrent scan tasks from each hammering the Wethr API.
-    # By loading everything into the cache first (sequentially, rate-limited),
-    # the concurrent scan tasks below just read from cache = zero Wethr calls.
     if WETHR_API_KEY:
         cities_to_fetch = set()
         for m in markets:
@@ -2034,7 +2038,6 @@ async def run_scan_async(force_codes=None):
             if cc in WETHR_STATIONS:
                 cities_to_fetch.add(cc)
 
-        # Determine which dates we need (today + any next-day markets)
         dates_needed = set()
         for m in markets:
             dates_needed.add(ticker_date(m["ticker"]).isoformat())
@@ -2044,17 +2047,14 @@ async def run_scan_async(force_codes=None):
             station = WETHR_STATIONS.get(cc)
             if not station:
                 continue
-            # Pre-fetch model accuracy for this station (cached 6h)
             await asyncio.get_event_loop().run_in_executor(
                 None, fetch_model_accuracy, station)
             for ds in dates_needed:
-                # Check if already cached and fresh
                 sample_key = f"{station}_HRRR_{ds}"
                 now = time.time()
                 if sample_key in _wethr_fcst_cache and \
                    now - _wethr_fcst_ts.get(sample_key, 0) < WETHR_FCST_TTL:
-                    continue  # already cached, skip
-                # Fetch all models for this city/date into cache (blocking)
+                    continue
                 await asyncio.get_event_loop().run_in_executor(
                     None, fetch_wethr_all_models, station, ds)
                 prefetch_count += 1
@@ -2094,7 +2094,6 @@ async def run_scan_async(force_codes=None):
 
         cat_counts[category] = cat_counts.get(category, 0) + 1
 
-        # Emoji by category (ASOS YES overrides)
         if asos_yes:
             emoji = "🌡️"
         else:
@@ -2171,7 +2170,7 @@ def fetch_current_prices() -> dict[str, tuple[int, int, str]]:
             if ticker:
                 prices[ticker] = (yes_price, no_price, city_code)
                 markets_raw.append(m)
-        time.sleep(1.0)  # increased to avoid rate limits
+        time.sleep(1.0)
     with _lock:
         _market_cache    = markets_raw
         _market_cache_ts = time.time()
@@ -2216,7 +2215,8 @@ def signal_rescan_loop():
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
 def main():
-    print("🌡️  Kalshi Weather Bot v3.39")
+    print("🌡️  Kalshi Weather Bot v3.40")
+    print(f"   v3.40: June bias recalibrated (model ran ~2.7F cold); DC added")
     print(f"   v3.39: Orderbook depth logging (levels + log_orderbook)")
     print(f"   v3.37: Bias table re-derived from logs + dead-key fix")
     print(f"          (AT/DA/HO/SE keys never matched ATL/DAL/HOU/SEA — now fixed)")
