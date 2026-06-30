@@ -1,4 +1,6 @@
-"""The ``weatherquant`` CLI — four subcommands over the shared spine (stdlib argparse).
+"""The ``weatherquant`` CLI — subcommands over the shared spine (stdlib argparse).
+
+* ``live``      — start the scheduler daemon (mode="live"); the continuous ingestion half.
 
 * ``ingest``    — backfill via :func:`ingest.orchestrator.ingest_range` (``mode="backfill"``,
   so ``available_at = cycle_init + PUBLISH_LATENCY``, never the wall clock; idempotent re-run
@@ -18,6 +20,7 @@ from __future__ import annotations
 from ._args import ALL_MODELS, build_parser
 from .calibrate import run_calibrate
 from .ingest import run_ingest
+from .live import run_live
 from .main import main
 from .paper import PAPER_SNAPSHOT_CADENCE_SECONDS, run_paper
 from .pricing import run_price
@@ -30,6 +33,7 @@ __all__ = [
     "main",
     "run_calibrate",
     "run_ingest",
+    "run_live",
     "run_paper",
     "run_price",
     "run_verify",

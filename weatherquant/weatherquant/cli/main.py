@@ -7,6 +7,7 @@ import logging
 from ._args import build_parser
 from .calibrate import run_calibrate
 from .ingest import run_ingest
+from .live import run_live
 from .paper import run_paper
 from .pricing import run_price
 from .verify import run_verify
@@ -22,6 +23,9 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "live":
+        # Blocks until SIGINT; the scheduler drives mode="live" ingestion (D-15).
+        return run_live(args)
     if args.command == "ingest":
         totals = run_ingest(args)
         inserted = sum(totals.values())

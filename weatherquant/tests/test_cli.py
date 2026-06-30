@@ -128,6 +128,40 @@ def test_cycle_hours_parsed_to_ints(captured_range: dict):
 # --- Scheduler (02-05 Task 3) ------------------------------------------------------------
 
 
+def test_live_subcommand_parses_with_no_args():
+    """`weatherquant live` is a registered no-arg subcommand (dispatch wiring contract)."""
+    args = cli.build_parser().parse_args(["live"])
+    assert args.command == "live"
+
+
+def test_live_serve_starts_then_shuts_down_scheduler(monkeypatch: pytest.MonkeyPatch):
+    """_serve start()s the scheduler and, when its forever-wait is cancelled, shutdown()s it."""
+    import asyncio
+
+    from weatherquant.cli.live import _serve
+
+    fake = type("S", (), {"started": False, "stopped": False, "get_jobs": lambda self: []})()
+    fake.start = lambda: setattr(fake, "started", True)
+    fake.shutdown = lambda wait=False: setattr(fake, "stopped", True)
+    monkeypatch.setattr("weatherquant.cli.live.build_scheduler", lambda: fake)
+
+    # _serve waits forever; wait_for cancels it after it has started, triggering the finally.
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(_serve(), timeout=0.05))
+    assert fake.started and fake.stopped
+
+
+def test_run_live_returns_zero_on_interrupt(monkeypatch: pytest.MonkeyPatch):
+    """Ctrl-C (KeyboardInterrupt out of asyncio.run) is a clean stop → exit code 0."""
+
+    def _interrupt(coro):
+        coro.close()  # avoid 'coroutine was never awaited' noise
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("weatherquant.cli.live.asyncio.run", _interrupt)
+    assert cli.run_live(object()) == 0
+
+
 def test_build_scheduler_registers_per_model_jobs():
     """build_scheduler wires AsyncIOScheduler per model cadence WITHOUT starting (D-15)."""
     from weatherquant.scheduler import build_scheduler

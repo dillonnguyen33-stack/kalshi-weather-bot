@@ -1,0 +1,9 @@
+# Gate-1 paper-trading targets — one "CITY TICKER" per line.
+# CITY must be a registry code (NYC, LAX, ...). TICKER is the real date-coded Kalshi
+# KXHIGH market you want to paper-trade. A literal {date} is replaced with today's
+# YYYY-MM-DD; if Kalshi's ticker date encoding differs, paste the exact ticker instead.
+# Lines starting with '#' and blank lines are ignored.
+#
+# Fill in the markets you intend to trade across the Gate-1 window, e.g.:
+# NYC KXHIGHNY-{date}-B62
+# LAX KXHIGHLAX-{date}-B78

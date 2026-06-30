@@ -112,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # --- live: start the scheduler daemon (D-15) — the continuous half of ingestion ---------
+    # No args: build_scheduler owns the cadences; this just runs the asyncio loop until SIGINT.
+    sub.add_parser(
+        "live",
+        help="Start the live ingestion scheduler (mode=live) and run until interrupted.",
+    )
+
     ingest = sub.add_parser(
         "ingest",
         help="Backfill forecasts/observations for a date or date range (idempotent).",
