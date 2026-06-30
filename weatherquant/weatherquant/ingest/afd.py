@@ -192,22 +192,26 @@ def classify_afd(
             tool_choice={"type": "function", "function": {"name": "record_afd_signal"}},
             max_completion_tokens=256,
         )
-    except Exception as exc:  # noqa: BLE001 - any OpenAI/SDK error degrades to no-signal (D-11).
+        # Forced tool_choice → the response's first choice carries exactly one tool call whose
+        # `function.arguments` is a JSON STRING of the schema-shaped dict. We json.loads ONLY those
+        # arguments — the model text body is never decoded as JSON (v3 fragility, D-13, T-02-08).
+        # Parsing stays INSIDE the try: a truncated tool call (e.g. max_completion_tokens hit)
+        # yields malformed JSON, and JSONDecodeError must degrade like any SDK error (D-11).
+        tool_calls = completion.choices[0].message.tool_calls
+        if not tool_calls:
+            logger.warning("AFD classify for WFO=%s returned no tool call; degrading", wfo)
+            return dict(_NO_SIGNAL)
+        result = json.loads(tool_calls[0].function.arguments)
+    except Exception as exc:  # noqa: BLE001 - any OpenAI/SDK/parse error degrades to no-signal (D-11).
         logger.warning(
             "AFD classify failed for WFO=%s (%s); degrading to no-signal (D-11)", wfo, exc
         )
         return {**_NO_SIGNAL, "reason": "openai_error"}
 
-    # Forced tool_choice → the response's first choice carries exactly one tool call whose
-    # `function.arguments` is a JSON STRING of the schema-shaped dict. We json.loads ONLY those
-    # arguments — the model text body is never decoded as JSON (v3 fragility, D-13, T-02-08).
-    tool_calls = completion.choices[0].message.tool_calls
-    if not tool_calls:
-        logger.warning("AFD classify for WFO=%s returned no tool call; degrading", wfo)
+    # Defensive: guarantee a dict with the three required keys even if the model returns a
+    # non-object (null/array) or the SDK changes.
+    if not isinstance(result, dict):
         return dict(_NO_SIGNAL)
-
-    result = json.loads(tool_calls[0].function.arguments)
-    # Defensive: guarantee the three required keys exist even if the SDK changes.
     return {
         "disagreement": bool(result.get("disagreement", False)),
         "direction": result.get("direction", ""),

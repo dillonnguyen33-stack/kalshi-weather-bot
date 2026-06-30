@@ -36,7 +36,7 @@ Weatherquant is a probabilistic forecasting system that prices bets on Kalshi da
 | **eccodes** (C lib) + **cfgrib** | eccodes 2.47.x / cfgrib 0.9.15.1 | Decode GRIB2 temperature fields into arrays | `cfgrib` is the de-facto standard GRIB2→xarray bridge (ECMWF-maintained, same org as eccodes). Unavoidable: GRIB2 is a packed binary format; no pure-NumPy decoder exists. Pin eccodes via conda-forge or the `eccodes` wheel to avoid system-library hell. |
 | **boto3** + **botocore UNSIGNED** | boto3 1.43.x | Anonymous byte-range reads from NOAA public S3 | NOAA buckets (`noaa-hrrr-pds`, `noaa-gfs-bdp-pds`, `noaa-gefs-pds`, `noaa-nbm-grib2-pds`) are free public Open-Data buckets. Use `Config(signature_version=UNSIGNED)` + `Range:` header on `get_object` to pull only the bytes for `TMP:2 m` (≈1 MB vs ≈700 MB full file) → egress stays negligible, matching the PROJECT.md cost target. |
 | **psycopg** (v3) | 3.3.4 | Postgres driver | Modern successor to psycopg2. Sync + async in one library, server-side binding, native `COPY`, good typing. Pair with `psycopg[binary]` wheel so no local libpq build. |
-| **anthropic** | 0.109.x | Claude Haiku — classify NWS Area Forecast Discussion text | Official SDK; built-in retries, streaming, structured/tool use for clean JSON extraction of "forecaster disagreement" flags. Use `claude-haiku` tier for the per-city AFD classification (cheap, matches the $3–8/day budget). |
+| **openai** | 2.44.0 | gpt-5.4-nano — classify NWS Area Forecast Discussion text | Official SDK; built-in retries, streaming, forced function/tool use for clean JSON extraction of "forecaster disagreement" flags. Use the `gpt-5.4-nano` tier for the per-city AFD classification (cheap, matches the $3–8/day budget). |
 | **Kalshi official SDK** (`kalshi-python`) | 2.1.4 | Kalshi REST (markets, orderbook snapshot, paper-account state) | Official (maintained by Kalshi Support; repo `Kalshi/exchange-infra`). Handles RSA-PSS signing internally via `config.private_key_pem`. REST-only — see WebSocket note below. |
 
 ### Supporting Libraries
@@ -49,7 +49,7 @@ Weatherquant is a probabilistic forecasting system that prices bets on Kalshi da
 | **httpx** | 0.28.1 | Async HTTP for non-SDK calls (Open-Meteo, NWS API, METAR/ASOS) | One async client for all the supplementary REST sources in PROJECT.md. HTTP/2, timeouts, retry-friendly. |
 | **APScheduler** | 3.11.2 | Time-triggered ingestion (model runs land on fixed UTC cycles) | In-process cron-like scheduler. NWP cycles are deterministic (HRRR hourly, GFS/GEFS 00/06/12/18Z, NBM hourly) → schedule fetch jobs per cycle. Lightweight; no external broker. Good enough for a single-node paper-trading system. |
 | **SQLAlchemy** (Core) + **Alembic** | 2.0.50 / 1.18.4 | Schema definition + migrations | Use SQLAlchemy **Core** (not the full ORM) to declare tables for forecasts/calibration-params/fills, and Alembic for versioned migrations. Core keeps you close to SQL while giving Alembic autogeneration. (If you prefer raw SQL, Alembic still works standalone.) |
-| **pydantic-settings** | 2.14.1 | Typed config + env/secret loading | Single typed `Settings` object: `KALSHI_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`, `ANTHROPIC_API_KEY`, `DATABASE_URL`, `EXECUTION_MODE`. Validates at startup, fails loud on missing secrets. |
+| **pydantic-settings** | 2.14.1 | Typed config + env/secret loading | Single typed `Settings` object: `KALSHI_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`, `OPENAI_API_KEY`, `DATABASE_URL`, `EXECUTION_MODE`. Validates at startup, fails loud on missing secrets. |
 | **python-dotenv** | 1.2.2 | Local `.env` loading | Dev-only convenience; pairs with pydantic-settings. Never commit the `.env`. |
 | **timezonefinder** | 8.2.4 | Map city lat/lon → IANA tz for the LST settlement window | Directly serves the v3 bug fix: Kalshi settles daily-high on **Local Standard Time (no DST)**. Resolve each city's base UTC offset and subtract DST manually so the settlement window is correct year-round. |
 
@@ -105,7 +105,7 @@ Weatherquant is a probabilistic forecasting system that prices bets on Kalshi da
 | **Airflow / Prefect / Dagster** | Heavyweight orchestration for a single-node paper bot; ops burden >> value here. | APScheduler in-process, or OS cron. |
 | **Storing the RSA private key in `.env`/repo/ConfigMap** | Loss = irrecoverable (Kalshi doesn't store it); leak = account-level trading access. | Local: file path outside the repo (`KALSHI_PRIVATE_KEY_PATH`), referenced via pydantic-settings. Future live (Gate 2): AWS Secrets Manager / Vault. Never commit. |
 | **psycopg2** | Legacy; no native async, slower dev. | `psycopg` v3. |
-| **requests** for hot paths | Sync-only; clashes with the asyncio WS/scheduler design. | `httpx` (async) for supplementary sources; SDK clients for Kalshi/Anthropic. |
+| **requests** for hot paths | Sync-only; clashes with the asyncio WS/scheduler design. | `httpx` (async) for supplementary sources; SDK clients for Kalshi/OpenAI. |
 
 ## Stack Patterns by Variant
 
@@ -115,7 +115,7 @@ Weatherquant is a probabilistic forecasting system that prices bets on Kalshi da
 - Because you control exactly which bytes are fetched and the ingestion path is fully auditable (matters when egress cost and correctness are both graded).
 - Swap `psycopg` for **asyncpg** on the write path only.
 - Because async batched inserts under live order flow benefit from asyncpg's lower per-statement overhead.
-- Batch AFD calls and use Anthropic **structured/tool-use** output for deterministic JSON.
+- Batch AFD calls and use OpenAI **forced function/tool-use** output for deterministic JSON.
 - Because per-city-per-cycle calls add up; batching + structured output cuts cost and parsing fragility, staying inside the $3–8/day target.
 
 ## Version Compatibility
@@ -132,7 +132,7 @@ Weatherquant is a probabilistic forecasting system that prices bets on Kalshi da
 
 ## Sources
 
-- PyPI JSON API (live, 2026-06-15) — verified current versions: numpy 2.4.6, cfgrib 0.9.15.1, xarray 2026.4.0, eccodes 2.47.0, boto3 1.43.29, psycopg 3.3.4, kalshi-python 2.1.4, kalshi-sdk 4.1.0, anthropic 0.109.1, websockets 16.0, cryptography 49.0.0, httpx 0.28.1, apscheduler 3.11.2, sqlalchemy 2.0.50, alembic 1.18.4, pydantic-settings 2.14.1, python-dotenv 1.2.2, timezonefinder 8.2.4, herbie-data 2026.3.0, pygrib 2.1.8, asyncpg 0.31.0 — **HIGH**
+- PyPI JSON API (live, 2026-06-15) — verified current versions: numpy 2.4.6, cfgrib 0.9.15.1, xarray 2026.4.0, eccodes 2.47.0, boto3 1.43.29, psycopg 3.3.4, kalshi-python 2.1.4, kalshi-sdk 4.1.0, openai 2.44.0, websockets 16.0, cryptography 49.0.0, httpx 0.28.1, apscheduler 3.11.2, sqlalchemy 2.0.50, alembic 1.18.4, pydantic-settings 2.14.1, python-dotenv 1.2.2, timezonefinder 8.2.4, herbie-data 2026.3.0, pygrib 2.1.8, asyncpg 0.31.0 — **HIGH**
 - docs.kalshi.com — RSA-PSS (RSA-SHA256, PSS padding) over `timestamp+method+path`; official SDK signs internally — **HIGH**
 - pypi.org/project/kalshi-python — official, maintained by Kalshi Support (repo `Kalshi/exchange-infra`); REST-only, `config.private_key_pem` — **HIGH**
 - registry.opendata.aws (NOAA GFS/GEFS/HRRR/NBM) + AWS CLI `--no-sign-request` guidance — free public buckets, anonymous access — **HIGH**

@@ -81,6 +81,23 @@ def test_openai_error_degrades_to_no_signal():
     assert "reason" in result  # carries the pre-filter reason
 
 
+def test_truncated_tool_arguments_degrade_to_no_signal():
+    """A truncated tool call (e.g. max_completion_tokens hit) yields malformed JSON; the
+    JSONDecodeError must degrade to no-signal like any SDK error (D-11), not propagate."""
+    truncated = types.SimpleNamespace(
+        function=types.SimpleNamespace(
+            name="record_afd_signal", arguments='{"disagreement": true, "summary": "Tem'
+        )
+    )
+    message = types.SimpleNamespace(tool_calls=[truncated])
+    completion = types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)])
+    client = MagicMock()
+    client.chat.completions.create.return_value = completion
+    result = classify_afd(_signal(), wfo="OKX", client=client)
+    assert result["disagreement"] is False
+    assert result.get("reason") == "openai_error"
+
+
 def test_signal_text_forces_tool_use_and_parses_structured_dict():
     client = _mock_client_returning(
         {"disagreement": True, "direction": "uncertain", "summary": "Model spread on the front."}
