@@ -1,16 +1,17 @@
-"""AFD forecaster-disagreement flag (ING-07, D-13) — pre-filter + Anthropic forced tool-use.
+"""AFD forecaster-disagreement flag (ING-07, D-13) — pre-filter + OpenAI forced tool-use.
 
 The AFD is untrusted human free-text; a flagged disagreement is a soft Phase-4 sizing
 modifier, never a hard gate. Two fixes over v3: a keyword pre-filter gates before any paid
-call to stay in budget, and a forced ``tool_choice`` on a strict ``input_schema`` returns a
-guaranteed-shape dict (bounding prompt-injection, T-02-08/ASVS V5) instead of decoding a JSON
-text body. The result stores as an ``observations`` row with ``source='afd'`` via the single
-audited writer; an unset ``ANTHROPIC_API_KEY`` degrades to no-signal (D-06/D-10/D-11; see
+call to stay in budget, and a forced ``tool_choice`` on a strict function ``parameters`` schema
+returns a guaranteed-shape dict (bounding prompt-injection, T-02-08/ASVS V5) instead of decoding
+a JSON text body. The result stores as an ``observations`` row with ``source='afd'`` via the
+single audited writer; an unset ``OPENAI_API_KEY`` degrades to no-signal (D-06/D-10/D-11; see
 docs/DECISIONS.md).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, date, datetime
 from typing import Any
@@ -28,9 +29,10 @@ logger = logging.getLogger(__name__)
 
 SOURCE = "afd"
 
-# The exact model id, pinned to the claude-haiku-4-5 family (cheap tier matching the
-# $3-8/day budget; v3 used claude-haiku-4-5-20251001). Forced tool_choice is supported.
-AFD_MODEL = "claude-haiku-4-5"
+# The exact model id: OpenAI gpt-5.4-nano, the cheapest current-gen tier matching the
+# $3-8/day budget (~$0.18/mo at this codebase's tiny pre-filtered AFD load). Supports forced
+# function calling for the guaranteed-shape tool result.
+AFD_MODEL = "gpt-5.4-nano"
 
 # Fixed external endpoint (SSRF guard T-02-11: WFO codes come from the static map below,
 # never from untrusted input; the host is a constant).
@@ -40,7 +42,7 @@ _USER_AGENT = "weatherquant/0.1 (kalshi daily-high paper-trading)"
 
 
 # --- v3 pre-filter, ported VERBATIM (kalshi_weather_bot_v3.py L277-309) -------------
-# These two keyword lists and afd_should_classify gate BEFORE any paid Anthropic call so
+# These two keyword lists and afd_should_classify gate BEFORE any paid OpenAI call so
 # routine discussions never cost a token (D-13, budget). Copied byte-for-byte from v3.
 AFD_ROUTINE_PHRASES = [
     "no significant", "no significant changes",
@@ -103,31 +105,34 @@ assert set(CITY_WFO) == set(CITIES), (
 )
 
 
-# --- Anthropic forced tool-use (Pattern 7) -----------------------------------------
-# A single tool whose input_schema IS the JSON shape; forcing tool_choice returns a
+# --- OpenAI forced tool-use (Pattern 7) --------------------------------------------
+# A single function tool whose `parameters` IS the JSON shape; forcing tool_choice returns a
 # guaranteed-shape dict and bounds prompt-injection to those keys (D-13, T-02-08, ASVS V5).
 _AFD_TOOL = {
-    "name": "record_afd_signal",
-    "description": "Record the forecaster-disagreement signal from an NWS AFD excerpt.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "disagreement": {
-                "type": "boolean",
-                "description": "True if the forecaster flags model disagreement / low "
-                "confidence in tomorrow's high temperature.",
+    "type": "function",
+    "function": {
+        "name": "record_afd_signal",
+        "description": "Record the forecaster-disagreement signal from an NWS AFD excerpt.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "disagreement": {
+                    "type": "boolean",
+                    "description": "True if the forecaster flags model disagreement / low "
+                    "confidence in tomorrow's high temperature.",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["warmer", "cooler", "uncertain", ""],
+                    "description": "Lean of the disagreement vs guidance, or '' if none.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "One-sentence summary of the temperature signal, or ''.",
+                },
             },
-            "direction": {
-                "type": "string",
-                "enum": ["warmer", "cooler", "uncertain", ""],
-                "description": "Lean of the disagreement vs guidance, or '' if none.",
-            },
-            "summary": {
-                "type": "string",
-                "description": "One-sentence summary of the temperature signal, or ''.",
-            },
+            "required": ["disagreement", "direction", "summary"],
         },
-        "required": ["disagreement", "direction", "summary"],
     },
 }
 
@@ -147,8 +152,8 @@ def classify_afd(
     body as JSON.
 
     Args:
-        client: optional pre-built Anthropic client; the unit test injects a mock so no real
-            paid call is made. ``None`` builds a real ``anthropic.Anthropic``.
+        client: optional pre-built OpenAI client; the unit test injects a mock so no real
+            paid call is made. ``None`` builds a real ``openai.OpenAI``.
 
     Returns:
         ``{"disagreement": bool, "direction": str, "summary": str}`` — always this shape.
@@ -162,51 +167,52 @@ def classify_afd(
         return {**_NO_SIGNAL, "reason": reason}
 
     if client is None:
-        api_key = get_settings().anthropic_api_key
+        api_key = get_settings().openai_api_key
         if not api_key:
             # Graceful degrade (D-11): the key is unset — log a structured skip, no call.
             logger.warning(
-                "AFD classify skipped for WFO=%s: ANTHROPIC_API_KEY unset (degrade, D-11)",
+                "AFD classify skipped for WFO=%s: OPENAI_API_KEY unset (degrade, D-11)",
                 wfo,
             )
-            return {**_NO_SIGNAL, "reason": "anthropic_api_key unset"}
-        from anthropic import Anthropic
+            return {**_NO_SIGNAL, "reason": "openai_api_key unset"}
+        from openai import OpenAI
 
-        client = Anthropic(api_key=api_key)
+        client = OpenAI(api_key=api_key)
 
     try:
-        message = client.messages.create(  # type: ignore[attr-defined]
+        completion = client.chat.completions.create(  # type: ignore[attr-defined]
             model=AFD_MODEL,
-            max_tokens=256,
-            tools=[_AFD_TOOL],
-            tool_choice={"type": "tool", "name": "record_afd_signal"},
             messages=[
                 {
                     "role": "user",
                     "content": f"WFO: {wfo}\n\nAFD excerpt:\n{text[:1500]}",
                 }
             ],
+            tools=[_AFD_TOOL],
+            tool_choice={"type": "function", "function": {"name": "record_afd_signal"}},
+            max_completion_tokens=256,
         )
-    except Exception as exc:  # noqa: BLE001 - any Anthropic/SDK error degrades to no-signal (D-11).
+    except Exception as exc:  # noqa: BLE001 - any OpenAI/SDK error degrades to no-signal (D-11).
         logger.warning(
             "AFD classify failed for WFO=%s (%s); degrading to no-signal (D-11)", wfo, exc
         )
-        return {**_NO_SIGNAL, "reason": "anthropic_error"}
+        return {**_NO_SIGNAL, "reason": "openai_error"}
 
-    # Forced tool_choice → the response carries exactly one tool_use block whose `input`
-    # is the schema-shaped dict. The text body is never decoded as JSON (v3 fragility, D-13).
-    for block in message.content:
-        if getattr(block, "type", None) == "tool_use":
-            result = dict(block.input)
-            # Defensive: guarantee the three required keys exist even if the SDK changes.
-            return {
-                "disagreement": bool(result.get("disagreement", False)),
-                "direction": result.get("direction", ""),
-                "summary": result.get("summary", ""),
-            }
+    # Forced tool_choice → the response's first choice carries exactly one tool call whose
+    # `function.arguments` is a JSON STRING of the schema-shaped dict. We json.loads ONLY those
+    # arguments — the model text body is never decoded as JSON (v3 fragility, D-13, T-02-08).
+    tool_calls = completion.choices[0].message.tool_calls
+    if not tool_calls:
+        logger.warning("AFD classify for WFO=%s returned no tool call; degrading", wfo)
+        return dict(_NO_SIGNAL)
 
-    logger.warning("AFD classify for WFO=%s returned no tool_use block; degrading", wfo)
-    return dict(_NO_SIGNAL)
+    result = json.loads(tool_calls[0].function.arguments)
+    # Defensive: guarantee the three required keys exist even if the SDK changes.
+    return {
+        "disagreement": bool(result.get("disagreement", False)),
+        "direction": result.get("direction", ""),
+        "summary": result.get("summary", ""),
+    }
 
 
 async def fetch_afd_text(

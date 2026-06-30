@@ -69,7 +69,7 @@ class Settings(BaseSettings):
     )
 
     database_url: str
-    anthropic_api_key: str | None = None
+    openai_api_key: str | None = None
     wethr_api_key: str | None = None
 
     # Phase-4 money-path config (D-13). NOT secrets — policy numbers, kept out of the repr.
@@ -157,7 +157,7 @@ class Settings(BaseSettings):
         # Fixed string: no field VALUE is interpolated, so no secret can leak via repr
         # (threats T-02-01, T-05-01). Policy fields (execution_mode etc.) stay OUT too.
         return (
-            "Settings(database_url=<redacted>, anthropic_api_key=<redacted>, "
+            "Settings(database_url=<redacted>, openai_api_key=<redacted>, "
             "wethr_api_key=<redacted>, kalshi_key_id=<redacted>, "
             "kalshi_private_key_path=<redacted>)"
         )
