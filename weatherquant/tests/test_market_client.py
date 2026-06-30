@@ -21,6 +21,7 @@ live creds. The ``-k reconnect`` selector still matches the VALIDATION map comma
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 import pytest
@@ -227,6 +228,47 @@ async def test_subscribed_control_frame_is_skipped():
     assert (_TICKER, 1) in seen
     assert (_TICKER, 2) in seen
     assert http.calls == []
+
+
+async def test_error_control_frame_logs_loud_and_benign_ack_stays_quiet(caplog):
+    """05-WR-01: a rejected-subscribe ``error`` control frame logs LOUD at ERROR with its body.
+
+    Guards the silent-failure hazard before the live Gate-1 run: a Kalshi ``error`` control
+    frame is how a REJECTED SUBSCRIPTION arrives, and at DEBUG it is indistinguishable from a
+    benign ack (or a merely quiet market). This proves (a) an ``error`` frame's body/reason
+    reaches the log at ERROR and the feed survives it, while (b) a benign ``subscribed`` ack
+    produces no ERROR-level record (no false alarm). Fully offline (mock WS + signer stub).
+    """
+    error_frame = {
+        "type": "error",
+        "msg": {"code": 6, "msg": "subscription rejected: bad ticker"},
+    }
+
+    # (a) An error control frame logs LOUD at ERROR with the reason body, feed survives it.
+    http = _MockHttp(_FP_PAYLOAD)
+    conn1 = _MockWS([error_frame, _ws_snapshot(1)], close_after=False)
+    connector = _MockConnector([conn1])
+    with caplog.at_level(logging.DEBUG, logger="weatherquant.market.client"):
+        await run_feed([_TICKER], _signer, ws_connect=connector, max_reconnects=1)
+
+    error_records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert error_records, "an error control frame must log at ERROR, not DEBUG"
+    assert any(
+        "subscription rejected: bad ticker" in r.getMessage() for r in error_records
+    ), "the error body/reason must reach the log output"
+    # The feed survived the error frame and still applied the following snapshot.
+    assert http.calls == []
+
+    # (b) A benign `subscribed` ack stays at DEBUG — no ERROR-level record (no false alarm).
+    caplog.clear()
+    conn2 = _MockWS([_CONTROL_FRAME, _ws_snapshot(1)], close_after=False)
+    connector2 = _MockConnector([conn2])
+    with caplog.at_level(logging.DEBUG, logger="weatherquant.market.client"):
+        await run_feed([_TICKER], _signer, ws_connect=connector2, max_reconnects=1)
+
+    assert not [r for r in caplog.records if r.levelno == logging.ERROR], (
+        "a benign control-frame ack must NOT produce an ERROR-level record"
+    )
 
 
 async def test_ws_snapshot_is_seq_anchor():

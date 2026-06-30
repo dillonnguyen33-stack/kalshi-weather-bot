@@ -10,12 +10,167 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+from collections.abc import Mapping
 from datetime import date
 from typing import Any
 
 from weatherquant.db.engine import get_engine, get_settings
+# Imported INTO this module's namespace as test seams (run_price's structured-strike fetch builds
+# the signer + resolves the host here, so tests monkeypatch cli.pricing.KalshiSigner /
+# cli.pricing._resolve_hosts). cli/ sits at the edge — importing market here breaks no invariant
+# (the no-market-import rule is price/-only); cli.paper already imports the same seams.
+from weatherquant.market.auth import KalshiSigner
+from weatherquant.market.client import _resolve_hosts
 
 logger = logging.getLogger(__name__)
+
+# Plausible Fahrenheit daily-high strike band + integer tolerance for the structured-strike
+# scale-sanity check. The 05.1-UAT demo returns SCALED strikes (e.g. 8.5e-05 for 85°F); int()-ing
+# that silently yields 0 and prices the WRONG bucket. A real KXHIGH strike is a whole °F degree in
+# this generous band (deep-winter Denver/Chicago lows to Phoenix/Austin highs), so a non-integer or
+# out-of-band value FAILS LOUD rather than int()-zeroing a degenerate strike (D-06 fail-loud).
+_STRIKE_MIN_F = -80
+_STRIKE_MAX_F = 140
+_STRIKE_INT_TOL = 1e-6
+
+
+def _plausible_strike(value: Any, *, field: str, ticker: str) -> int | None:
+    """Validate a structured strike is a plausible integer °F degree, fail loud on scaled junk.
+
+    ``None`` passes through (an open-tail strike legitimately omits one of floor/cap). A present
+    strike must be a finite, (near-)integer value inside the plausible daily-high band; the demo's
+    ``8.5e-05`` is non-integer (``8.5e-05`` is not within ``_STRIKE_INT_TOL`` of ``0``) so it raises
+    instead of silently becoming ``int(8.5e-05) == 0`` — the exact degenerate-strike money-path
+    hazard the project's fail-loud discipline forbids (never int()-zero).
+    """
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(
+            f"price/paper: {field}={value!r} on {ticker} is not numeric — refusing to price a "
+            "non-numeric strike (fail loud, never int()-zero)."
+        ) from exc
+    if not math.isfinite(f):
+        raise SystemExit(
+            f"price/paper: {field}={value!r} on {ticker} is not a finite strike (fail loud)."
+        )
+    rounded = round(f)
+    if abs(f - rounded) > _STRIKE_INT_TOL:
+        raise SystemExit(
+            f"price/paper: {field}={value!r} on {ticker} is not an integer °F strike (looks "
+            "scaled, e.g. the demo's 8.5e-05 for 85°) — refusing to int()-zero a degenerate "
+            "strike (D-06 fail-loud)."
+        )
+    if not (_STRIKE_MIN_F <= rounded <= _STRIKE_MAX_F):
+        raise SystemExit(
+            f"price/paper: {field}={value!r} on {ticker} rounds to {rounded}°F, outside the "
+            f"plausible daily-high band [{_STRIKE_MIN_F}, {_STRIKE_MAX_F}] — fail loud (D-06)."
+        )
+    return int(rounded)
+
+
+def _resolve_bucket(
+    ticker: str, *, market: Mapping[str, Any] | None = None
+) -> tuple[int | None, int | None, bool, bool]:
+    """Resolve ``(lo, hi, open_lo, open_hi)`` ONCE, preferring the structured GetMarket strikes (D-06).
+
+    The structured ``floor_strike`` / ``cap_strike`` / ``strike_type`` from a fetched ``GetMarket``
+    record is the AUTHORITATIVE, live-confirmed path (05-UAT Test 3 / test_kxhigh_live_crosscheck).
+    REAL date-coded KXHIGH tickers do NOT match the positional ``KXHIGH{SUFFIX}-lo-hi`` regex, so
+    they REQUIRE the structured record — the ``B``/``T`` tail direction is unconfirmed and MUST NOT
+    be guessed on the money path. When no record is supplied the only safe fallback is the
+    positional ticker-string parse (the synthetic closed-range form); a real ticker with no record
+    fails loud inside ``parse_ticker`` rather than fabricating a bucket.
+    """
+    from weatherquant import price as pricing
+
+    if market is not None:
+        floor_strike = _plausible_strike(
+            market.get("floor_strike"), field="floor_strike", ticker=ticker
+        )
+        cap_strike = _plausible_strike(
+            market.get("cap_strike"), field="cap_strike", ticker=ticker
+        )
+        return pricing.parse_ticker(
+            floor_strike=floor_strike,
+            cap_strike=cap_strike,
+            strike_type=market.get("strike_type"),
+        )
+    return pricing.parse_ticker(ticker)
+
+
+def _needs_market_record(ticker: str) -> bool:
+    """True iff ``ticker`` is NOT the positional synthetic form (so a structured record is needed).
+
+    A positional ``KXHIGH{SUFFIX}-lo-hi`` ticker resolves with NO network (the synthetic
+    closed-range form tests/dev use). A REAL date-coded ticker raises ``ValueError`` in
+    ``parse_ticker`` — that is precisely the branch that must fetch the structured ``GetMarket``
+    record (never guess the B/T grammar).
+    """
+    from weatherquant import price as pricing
+
+    try:
+        pricing.parse_ticker(ticker)
+    except ValueError:
+        return True
+    return False
+
+
+def _fetch_market_record(
+    ticker: str, sign: Any, rest_host: str
+) -> dict[str, Any]:
+    """Run the signed async ``GetMarket`` fetch synchronously (the I/O edge; structured-strike path).
+
+    Shared by ``run_price`` and ``run_paper`` so both resolve the structured strikes through the
+    ONE :func:`weatherquant.market.client.fetch_market` seam (no re-derived auth/host).
+    """
+    import asyncio
+
+    import httpx
+
+    from weatherquant.market.client import fetch_market
+
+    async def _go() -> dict[str, Any]:
+        async with httpx.AsyncClient() as http:
+            return await fetch_market(http, sign, ticker, rest_host=rest_host)
+
+    return asyncio.run(_go())
+
+
+def _resolve_bucket_for_run(
+    ticker: str, *, sign: Any, rest_host: str
+) -> tuple[int | None, int | None, bool, bool]:
+    """Resolve bucket edges ONCE for a run: structured GetMarket strikes for a real ticker, else positional.
+
+    The structured fetch is reached ONLY for a real date-coded ticker (the positional synthetic
+    form resolves offline with no signer/network) so the offline DB-free suite stays green while a
+    live KXHIGH ticker drives the authoritative structured path.
+    """
+    if not _needs_market_record(ticker):
+        return _resolve_bucket(ticker)
+    market = _fetch_market_record(ticker, sign, rest_host)
+    return _resolve_bucket(ticker, market=market)
+
+
+def _resolve_price_bucket(
+    ticker: str, *, settings: Any, demo: bool
+) -> tuple[int | None, int | None, bool, bool]:
+    """``run_price`` bucket resolution: structured GetMarket strikes for a real ticker, else positional.
+
+    Builds the signer + resolves the host ONLY when a REAL date-coded ticker forces the structured
+    fetch (the synthetic positional form resolves offline with no signer/network), so the smoke
+    command stays offline for the tests/dev synthetic ticker and reaches the network only for a live
+    KXHIGH market. The mid stays MOCKED (``--market-mid``, D-16); only the bucket edges come from the
+    live record.
+    """
+    if not _needs_market_record(ticker):
+        return _resolve_bucket(ticker)
+    _, rest_host = _resolve_hosts(demo)
+    signer = KalshiSigner.from_settings(settings)
+    return _resolve_bucket_for_run(ticker, sign=signer.sign, rest_host=rest_host)
 
 
 def _blend_distribution(
@@ -130,18 +285,23 @@ def _blend_distribution(
 
 
 def _price_bucket(
-    blend: dict[str, Any], ticker: str, mid: float
+    blend: dict[str, Any],
+    bucket: tuple[int | None, int | None, bool, bool],
+    mid: float,
 ) -> tuple[float, float, float, float]:
     """Price one bucket on ``blend`` at ``mid`` — the shared run_price/run_paper money tail.
 
-    Returns ``(prob, p_used, ev, stake_fraction)``. The ONLY difference between the mocked
-    (``--market-mid``) and real (live ``mid_unit``) money paths is the ``mid`` arg, so both
-    share this one stake-arg ordering — EV and the sized stake stay on the SAME shrunk belief
-    (``p_used``) and can never silently disagree in sign near the boundary (D-08/D-16).
+    Takes the bucket edges RESOLVED ONCE (``_resolve_bucket`` — structured GetMarket strikes for a
+    real date-coded ticker, the positional parse for the synthetic form) rather than re-parsing the
+    ticker string here, so a real KXHIGH ticker the positional regex cannot match is priced via the
+    authoritative structured path. Returns ``(prob, p_used, ev, stake_fraction)``. The ONLY
+    difference between the mocked (``--market-mid``) and real (live ``mid_unit``) money paths is the
+    ``mid`` arg, so both share this one stake-arg ordering — EV and the sized stake stay on the SAME
+    shrunk belief (``p_used``) and can never silently disagree in sign near the boundary (D-08/D-16).
     """
     from weatherquant import price as pricing
 
-    lo, hi, open_lo, open_hi = pricing.parse_ticker(ticker)
+    lo, hi, open_lo, open_hi = bucket
     c_lo, c_hi = pricing.integers_in_bucket(lo, hi, open_lo, open_hi)
     prob = pricing.bucket_prob(
         blend["mu_blend"], blend["sigma_blend"], c_lo, c_hi, open_lo, open_hi
@@ -213,10 +373,16 @@ def run_price(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     if args.ticker is not None:
+        # Resolve the bucket edges ONCE: structured GetMarket strikes for a real date-coded ticker
+        # the positional regex cannot match, else the synthetic positional parse (no network). The
+        # mid stays MOCKED (--market-mid, D-16); only the bucket edges come from the live record.
+        bucket_edges = _resolve_price_bucket(
+            args.ticker, settings=get_settings(), demo=bool(getattr(args, "demo", False))
+        )
         # The shared money tail (also run by run_paper); the ONLY difference there is the REAL
         # live-book midpoint replacing this MOCKED --market-mid (D-08/D-16). EV + stake share the
         # one p_used basis inside _price_bucket so the printed edge and the stake never disagree.
-        prob, _pu, ev, stake = _price_bucket(blend, args.ticker, market_mid)
+        prob, _pu, ev, stake = _price_bucket(blend, bucket_edges, market_mid)
         bucket = {
             "ticker": args.ticker, "prob": prob, "ev": ev, "stake_fraction": stake,
         }

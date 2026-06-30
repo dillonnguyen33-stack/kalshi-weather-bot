@@ -61,6 +61,9 @@ _RECONNECT_BACKOFF_MAX_SECONDS = 30.0
 
 # REST orderbook path template; {ticker} is path-segment data, the host is a fixed const.
 _REST_ORDERBOOK_PATH = "/trade-api/v2/markets/{ticker}/orderbook"
+# REST GetMarket path template (the STRUCTURED strike record, not the orderbook); {ticker} is
+# path-segment data, the host is a fixed const (SSRF guard T-05-11).
+_REST_MARKET_PATH = "/trade-api/v2/markets/{ticker}"
 _REST_METHOD = "GET"
 
 # Type aliases for the injectable seams.
@@ -186,6 +189,78 @@ async def fetch_snapshot(
         raise
 
 
+async def fetch_market(
+    http: Any,
+    signer: SignerFn,
+    ticker: str,
+    *,
+    rest_host: str = REST_HOST_PROD,
+) -> dict[str, Any]:
+    """Fetch + sign a REST ``GetMarket`` record for ``ticker`` — the STRUCTURED strike path (PAP-01).
+
+    The money path resolves bucket edges from the live-confirmed structured fields
+    (``floor_strike`` / ``cap_strike`` / ``strike_type``) that ``price.parse_ticker`` consumes, so
+    REAL date-coded KXHIGH tickers (``KXHIGH{CITY}-{DATE}-{B/T...}``) — which the positional
+    ``KXHIGH{SUFFIX}-lo-hi`` regex can NEVER match — are priced/settled via the authoritative
+    structured record instead of guessing the B/T ticker-string grammar. Mirrors
+    :func:`fetch_snapshot`'s signer + httpx REST seam and error discipline: the path is signed
+    WITHOUT a query (Pitfall 6 / T-05-06), the host is a fixed const (SSRF guard T-05-11), and the
+    ``GetMarket`` response wraps the record under ``"market"``.
+
+    Args:
+        http: an injectable async HTTP client exposing ``await http.get(url, headers=)`` (an
+            ``httpx.AsyncClient`` in production, a mock in tests).
+        signer: the signing seam ``signer(method, path) -> headers``.
+        ticker: the market ticker (a path segment; the host stays a fixed const, T-05-11).
+        rest_host: the fixed REST host constant (prod by default; demo for the checkpoint).
+
+    Returns:
+        ``{"ticker", "floor_strike", "cap_strike", "strike_type"}`` — the structured strike fields
+        ``price.parse_ticker(floor_strike=, cap_strike=, strike_type=)`` resolves to bucket edges.
+
+    Raises:
+        ValueError: a 404 surfaces a clear "no such market" message; a missing/non-Mapping
+            ``market`` record raises — fail loud, never a fabricated bucket.
+        httpx.HTTPError: on a transport/auth/5xx error (logged ``[market error]`` and re-raised).
+    """
+    path = _REST_MARKET_PATH.format(ticker=ticker)
+    headers = dict(signer(_REST_METHOD, path))  # query-stripped path (Pitfall 6)
+    url = f"{rest_host}{path}"
+    try:
+        response = await http.get(url, headers=headers)
+        if getattr(response, "status_code", None) == 404:
+            # A 404 is the clear "no such market" case (a dated ticker may have expired) — surface
+            # it as a descriptive ValueError, not a raw HTTPStatusError; auth/5xx fall through to
+            # raise_for_status and fail loud below.
+            raise ValueError(
+                f"fetch_market: no such market {ticker!r} (HTTP 404) — cannot resolve structured "
+                "strikes for the money path."
+            )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, KeyError, TypeError) as exc:
+        logger.warning("[market error] fetch_market failed for %s: %s", ticker, exc)
+        raise
+    if not isinstance(payload, Mapping) or "market" not in payload:
+        raise ValueError(
+            f"fetch_market: GetMarket response for {ticker!r} carries no 'market' record "
+            f"(fail loud, never a fabricated bucket): {payload!r}"
+        )
+    market = payload["market"]
+    if not isinstance(market, Mapping):
+        raise ValueError(
+            f"fetch_market: 'market' record for {ticker!r} is not a mapping: {market!r}"
+        )
+    # The structured strike fields the live-confirmed parse_ticker path consumes (an open-tail
+    # market legitimately omits one of floor/cap; absent strike_type is handled downstream).
+    return {
+        "ticker": market.get("ticker", ticker),
+        "floor_strike": market.get("floor_strike"),
+        "cap_strike": market.get("cap_strike"),
+        "strike_type": market.get("strike_type"),
+    }
+
+
 def _subscribe_command(tickers: Sequence[str]) -> str:
     """Build the ``orderbook_delta`` subscribe command JSON for ``tickers``."""
     return json.dumps(
@@ -283,7 +358,15 @@ async def run_feed(
                         continue
                     # A control frame is feed-level — skip it BEFORE keying a book (W1).
                     if isinstance(msg, Mapping) and msg.get("type") in CONTROL_FRAME_TYPES:
-                        logger.debug("[ws] skipping control frame: %s", msg.get("type"))
+                        if msg.get("type") == "error":
+                            # A Kalshi `error` control frame is how a REJECTED SUBSCRIPTION
+                            # arrives — log it LOUD at ERROR with the FULL body so the reason
+                            # is impossible to miss in a live `--watch` run (05-WR-01). The feed
+                            # still survives the frame (continue, no raise/break — the loud log
+                            # is the alarm, not a crash).
+                            logger.error("[ws error] kalshi rejected subscription: %s", msg)
+                        else:
+                            logger.debug("[ws] skipping control frame: %s", msg.get("type"))
                         continue
                     ticker = _msg_ticker(msg, tickers)
                     book = books[ticker]
@@ -344,4 +427,12 @@ def _msg_ticker(msg: Mapping[str, Any], tickers: Sequence[str]) -> str:
     )
 
 
-__all__ = ["REST_HOST_DEMO", "REST_HOST_PROD", "WS_URL_DEMO", "WS_URL_PROD", "fetch_snapshot", "run_feed"]
+__all__ = [
+    "REST_HOST_DEMO",
+    "REST_HOST_PROD",
+    "WS_URL_DEMO",
+    "WS_URL_PROD",
+    "fetch_market",
+    "fetch_snapshot",
+    "run_feed",
+]
