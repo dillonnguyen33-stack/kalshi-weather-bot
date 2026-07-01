@@ -1,9 +1,18 @@
 # Gate-1 paper-trading targets — one "CITY TICKER" per line.
-# CITY must be a registry code (NYC, LAX, ...). TICKER is the real date-coded Kalshi
-# KXHIGH market you want to paper-trade. A literal {date} is replaced with today's
-# YYYY-MM-DD; if Kalshi's ticker date encoding differs, paste the exact ticker instead.
-# Lines starting with '#' and blank lines are ignored.
 #
-# Fill in the markets you intend to trade across the Gate-1 window, e.g.:
-# NYC KXHIGHNY-{date}-B62
-# LAX KXHIGHLAX-{date}-B78
+# CITY  : registry code — one of NYC CHI AUS MIA LAX DEN PHI
+# TICKER: a real, currently-OPEN Kalshi KXHIGH market for that city+day.
+#         Anatomy:  KXHIGH<SUFFIX>-<YYMMMDD>-<BUCKET>
+#           SUFFIX  city market code (NOT the registry key):
+#                   NYC->NY  CHI->CHI  AUS->AUS  MIA->MIA  LAX->LAX  DEN->DEN  PHI->PHIL
+#           YYMMMDD Kalshi date code, e.g. 26JUN30  (use the literal {kdate} token to auto-fill)
+#           BUCKET  B<mid> for a range (B62.5 = "62° to 63°") or T<n> for a tail (T90 = "91°+")
+#
+# Pick the bucket(s) straddling YOUR model's predicted daily high for that city (run
+# `weatherquant price --city <C> --date <today> --ticker <T>` to see the model's bucket prob/EV).
+# List today's real open tickers from Kalshi (public GET, no auth):
+#   curl -s 'https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXHIGHNY&status=open'
+#
+# Lines starting with '#' and blank lines are ignored. Example (edit to today's real buckets):
+# NYC KXHIGHNY-{kdate}-B88.5
+# LAX KXHIGHLAX-{kdate}-B78.5
