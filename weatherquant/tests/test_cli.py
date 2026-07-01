@@ -174,6 +174,49 @@ def test_build_scheduler_registers_per_model_jobs():
     assert scheduler.running is False
 
 
+def test_scheduler_grib_job_ingests_both_leads_per_city(monkeypatch: pytest.MonkeyPatch):
+    """The live grib job ingests lead 0 AND lead 24 for every city (feeds the traded horizon)."""
+    import asyncio
+
+    from weatherquant import scheduler as sched
+    from weatherquant.registry import CITIES
+
+    calls: list[tuple[str, int]] = []
+
+    async def _fake_ingest(bind, model, city, cycle, *, mode, lead):  # noqa: ANN001
+        calls.append((city, lead))
+
+    monkeypatch.setattr(sched, "get_engine", lambda: object())
+    monkeypatch.setattr(sched.orchestrator, "ingest_cycle", _fake_ingest)
+    asyncio.run(sched._ingest_grib_all_cities("hrrr", 1))
+
+    assert sched.LIVE_LEADS == (0, 24)
+    for city in CITIES:
+        assert (city, 0) in calls, city
+        assert (city, 24) in calls, city
+
+
+def test_scheduler_lead24_failure_does_not_sink_lead0(monkeypatch: pytest.MonkeyPatch):
+    """A missing fxx=24 (e.g. HRRR hourly) degrades+logs; the lead-0 write still happens for all cities."""
+    import asyncio
+
+    from weatherquant import scheduler as sched
+    from weatherquant.registry import CITIES
+
+    calls: list[tuple[str, int]] = []
+
+    async def _fake_ingest(bind, model, city, cycle, *, mode, lead):  # noqa: ANN001
+        calls.append((city, lead))
+        if lead == 24:
+            raise RuntimeError("no fxx=24 on this cycle")
+
+    monkeypatch.setattr(sched, "get_engine", lambda: object())
+    monkeypatch.setattr(sched.orchestrator, "ingest_cycle", _fake_ingest)
+    # Must NOT raise despite every lead-24 call failing.
+    asyncio.run(sched._ingest_grib_all_cities("hrrr", 1))
+    assert all((city, 0) in calls for city in CITIES)
+
+
 def test_scheduler_jobs_have_explicit_misfire_policy():
     """Each live job sets an explicit misfire_grace_time + coalesce so a late/overrunning cycle
     is handled deliberately, not silently dropped under apscheduler's 1-second default."""
@@ -211,7 +254,7 @@ def test_price_subcommand_parses_valid_city_and_date():
     assert args.command == "price"
     assert args.city == "NYC"
     assert args.date == date(2026, 6, 12)
-    assert args.lead == 0  # default
+    assert args.lead == 24  # default: the calibrated/traded 24h-ahead high
     assert args.market_mid == 0.5  # mocked midpoint default (D-16 — no market fetch)
     assert args.ticker == "KXHIGHNY-62-63"
 

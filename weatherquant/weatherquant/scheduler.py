@@ -33,6 +33,35 @@ logger = logging.getLogger(__name__)
 # Cycle latency cushion: a cadence fires for the cycle that has had time to publish; the
 # orchestrator handles a not-yet-published cycle gracefully (D-11), so clock skew never crashes.
 
+# The live feed ingests TWO leads each cycle: lead 0 (the contemporaneous nowcast + the D-04 ASOS
+# sanity snap) and lead 24 (the calibrated/traded 24h-ahead daily high — what pricing reads). lead 0
+# is PRIMARY (always published for the cycle); lead 24 is BEST-EFFORT — not every model/cycle
+# publishes fxx=24 (e.g. HRRR hourly runs stop at fxx=18), so a missing lead-24 degrades+logs and
+# never sinks the guaranteed lead-0 write.
+# ponytail: lead 24 on the HRRR-hourly cadence is often absent → routine warnings; move lead 24 to
+# the synoptic cadence only if that log noise ever matters.
+PRIMARY_LEAD = 0
+TRADE_LEAD = 24
+LIVE_LEADS = (PRIMARY_LEAD, TRADE_LEAD)
+
+
+def _both_leads(
+    ingest_one: Callable[[str, int], Awaitable[object]],
+) -> Callable[[str], Awaitable[None]]:
+    """Wrap a per-(city, lead) ingest into a per-city coro that does lead 0 then best-effort lead 24."""
+
+    async def _one(city: str) -> None:
+        await ingest_one(city, PRIMARY_LEAD)  # primary: its failure marks the city failed (correct)
+        try:
+            await ingest_one(city, TRADE_LEAD)
+        except Exception as exc:  # noqa: BLE001 - best-effort trade lead; a missing fxx must not sink lead 0
+            logger.warning(
+                "live ingest city=%s lead=%s unavailable (best-effort, D-11): %r",
+                city, TRADE_LEAD, exc,
+            )
+
+    return _one
+
 
 async def _run_per_city(
     make_coro: Callable[[str], Awaitable[object]], label: str
@@ -80,14 +109,19 @@ async def _ingest_grib_all_cities(model: str, step_hours: int) -> None:
     )
     bind = get_engine()
     # Cities are independent (per-city graceful degradation, D-11) — run concurrently so the job
-    # finishes well within its cadence and never overruns into the next firing.
+    # finishes well within its cadence and never overruns into the next firing. Each city ingests
+    # both leads (lead 0 primary, lead 24 best-effort — see LIVE_LEADS).
     n_ok, n_failed = await _run_per_city(
-        lambda city: orchestrator.ingest_cycle(bind, model, city, cycle, mode="live", lead=0),
+        _both_leads(
+            lambda city, lead: orchestrator.ingest_cycle(
+                bind, model, city, cycle, mode="live", lead=lead
+            )
+        ),
         f"grib model={model}",
     )
     logger.info(
-        "live grib job model=%s cycle=%s ran across %d cities (ok=%d failed=%d)",
-        model, cycle, len(CITIES), n_ok, n_failed,
+        "live grib job model=%s cycle=%s leads=%s ran across %d cities (ok=%d failed=%d)",
+        model, cycle, LIVE_LEADS, len(CITIES), n_ok, n_failed,
     )
 
 
@@ -99,12 +133,16 @@ async def _ingest_source_all_cities(source: str, step_hours: int) -> None:
     )
     bind = get_engine()
     n_ok, n_failed = await _run_per_city(
-        lambda city: orchestrator.ingest_cycle(bind, source, city, cycle, mode="live", lead=0),
+        _both_leads(
+            lambda city, lead: orchestrator.ingest_cycle(
+                bind, source, city, cycle, mode="live", lead=lead
+            )
+        ),
         f"source={source}",
     )
     logger.info(
-        "live source job source=%s cycle=%s ran across %d cities (ok=%d failed=%d)",
-        source, cycle, len(CITIES), n_ok, n_failed,
+        "live source job source=%s cycle=%s leads=%s ran across %d cities (ok=%d failed=%d)",
+        source, cycle, LIVE_LEADS, len(CITIES), n_ok, n_failed,
     )
 
 
