@@ -21,6 +21,7 @@ cd "$(dirname "$0")/.."                       # repo root = weatherquant/
 targets="${1:-scripts/paper_targets.txt}"
 today="$(date +%F)"                           # LST settlement date, YYYY-MM-DD (the --date arg)
 kdate="$(date +%y%b%d | tr '[:lower:]' '[:upper:]')"   # Kalshi ticker date code, e.g. 26JUN30
+lead="${LEAD:-24}"                            # trade horizon — MUST match the calibrated lead (24h-ahead high)
 mkdir -p reports
 stamp() { date -u +%FT%TZ; }
 
@@ -31,8 +32,8 @@ fi
 
 echo "[$(stamp)] daily paper run for ${today} (targets=$targets)"
 
-# 1. Refresh today's inputs so pricing sees the latest cycle (idempotent re-run is a no-op).
-uv run weatherquant ingest --all-models --all-cities --date "$today"
+# 1. Refresh today's inputs at the TRADE lead so pricing/calibration align (idempotent re-run is a no-op).
+uv run weatherquant ingest --all-models --all-cities --date "$today" --lead "$lead"
 
 # 2. One watch loop per target, concurrent (each runs to settlement / its --max-duration cap).
 pids=()
@@ -41,7 +42,7 @@ while read -r city ticker _rest; do
   ticker="${ticker//\{kdate\}/$kdate}"
   tlog="reports/paper_${today}_${city}_${ticker}.log"
   echo "[$(stamp)] launch paper --watch city=$city ticker=$ticker → $tlog"
-  uv run weatherquant paper --city "$city" --date "$today" --ticker "$ticker" --watch \
+  uv run weatherquant paper --city "$city" --date "$today" --ticker "$ticker" --lead "$lead" --watch \
     >"$tlog" 2>&1 &
   pids+=("$!")
 done < "$targets"
