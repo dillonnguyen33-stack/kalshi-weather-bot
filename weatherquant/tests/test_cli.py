@@ -430,6 +430,16 @@ def test_run_price_min_ramp_model_chosen_deterministically(
     assert stake_fwd == pytest.approx(expected)
 
 
+def test_nearest_month_circular_distance_and_tiebreak():
+    """_nearest_month selects by cyclic 1..12 distance with a lower-month tie-break (no DB)."""
+    from weatherquant.cli.pricing import _nearest_month
+
+    assert _nearest_month(7, [3, 5]) == 5      # dist 7→5 = 2 beats 7→3 = 4
+    assert _nearest_month(1, [11, 12]) == 12   # wrap-around: 1→12 = 1 beats 1→11 = 2
+    assert _nearest_month(1, [12, 2]) == 2     # both distance 1 → tie → lower month (2) wins
+    assert _nearest_month(6, [6, 9]) == 6      # exact present → distance 0
+
+
 # --- paper subcommand (05-04) — the REAL live-book midpoint loop closer ----------------------
 #
 # run_paper feeds the REAL reflection-derived live-book midpoint into the Phase-4 money path

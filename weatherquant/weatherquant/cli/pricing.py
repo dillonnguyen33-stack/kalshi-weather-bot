@@ -173,6 +173,19 @@ def _resolve_price_bucket(
     return _resolve_bucket_for_run(ticker, sign=signer.sign, rest_host=rest_host)
 
 
+def _nearest_month(target_month: int, available: list[int]) -> int:
+    """Pick the month in ``available`` closest to ``target_month`` on the cyclic 1..12 axis.
+
+    Circular distance ``min(d, 12 - d)`` for ``d = abs(m - target_month)`` so Dec(12)↔Jan(1) == 1.
+    Deterministic tie-break: on equal distance, prefer the LOWER month number (the ``m`` in the key
+    tuple). Caller guarantees ``available`` is non-empty. Pure int arithmetic — no dependency added.
+    """
+    return min(
+        available,
+        key=lambda m: (min(abs(m - target_month), 12 - abs(m - target_month)), m),
+    )
+
+
 def _blend_distribution(
     bind: Any, city: str, target: date, lead: int
 ) -> dict[str, Any]:
