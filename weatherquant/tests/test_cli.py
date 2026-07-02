@@ -15,6 +15,7 @@ section (Task 3) asserts ``build_scheduler`` registers the per-model cadence job
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pytest
@@ -438,6 +439,87 @@ def test_nearest_month_circular_distance_and_tiebreak():
     assert _nearest_month(1, [11, 12]) == 12   # wrap-around: 1→12 = 1 beats 1→11 = 2
     assert _nearest_month(1, [12, 2]) == 2     # both distance 1 → tie → lower month (2) wins
     assert _nearest_month(6, [6, 9]) == 6      # exact present → distance 0
+
+
+def _patch_price_db_by_month(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    forecasts: list[dict],
+    cal_by_month: dict[int, list[dict]],
+    cap: float = 0.025,
+) -> None:
+    """Patch run_price offline with a MONTH-AWARE calibration_params fake (fallback path).
+
+    The fake stamps each returned calibration row with its month so the production
+    ``int(r["month"])`` filter works: an exact-month query (``where["month"]`` set) returns that
+    month's rows; the broad fallback query (``month`` absent) returns every stamped row.
+    """
+
+    def _fake_latest(bind, table, where=None):  # noqa: ANN001
+        if table == "forecasts":
+            return forecasts
+        if table == "calibration_params":
+            m = (where or {}).get("month")
+            if m is not None:
+                return [dict(row, month=m) for row in cal_by_month.get(m, [])]
+            return [
+                dict(row, month=mm)
+                for mm, rows in cal_by_month.items()
+                for row in rows
+            ]
+        if table == "observations":
+            return []
+        raise AssertionError(f"unexpected table {table!r}")
+
+    monkeypatch.setattr(cli.pricing, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        cli.pricing, "get_settings", lambda: type("S", (), {"max_position_fraction": cap})()
+    )
+    monkeypatch.setattr("weatherquant.db.queries.latest", _fake_latest)
+
+
+def test_run_price_uses_exact_month_when_present(monkeypatch: pytest.MonkeyPatch):
+    """When the target month has a fit, it is used directly — no fallback warning fires."""
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={6: [_cal_row("hrrr")]},  # target 2026-06-12 → month 6
+    )
+    result = cli.run_price(_price_args())
+    assert result["models"] == ["hrrr"]
+
+
+def test_run_price_falls_back_to_nearest_month(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A July run with fits only at months 3 and 5 prices with month=5 (NEAREST, not 3)."""
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={3: [_cal_row("hrrr")], 5: [_cal_row("hrrr")]},
+    )
+    args = cli.build_parser().parse_args(
+        ["price", "--city", "NYC", "--date", "2026-07-12", "--market-mid", "0.1",
+         "--ticker", "KXHIGHNY-62-63"]
+    )
+    with caplog.at_level(logging.WARNING):
+        result = cli.run_price(args)
+    assert result["models"] == ["hrrr"]  # run succeeded via fallback
+    assert "month=5" in caplog.text      # nearest fitted month named
+    assert "month=3" not in caplog.text  # NOT the farther month
+
+
+def test_run_price_fails_loud_when_no_calibration_any_month(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """No calibration in ANY month for the (city, lead) still fails loud (SystemExit)."""
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={},
+    )
+    with pytest.raises(SystemExit):
+        cli.run_price(_price_args())
 
 
 # --- paper subcommand (05-04) — the REAL live-book midpoint loop closer ----------------------

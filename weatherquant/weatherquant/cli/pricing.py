@@ -215,9 +215,27 @@ def _blend_distribution(
     forecasts = queries.latest(
         bind, "forecasts", where={"city": city, "target_date": target, "lead": lead}
     )
+    used_month = month
     cal_rows = queries.latest(
         bind, "calibration_params", where={"city": city, "lead": lead, "month": month}
     )
+    if not cal_rows:
+        # The exact month has no fit. Broaden to (city, lead) — one row per (model, month) — and
+        # price with the NEAREST fitted month on the cyclic 1..12 axis. A missing (city, lead)
+        # (no month at all) leaves cal_rows empty so the downstream fail-loud guard still fires:
+        # the fallback rescues a missing MONTH only, never a missing city/lead.
+        all_rows = queries.latest(
+            bind, "calibration_params", where={"city": city, "lead": lead}
+        )
+        available = {int(r["month"]) for r in all_rows}
+        if available:
+            used_month = _nearest_month(month, sorted(available))
+            cal_rows = [r for r in all_rows if int(r["month"]) == used_month]
+            logger.warning(
+                "calibration month=%s absent for city=%s lead=%s — pricing with nearest "
+                "fitted month=%s (%d fits)",
+                month, city, lead, used_month, len(cal_rows),
+            )
     cal_by_model = {r["model"]: r for r in cal_rows}
 
     members_by_model: dict[str, list[float]] = {}
@@ -259,7 +277,7 @@ def _blend_distribution(
     if not used_models:
         raise SystemExit(
             f"no model has BOTH latest forecasts and calibration for "
-            f"city={city} date={target} lead={lead} month={month}."
+            f"city={city} date={target} lead={lead} month={used_month}."
         )
 
     weights = pricing.accuracy_weights(np.asarray(crps_oos, dtype=np.float64))
