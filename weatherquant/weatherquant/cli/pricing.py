@@ -173,6 +173,32 @@ def _resolve_price_bucket(
     return _resolve_bucket_for_run(ticker, sign=signer.sign, rest_host=rest_host)
 
 
+_FIT_PARAM_KEYS = ("mean_intercept", "mean_slope", "var_intercept", "var_slope", "sigma_floor")
+
+
+def _has_usable_fit(row: Any) -> bool:
+    """True when a calibration row carries a complete (all-non-NULL) EMOS param set.
+
+    A degenerate placeholder row (every param NULL) is unusable — ``link.predict`` can't run on
+    it. The nearest-month fallback must ignore such rows so a junk month never shadows a real fit;
+    the pricing loop applies the SAME check per model. One definition, two call sites.
+    """
+    return all(row[k] is not None for k in _FIT_PARAM_KEYS)
+
+
+def _nearest_month(target_month: int, available: list[int]) -> int:
+    """Pick the month in ``available`` closest to ``target_month`` on the cyclic 1..12 axis.
+
+    Circular distance ``min(d, 12 - d)`` for ``d = abs(m - target_month)`` so Dec(12)↔Jan(1) == 1.
+    Deterministic tie-break: on equal distance, prefer the LOWER month number (the ``m`` in the key
+    tuple). Caller guarantees ``available`` is non-empty. Pure int arithmetic — no dependency added.
+    """
+    return min(
+        available,
+        key=lambda m: (min(abs(m - target_month), 12 - abs(m - target_month)), m),
+    )
+
+
 def _blend_distribution(
     bind: Any, city: str, target: date, lead: int
 ) -> dict[str, Any]:
@@ -202,9 +228,31 @@ def _blend_distribution(
     forecasts = queries.latest(
         bind, "forecasts", where={"city": city, "target_date": target, "lead": lead}
     )
+    used_month = month
     cal_rows = queries.latest(
         bind, "calibration_params", where={"city": city, "lead": lead, "month": month}
     )
+    if not cal_rows:
+        # The exact month has no fit. Broaden to (city, lead) — one row per (model, month) — and
+        # price with the NEAREST fitted month on the cyclic 1..12 axis. Only months with a USABLE
+        # (all-params-present) fit are candidates, so a degenerate NULL-param placeholder can't
+        # shadow a real fit a month further away. A missing (city, lead) — or one with only junk
+        # rows — leaves cal_rows empty so the downstream fail-loud guard still fires: the fallback
+        # rescues a missing MONTH only, never a missing city/lead.
+        all_rows = [
+            r
+            for r in queries.latest(bind, "calibration_params", where={"city": city, "lead": lead})
+            if _has_usable_fit(r)
+        ]
+        available = {int(r["month"]) for r in all_rows}
+        if available:
+            used_month = _nearest_month(month, sorted(available))
+            cal_rows = [r for r in all_rows if int(r["month"]) == used_month]
+            logger.warning(
+                "calibration month=%s absent for city=%s lead=%s — pricing with nearest "
+                "fitted month=%s (%d fits)",
+                month, city, lead, used_month, len(cal_rows),
+            )
     cal_by_model = {r["model"]: r for r in cal_rows}
 
     members_by_model: dict[str, list[float]] = {}
@@ -221,20 +269,12 @@ def _blend_distribution(
     used_models: list[str] = []
     for model, vals in members_by_model.items():
         cal = cal_by_model.get(model)
-        if cal is None or not vals:
+        if cal is None or not vals or not _has_usable_fit(cal):
             continue
         arr = np.asarray(vals, dtype=np.float64)
         mean_f = float(arr.mean())
         var_f = float(arr.var()) if arr.size > 1 else 0.0
-        params = (
-            cal["mean_intercept"],
-            cal["mean_slope"],
-            cal["var_intercept"],
-            cal["var_slope"],
-            cal["sigma_floor"],
-        )
-        if any(v is None for v in params):
-            continue
+        params = tuple(cal[k] for k in _FIT_PARAM_KEYS)
         mu_i, sigma_i = link.predict(params, np.array([mean_f]), np.array([var_f]))
         mus.append(float(mu_i[0]))
         sigmas.append(float(sigma_i[0]))
@@ -246,7 +286,7 @@ def _blend_distribution(
     if not used_models:
         raise SystemExit(
             f"no model has BOTH latest forecasts and calibration for "
-            f"city={city} date={target} lead={lead} month={month}."
+            f"city={city} date={target} lead={lead} month={used_month}."
         )
 
     weights = pricing.accuracy_weights(np.asarray(crps_oos, dtype=np.float64))

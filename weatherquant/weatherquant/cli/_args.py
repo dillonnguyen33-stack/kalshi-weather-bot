@@ -112,6 +112,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    # --- live: start the scheduler daemon (D-15) — the continuous half of ingestion ---------
+    # No args: build_scheduler owns the cadences; this just runs the asyncio loop until SIGINT.
+    sub.add_parser(
+        "live",
+        help="Start the live ingestion scheduler (mode=live) and run until interrupted.",
+    )
+
     ingest = sub.add_parser(
         "ingest",
         help="Backfill forecasts/observations for a date or date range (idempotent).",
@@ -140,8 +147,9 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument(
         "--lead",
         type=int,
-        default=0,
-        help="Forecast lead hours for the GRIB models (default 0).",
+        default=24,
+        help="Forecast lead hours for the GRIB models (default 24 — the calibrated/traded "
+        "24h-ahead daily high; pass --lead 0 for the contemporaneous nowcast/ASOS sanity snap).",
     )
     ingest.add_argument(
         "--cycle-hours",
@@ -165,8 +173,8 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument(
         "--lead",
         type=int,
-        default=0,
-        help="Forecast lead hours to calibrate (default 0).",
+        default=24,
+        help="Forecast lead hours to calibrate (default 24 — the traded 24h-ahead high).",
     )
     calibrate.add_argument(
         "--oos-fraction",
@@ -201,8 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     price.add_argument(
         "--lead",
         type=int,
-        default=0,
-        help="Forecast lead hours to price (default 0).",
+        default=24,
+        help="Forecast lead hours to price (default 24 — the calibrated 24h-ahead high).",
     )
     price.add_argument(
         "--ticker",
@@ -248,8 +256,8 @@ def build_parser() -> argparse.ArgumentParser:
     paper.add_argument(
         "--lead",
         type=int,
-        default=0,
-        help="Forecast lead hours to price (default 0).",
+        default=24,
+        help="Forecast lead hours to price (default 24 — the calibrated 24h-ahead high).",
     )
     paper.add_argument(
         "--ticker",
@@ -308,8 +316,8 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument(
         "--lead",
         type=int,
-        default=0,
-        help="Forecast lead hours for the proof (default 0).",
+        default=24,
+        help="Forecast lead hours for the proof (default 24 — the calibrated 24h-ahead high).",
     )
     verify.add_argument(
         "--monitor",

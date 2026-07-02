@@ -15,6 +15,7 @@ section (Task 3) asserts ``build_scheduler`` registers the per-model cadence job
 
 from __future__ import annotations
 
+import logging
 from datetime import date
 
 import pytest
@@ -128,6 +129,40 @@ def test_cycle_hours_parsed_to_ints(captured_range: dict):
 # --- Scheduler (02-05 Task 3) ------------------------------------------------------------
 
 
+def test_live_subcommand_parses_with_no_args():
+    """`weatherquant live` is a registered no-arg subcommand (dispatch wiring contract)."""
+    args = cli.build_parser().parse_args(["live"])
+    assert args.command == "live"
+
+
+def test_live_serve_starts_then_shuts_down_scheduler(monkeypatch: pytest.MonkeyPatch):
+    """_serve start()s the scheduler and, when its forever-wait is cancelled, shutdown()s it."""
+    import asyncio
+
+    from weatherquant.cli.live import _serve
+
+    fake = type("S", (), {"started": False, "stopped": False, "get_jobs": lambda self: []})()
+    fake.start = lambda: setattr(fake, "started", True)
+    fake.shutdown = lambda wait=False: setattr(fake, "stopped", True)
+    monkeypatch.setattr("weatherquant.cli.live.build_scheduler", lambda: fake)
+
+    # _serve waits forever; wait_for cancels it after it has started, triggering the finally.
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(asyncio.wait_for(_serve(), timeout=0.05))
+    assert fake.started and fake.stopped
+
+
+def test_run_live_returns_zero_on_interrupt(monkeypatch: pytest.MonkeyPatch):
+    """Ctrl-C (KeyboardInterrupt out of asyncio.run) is a clean stop → exit code 0."""
+
+    def _interrupt(coro):
+        coro.close()  # avoid 'coroutine was never awaited' noise
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("weatherquant.cli.live.asyncio.run", _interrupt)
+    assert cli.run_live(object()) == 0
+
+
 def test_build_scheduler_registers_per_model_jobs():
     """build_scheduler wires AsyncIOScheduler per model cadence WITHOUT starting (D-15)."""
     from weatherquant.scheduler import build_scheduler
@@ -138,6 +173,49 @@ def test_build_scheduler_registers_per_model_jobs():
     assert len(jobs) >= 4
     # The scheduler is configured but NOT started (unit-testable).
     assert scheduler.running is False
+
+
+def test_scheduler_grib_job_ingests_both_leads_per_city(monkeypatch: pytest.MonkeyPatch):
+    """The live grib job ingests lead 0 AND lead 24 for every city (feeds the traded horizon)."""
+    import asyncio
+
+    from weatherquant import scheduler as sched
+    from weatherquant.registry import CITIES
+
+    calls: list[tuple[str, int]] = []
+
+    async def _fake_ingest(bind, model, city, cycle, *, mode, lead):  # noqa: ANN001
+        calls.append((city, lead))
+
+    monkeypatch.setattr(sched, "get_engine", lambda: object())
+    monkeypatch.setattr(sched.orchestrator, "ingest_cycle", _fake_ingest)
+    asyncio.run(sched._ingest_grib_all_cities("hrrr", 1))
+
+    assert sched.LIVE_LEADS == (0, 24)
+    for city in CITIES:
+        assert (city, 0) in calls, city
+        assert (city, 24) in calls, city
+
+
+def test_scheduler_lead24_failure_does_not_sink_lead0(monkeypatch: pytest.MonkeyPatch):
+    """A missing fxx=24 (e.g. HRRR hourly) degrades+logs; the lead-0 write still happens for all cities."""
+    import asyncio
+
+    from weatherquant import scheduler as sched
+    from weatherquant.registry import CITIES
+
+    calls: list[tuple[str, int]] = []
+
+    async def _fake_ingest(bind, model, city, cycle, *, mode, lead):  # noqa: ANN001
+        calls.append((city, lead))
+        if lead == 24:
+            raise RuntimeError("no fxx=24 on this cycle")
+
+    monkeypatch.setattr(sched, "get_engine", lambda: object())
+    monkeypatch.setattr(sched.orchestrator, "ingest_cycle", _fake_ingest)
+    # Must NOT raise despite every lead-24 call failing.
+    asyncio.run(sched._ingest_grib_all_cities("hrrr", 1))
+    assert all((city, 0) in calls for city in CITIES)
 
 
 def test_scheduler_jobs_have_explicit_misfire_policy():
@@ -177,7 +255,7 @@ def test_price_subcommand_parses_valid_city_and_date():
     assert args.command == "price"
     assert args.city == "NYC"
     assert args.date == date(2026, 6, 12)
-    assert args.lead == 0  # default
+    assert args.lead == 24  # default: the calibrated/traded 24h-ahead high
     assert args.market_mid == 0.5  # mocked midpoint default (D-16 — no market fetch)
     assert args.ticker == "KXHIGHNY-62-63"
 
@@ -351,6 +429,129 @@ def test_run_price_min_ramp_model_chosen_deterministically(
         pu, 0.1, pricing.exact_fee(1, 0.1), 1.0, 15, "own:city", False, cap=0.025
     )
     assert stake_fwd == pytest.approx(expected)
+
+
+def test_nearest_month_circular_distance_and_tiebreak():
+    """_nearest_month selects by cyclic 1..12 distance with a lower-month tie-break (no DB)."""
+    from weatherquant.cli.pricing import _nearest_month
+
+    assert _nearest_month(7, [3, 5]) == 5      # dist 7→5 = 2 beats 7→3 = 4
+    assert _nearest_month(1, [11, 12]) == 12   # wrap-around: 1→12 = 1 beats 1→11 = 2
+    assert _nearest_month(1, [12, 2]) == 2     # both distance 1 → tie → lower month (2) wins
+    assert _nearest_month(6, [6, 9]) == 6      # exact present → distance 0
+
+
+def _patch_price_db_by_month(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    forecasts: list[dict],
+    cal_by_month: dict[int, list[dict]],
+    cap: float = 0.025,
+) -> None:
+    """Patch run_price offline with a MONTH-AWARE calibration_params fake (fallback path).
+
+    The fake stamps each returned calibration row with its month so the production
+    ``int(r["month"])`` filter works: an exact-month query (``where["month"]`` set) returns that
+    month's rows; the broad fallback query (``month`` absent) returns every stamped row.
+    """
+
+    def _fake_latest(bind, table, where=None):  # noqa: ANN001
+        if table == "forecasts":
+            return forecasts
+        if table == "calibration_params":
+            m = (where or {}).get("month")
+            if m is not None:
+                return [dict(row, month=m) for row in cal_by_month.get(m, [])]
+            return [
+                dict(row, month=mm)
+                for mm, rows in cal_by_month.items()
+                for row in rows
+            ]
+        if table == "observations":
+            return []
+        raise AssertionError(f"unexpected table {table!r}")
+
+    monkeypatch.setattr(cli.pricing, "get_engine", lambda: object())
+    monkeypatch.setattr(
+        cli.pricing, "get_settings", lambda: type("S", (), {"max_position_fraction": cap})()
+    )
+    monkeypatch.setattr("weatherquant.db.queries.latest", _fake_latest)
+
+
+def test_run_price_uses_exact_month_when_present(monkeypatch: pytest.MonkeyPatch):
+    """When the target month has a fit, it is used directly — no fallback warning fires."""
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={6: [_cal_row("hrrr")]},  # target 2026-06-12 → month 6
+    )
+    result = cli.run_price(_price_args())
+    assert result["models"] == ["hrrr"]
+
+
+def test_run_price_falls_back_to_nearest_month(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A July run with fits only at months 3 and 5 prices with month=5 (NEAREST, not 3)."""
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={3: [_cal_row("hrrr")], 5: [_cal_row("hrrr")]},
+    )
+    args = cli.build_parser().parse_args(
+        ["price", "--city", "NYC", "--date", "2026-07-12", "--market-mid", "0.1",
+         "--ticker", "KXHIGHNY-62-63"]
+    )
+    with caplog.at_level(logging.WARNING):
+        result = cli.run_price(args)
+    assert result["models"] == ["hrrr"]  # run succeeded via fallback
+    assert "month=5" in caplog.text      # nearest fitted month named
+    assert "month=3" not in caplog.text  # NOT the farther month
+
+
+def test_run_price_fallback_skips_null_param_month(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A NEARER month whose only fit has NULL params is skipped for a farther USABLE fit.
+
+    Mirrors the live DB: July (7) with a degenerate all-NULL placeholder at month 6 and a real
+    fit at month 5 must price with month=5, not resolve to the unusable month-6 row.
+    """
+    null_fit = _cal_row(
+        "hrrr",
+        mean_intercept=None,
+        mean_slope=None,
+        var_intercept=None,
+        var_slope=None,
+        sigma_floor=None,
+    )
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={5: [_cal_row("hrrr")], 6: [null_fit]},
+    )
+    args = cli.build_parser().parse_args(
+        ["price", "--city", "NYC", "--date", "2026-07-12", "--market-mid", "0.1",
+         "--ticker", "KXHIGHNY-62-63"]
+    )
+    with caplog.at_level(logging.WARNING):
+        result = cli.run_price(args)
+    assert result["models"] == ["hrrr"]  # priced via the usable month-5 fit
+    assert "month=5" in caplog.text      # farther-but-usable month named
+    assert "month=6" not in caplog.text  # nearer junk month NOT chosen
+
+
+def test_run_price_fails_loud_when_no_calibration_any_month(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """No calibration in ANY month for the (city, lead) still fails loud (SystemExit)."""
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={},
+    )
+    with pytest.raises(SystemExit):
+        cli.run_price(_price_args())
 
 
 # --- paper subcommand (05-04) — the REAL live-book midpoint loop closer ----------------------
