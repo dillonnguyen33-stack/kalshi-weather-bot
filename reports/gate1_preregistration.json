@@ -1,0 +1,24 @@
+{
+  "ci_level": 0.95,
+  "metrics": [
+    "brier",
+    "crps",
+    "ece",
+    "roi",
+    "clv"
+  ],
+  "n_resamples": 10000,
+  "primary_lead": 0,
+  "seed": 0,
+  "sign_map": {
+    "brier": "lower",
+    "clv": "higher",
+    "crps": "lower",
+    "ece": "lower",
+    "roi": "higher"
+  },
+  "test_window": [
+    "2026-06-01",
+    "2026-06-15"
+  ]
+}
