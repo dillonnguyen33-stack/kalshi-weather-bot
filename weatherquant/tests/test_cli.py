@@ -509,6 +509,38 @@ def test_run_price_falls_back_to_nearest_month(
     assert "month=3" not in caplog.text  # NOT the farther month
 
 
+def test_run_price_fallback_skips_null_param_month(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    """A NEARER month whose only fit has NULL params is skipped for a farther USABLE fit.
+
+    Mirrors the live DB: July (7) with a degenerate all-NULL placeholder at month 6 and a real
+    fit at month 5 must price with month=5, not resolve to the unusable month-6 row.
+    """
+    null_fit = _cal_row(
+        "hrrr",
+        mean_intercept=None,
+        mean_slope=None,
+        var_intercept=None,
+        var_slope=None,
+        sigma_floor=None,
+    )
+    _patch_price_db_by_month(
+        monkeypatch,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_by_month={5: [_cal_row("hrrr")], 6: [null_fit]},
+    )
+    args = cli.build_parser().parse_args(
+        ["price", "--city", "NYC", "--date", "2026-07-12", "--market-mid", "0.1",
+         "--ticker", "KXHIGHNY-62-63"]
+    )
+    with caplog.at_level(logging.WARNING):
+        result = cli.run_price(args)
+    assert result["models"] == ["hrrr"]  # priced via the usable month-5 fit
+    assert "month=5" in caplog.text      # farther-but-usable month named
+    assert "month=6" not in caplog.text  # nearer junk month NOT chosen
+
+
 def test_run_price_fails_loud_when_no_calibration_any_month(
     monkeypatch: pytest.MonkeyPatch,
 ):
