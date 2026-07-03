@@ -22,6 +22,7 @@ targets="${1:-scripts/paper_targets.txt}"
 today="$(date +%F)"                           # LST settlement date, YYYY-MM-DD (the --date arg)
 kdate="$(date +%y%b%d | tr '[:lower:]' '[:upper:]')"   # Kalshi ticker date code, e.g. 26JUN30
 lead="${LEAD:-24}"                            # trade horizon — MUST match the calibrated lead (24h-ahead high)
+stagger="${STAGGER:-3}"                        # seconds between WS handshakes — Kalshi 429s a concurrent burst
 mkdir -p reports
 stamp() { date -u +%FT%TZ; }
 
@@ -45,6 +46,7 @@ while read -r city ticker _rest; do
   uv run weatherquant paper --city "$city" --date "$today" --ticker "$ticker" --lead "$lead" --watch \
     >"$tlog" 2>&1 &
   pids+=("$!")
+  sleep "$stagger"                             # space out handshakes so Kalshi doesn't 429 the burst
 done < "$targets"
 
 # 3. Wait for every watch loop; report any that exited non-zero (don't abort the others).

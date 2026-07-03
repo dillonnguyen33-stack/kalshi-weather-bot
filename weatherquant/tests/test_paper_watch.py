@@ -33,6 +33,7 @@ from tests.test_cli import (
     _forecast_rows,
     _paper_args,
     _patch_paper,
+    _scripted_paper_book,
 )
 
 # Reuse the verified mock-WS harness + enveloped builders rather than re-deriving them — the
@@ -227,3 +228,60 @@ def test_watch_persist_failure_surfaces_as_systemexit(monkeypatch: pytest.Monkey
     )
     with pytest.raises(SystemExit, match="persist failed"):
         _run_watch(_MockConnector([conn]))
+
+
+def test_watch_skips_one_sided_book_and_survives(monkeypatch: pytest.MonkeyPatch):
+    """A transiently ONE-SIDED book is SKIPPED, and the watch loop survives to persist the next.
+
+    WHY: a one-sided book (only bids or only asks) is a NORMAL, transient market state for thin
+    tail buckets — it must NOT kill the ticker's watch loop. On the current code the one-sided
+    guard raises ``SystemExit`` (a ``BaseException``) inside ``_process_book``; ``client._emit``
+    and the sink both catch only ``Exception``, so it propagates out of ``run_feed`` / ``run_paper``
+    and permanently ends that market's feed — losing coverage AND the closing-window snapshots CLV
+    needs. The loop must instead skip the one-sided emit and keep going.
+
+    Stream: the default two-sided snapshot (seq=1, no ts → the sink skips it, no back-dating) → a
+    ``no``-side delta that EMPTIES the no side (book one-sided, carries a WS ts) → a ``no``-side
+    delta that RESTORES it (two-sided, carries a later WS ts). Only the final two-sided book must
+    persist, stamped with its own WS instant.
+    """
+    captured = _patch_watch(monkeypatch)
+    ts1 = _in_window_instant(8)  # the one-sided book instant (must be skipped, not persisted)
+    ts2 = _in_window_instant(7)  # the restored two-sided book instant (the ONLY persisted row)
+    conn = _MockWS(
+        [
+            _ws_snapshot(1, ticker=_TICKER),
+            # Empty the no side (no bid 0.49 had size 80) → book ONE-SIDED (yes only).
+            _ws_delta(2, side="no", price="0.49", delta="-80.00", ts=_iso(ts1), ticker=_TICKER),
+            # Restore the no side → book TWO-SIDED again.
+            _ws_delta(3, side="no", price="0.49", delta="80.00", ts=_iso(ts2), ticker=_TICKER),
+        ],
+        close_after=False,
+    )
+    result = _run_watch(_MockConnector([conn]))
+
+    # run_paper RETURNED (the one-sided book did not raise out of the feed) and persisted exactly
+    # the one two-sided book — the one-sided emit was skipped.
+    assert result["persisted_snapshot_count"] == 1
+    assert len(captured["snapshots"]) == 1
+    assert captured["snapshots"][0]["available_at"] == ts2
+
+
+def test_single_shot_fails_loud_on_one_sided_book(monkeypatch: pytest.MonkeyPatch):
+    """Single-shot ``run_paper`` STILL fails loud (SystemExit) on a one-sided book — WR-04.
+
+    WHY: making ``--watch`` treat a one-sided book as transient must NOT weaken the single-shot
+    path. Single-shot is a one-time explicit price query; a one-sided book there is a genuine
+    "no derivable two-sided mid" condition and stays fail-loud with the SAME human-readable
+    message after Task 2 re-types the guard from ``SystemExit`` to the transient ``OneSidedBook``.
+    """
+    book = _scripted_paper_book(_in_window_instant(5))
+    book["no"] = []  # one-sided REST book (no reflected yes ask derivable)
+    _patch_paper(
+        monkeypatch,
+        book=book,
+        forecasts=_forecast_rows("hrrr", 62.5),
+        cal_rows=[_cal_row("hrrr")],
+    )
+    with pytest.raises(SystemExit, match="one-sided"):
+        cli.run_paper(_paper_args())

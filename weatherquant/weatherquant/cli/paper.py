@@ -48,6 +48,20 @@ PAPER_MIN_STAKE_FRACTION = 1e-4
 # operator's WR-02 responsibility).
 
 
+class OneSidedBook(Exception):
+    """A momentarily one-sided book (only bids or only asks) — a TRANSIENT, recoverable state.
+
+    WHY a dedicated Exception (not SystemExit): a one-sided book is a NORMAL market condition for
+    thin/tail buckets, NOT a persist/integrity failure. The long-running ``paper --watch`` sink
+    catches this and SKIPS the book so the ticker's feed survives to persist later two-sided
+    closing-window snapshots (keeping CLV derivable). Only genuine DB/persist failures stay fatal
+    (WR-04). It subclasses ``Exception`` (not ``BaseException``) precisely so the sink's
+    ``except Exception`` can catch it — a ``SystemExit`` would propagate out of ``run_feed`` and
+    permanently kill the loop. Single-shot ``run_paper`` translates it back to ``SystemExit`` so
+    the one-time price query stays fail-loud (unchanged user-visible behavior).
+    """
+
+
 def _reflection_midpoint_cents(book: object) -> float:
     """Derive the live-book midpoint in FLOAT-VALUED CENTS from the REFLECTED best levels.
 
@@ -73,7 +87,9 @@ def _reflection_midpoint_cents(book: object) -> float:
     best_yes_bid = reflect.best_bid(book, "yes")
     yes_asks = reflect.yes_ask_levels(book)  # reflected from the no bids, cheapest first
     if best_yes_bid is None or not yes_asks:
-        raise SystemExit(
+        # Transient, recoverable (the watch sink skips; single-shot translates to SystemExit) —
+        # a one-sided book is a normal market state, never a fabricated mid (WR-04).
+        raise OneSidedBook(
             "paper: book is one-sided (missing a yes bid or a reflected yes ask) — "
             "cannot derive a two-sided midpoint (no fabricated mid)."
         )
@@ -183,7 +199,9 @@ def _process_book(
     best_yes_bid_size = _best_price_size(yes_levels)
     best_no_bid_size = _best_price_size(no_levels)
     if best_yes_bid_size is None or best_no_bid_size is None:
-        raise SystemExit(
+        # Transient, recoverable (the watch sink skips; single-shot translates to SystemExit) —
+        # a one-sided book yields no supporting size, never a fabricated volume (WR-04).
+        raise OneSidedBook(
             "paper: book is one-sided — cannot derive the top-of-book supporting size behind "
             "the persisted mid (no fabricated volume)."
         )
@@ -405,6 +423,12 @@ class _WatchSink:
                 fills_mod=self._fills,
                 reflect_mod=self._reflect,
             )
+        except OneSidedBook:
+            # A transient one-sided book: SKIP it (do NOT record on self.error, do NOT advance
+            # the debounce/top-of-book/persist counters, do NOT re-raise) so the ticker's feed
+            # survives to persist later two-sided snapshots. Only genuine persist failures (the
+            # broad handler below) surface via self.error and fail the run loud (WR-04).
+            return
         except Exception as exc:  # noqa: BLE001 — record + re-raise via the loop (WR-04, T-051-09)
             # _emit would swallow this; remember the FIRST hard failure so the loop fails loud
             # after the feed drains (a swallowed DB error must never make --watch look successful).
@@ -637,18 +661,24 @@ def run_paper(args: argparse.Namespace) -> dict[str, Any]:
     # in-process cadence loop, WR-02). DELEGATE the per-book money tail (midpoint → EV/Kelly gate →
     # taker fill → persist snapshot + fill) to the shared _process_book helper so the Plan-02 watch
     # sink runs the IDENTICAL body — no drift in volume/event-time/fail-loud semantics (PROC-01).
-    result = _process_book(
-        bind,
-        book=snapshot,
-        event_time=event_time,
-        seq=seq,
-        ticker=ticker,
-        bucket=bucket,
-        blend=blend,
-        pricing_mod=pricing,
-        fills_mod=fills,
-        reflect_mod=reflect,
-    )
+    try:
+        result = _process_book(
+            bind,
+            book=snapshot,
+            event_time=event_time,
+            seq=seq,
+            ticker=ticker,
+            bucket=bucket,
+            blend=blend,
+            pricing_mod=pricing,
+            fills_mod=fills,
+            reflect_mod=reflect,
+        )
+    except OneSidedBook as exc:
+        # Single-shot is a one-time explicit price query — a one-sided book here stays FAIL-LOUD
+        # with the same message (unchanged user-visible behavior); only the long-running --watch
+        # loop treats a one-sided book as transient and skips it.
+        raise SystemExit(str(exc)) from exc
 
     logger.info(
         "paper city=%s date=%s ticker=%s midpoint=%.4f mid_cents=%.2f p_used=%.4f ev=%+.4f "
