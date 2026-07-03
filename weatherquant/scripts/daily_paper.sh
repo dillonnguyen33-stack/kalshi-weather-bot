@@ -28,6 +28,11 @@ kdate="$(date +%y%b%d | tr '[:lower:]' '[:upper:]')"   # Kalshi ticker date code
 lead="${LEAD:-24}"                            # trade horizon — MUST match the calibrated lead (24h-ahead high)
 stagger="${STAGGER:-3}"                        # seconds between WS handshakes — Kalshi 429s a concurrent burst
 auto_pick="${AUTO_PICK:-1}"                    # 1 = regenerate targets from today's forecast before launch
+# paper --watch's own default cap is 4h, which truncates the loop mid-afternoon — before the
+# daily-high peak and the pre-settlement closing window (no CLV). Pass a cap long enough that the
+# settlement-window end is the binding bound instead (loops run to LST midnight, ~16-19h out). A
+# machine that sleeps overnight can shorten this via WATCH_MAX_DURATION at the cost of CLV coverage.
+watch_max="${WATCH_MAX_DURATION:-72000}"       # 20h — lets settlement bind for every city
 mkdir -p reports
 stamp() { date -u +%FT%TZ; }
 
@@ -56,7 +61,7 @@ while read -r city ticker _rest; do
   tlog="reports/paper_${today}_${city}_${ticker}.log"
   echo "[$(stamp)] launch paper --watch city=$city ticker=$ticker → $tlog"
   uv run weatherquant paper --city "$city" --date "$today" --ticker "$ticker" --lead "$lead" --watch \
-    >"$tlog" 2>&1 &
+    --max-duration "$watch_max" >"$tlog" 2>&1 &
   pids+=("$!")
   sleep "$stagger"                             # space out handshakes so Kalshi doesn't 429 the burst
 done < "$targets"
