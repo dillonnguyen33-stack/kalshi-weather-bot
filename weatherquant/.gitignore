@@ -11,3 +11,6 @@ reports/
 # and must NOT be vendored (they embed an absolute-path/mtime cache key).
 *.grib2.*.idx
 
+# Auto-regenerated daily by pick_targets.py (daily_paper.sh) — churns every trading day.
+scripts/paper_targets.txt
+
